@@ -1,0 +1,650 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Upload Văn bản - Text Labeling System</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <style>
+        body { 
+            font-family: 'Segoe UI', sans-serif; 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+            min-height: 100vh; 
+        }
+        .main-content { 
+            background: white; 
+            border-radius: 20px; 
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1); 
+            margin: 20px; 
+            padding: 40px; 
+        }
+        .document-item {
+            background: #f8f9fa;
+            border: 2px dashed #dee2e6;
+            border-radius: 12px;
+            padding: 20px;
+            margin: 15px 0;
+            transition: all 0.3s ease;
+        }
+        .document-item:hover {
+            border-color: #0d6efd;
+            background: #e3f2fd;
+        }
+        .document-item.filled {
+            border-style: solid;
+            border-color: #28a745;
+            background: #d4edda;
+        }
+        .upload-type-card {
+            border: 2px solid #e9ecef;
+            border-radius: 15px;
+            padding: 30px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            height: 200px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+        .upload-type-card:hover {
+            border-color: #0d6efd;
+            background: #f8f9ff;
+            transform: translateY(-5px);
+        }
+        .upload-type-card.selected {
+            border-color: #0d6efd;
+            background: #e3f2fd;
+            box-shadow: 0 8px 25px rgba(13, 110, 253, 0.2);
+        }
+        .text-gradient { 
+            background: linear-gradient(135deg, #0d6efd, #764ba2); 
+            -webkit-background-clip: text; 
+            -webkit-text-fill-color: transparent; 
+        }
+        .step-indicator {
+            display: flex;
+            justify-content: center;
+            margin: 30px 0;
+        }
+        .step {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            background: #e9ecef;
+            color: #6c757d;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 10px;
+            font-weight: bold;
+            transition: all 0.3s ease;
+        }
+        .step.active {
+            background: #0d6efd;
+            color: white;
+        }
+        .step.completed {
+            background: #28a745;
+            color: white;
+        }
+    </style>
+</head>
+<body>
+    <div class="container-fluid">
+        <div class="main-content">
+            <!-- Header -->
+            <div class="d-flex justify-content-between align-items-center mb-4">
+                <div>
+                    <h2 class="text-gradient">
+                        <i class="fas fa-upload me-2"></i>Upload Văn bản để Gán nhãn
+                    </h2>
+                    <p class="text-muted mb-0">Chọn loại upload và thêm văn bản vào hệ thống</p>
+                </div>
+                <a href="dashboard.php" class="btn btn-outline-secondary">
+                    <i class="fas fa-arrow-left me-2"></i>Quay lại Dashboard
+                </a>
+            </div>
+
+            <!-- Step Indicator -->
+            <div class="step-indicator">
+                <div class="step active" id="step-1">1</div>
+                <div class="step" id="step-2">2</div>
+                <div class="step" id="step-3">3</div>
+            </div>
+
+            <!-- Step 1: Choose Upload Type -->
+            <div class="upload-step" id="upload-step-1">
+                <h4 class="text-center mb-4">Bước 1: Chọn loại văn bản cần upload</h4>
+                
+                <div class="row">
+                    <div class="col-md-6">
+                        <div class="upload-type-card" data-type="single" onclick="selectUploadType('single')">
+                            <i class="fas fa-file-text fa-3x text-primary mb-3"></i>
+                            <h5>Văn bản đơn</h5>
+                            <p class="text-muted mb-0">Upload một văn bản và bản tóm tắt AI tương ứng</p>
+                        </div>
+                    </div>
+                    <div class="col-md-6">
+                        <div class="upload-type-card" data-type="multi" onclick="selectUploadType('multi')">
+                            <i class="fas fa-copy fa-3x text-success mb-3"></i>
+                            <h5>Đa văn bản</h5>
+                            <p class="text-muted mb-0">Upload nhiều văn bản cùng với bản tóm tắt AI chung</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="text-center mt-4">
+                    <button class="btn btn-primary" id="next-to-step-2" style="display: none;" onclick="goToStep(2)">
+                        Tiếp theo <i class="fas fa-arrow-right ms-2"></i>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Step 2: Upload Documents -->
+            <div class="upload-step" id="upload-step-2" style="display: none;">
+                <h4 class="text-center mb-4">Bước 2: Upload văn bản</h4>
+                
+                <form id="upload-form" method="POST" enctype="multipart/form-data">
+                    <input type="hidden" id="upload-type" name="upload_type" value="">
+                    
+                    <!-- Single Document Upload -->
+                    <div id="single-upload" style="display: none;">
+                        <div class="row">
+                            <div class="col-md-6">
+                                <div class="card">
+                                    <div class="card-header bg-primary text-white">
+                                        <h6 class="mb-0"><i class="fas fa-file-text me-2"></i>Văn bản</h6>
+                                    </div>
+                                    <div class="card-body">
+                                        <div class="mb-3">
+                                            <label class="form-label">Tiêu đề</label>
+                                            <input type="text" class="form-control" name="single_title" placeholder="Nhập tiêu đề văn bản...">
+                                        </div>
+                                        <div class="mb-3">
+                                            <label class="form-label">Nội dung</label>
+                                            <textarea class="form-control" name="single_content" rows="8" placeholder="Nhập nội dung văn bản..."></textarea>
+                                        </div>
+                                        <div class="mb-3">
+                                            <label class="form-label">Hoặc upload file</label>
+                                            <input type="file" class="form-control" name="single_file" accept=".txt,.docx">
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-6">
+                                <div class="card">
+                                    <div class="card-header bg-success text-white">
+                                        <h6 class="mb-0"><i class="fas fa-robot me-2"></i>Bản tóm tắt AI</h6>
+                                    </div>
+                                    <div class="card-body">
+                                        <textarea class="form-control" name="single_summary" rows="12" placeholder="Nhập bản tóm tắt AI cho văn bản..."></textarea>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Multi Document Upload -->
+                    <div id="multi-upload" style="display: none;">
+                        <div class="row">
+                            <div class="col-md-8">
+                                <div class="card">
+                                    <div class="card-header bg-info text-white d-flex justify-content-between align-items-center">
+                                        <h6 class="mb-0"><i class="fas fa-copy me-2"></i>Danh sách văn bản</h6>
+                                        <button type="button" class="btn btn-light btn-sm" onclick="addDocument()">
+                                            <i class="fas fa-plus me-1"></i>Thêm văn bản
+                                        </button>
+                                    </div>
+                                    <div class="card-body">
+                                        <div class="mb-3">
+                                            <label class="form-label">Tiêu đề nhóm văn bản</label>
+                                            <input type="text" class="form-control" name="group_title" placeholder="Nhập tiêu đề cho nhóm văn bản...">
+                                        </div>
+                                        <div class="mb-3">
+                                            <label class="form-label">Mô tả nhóm</label>
+                                            <textarea class="form-control" name="group_description" rows="2" placeholder="Mô tả ngắn về nhóm văn bản này..."></textarea>
+                                        </div>
+                                        
+                                        <div id="documents-container">
+                                            <!-- Document 1 -->
+                                            <div class="document-item" data-doc-index="1">
+                                                <div class="d-flex justify-content-between align-items-center mb-3">
+                                                    <h6 class="mb-0"><i class="fas fa-file-text me-2"></i>Văn bản #1</h6>
+                                                    <button type="button" class="btn btn-sm btn-outline-danger" onclick="removeDocument(1)" style="display: none;">
+                                                        <i class="fas fa-trash"></i>
+                                                    </button>
+                                                </div>
+                                                
+                                                <div class="row">
+                                                    <div class="col-md-6">
+                                                        <div class="mb-3">
+                                                            <label class="form-label">Tiêu đề</label>
+                                                            <input type="text" class="form-control" name="doc_title[]" placeholder="Tiêu đề văn bản...">
+                                                        </div>
+                                                        <div class="mb-3">
+                                                            <label class="form-label">Upload file</label>
+                                                            <input type="file" class="form-control" name="doc_file[]" accept=".txt,.docx" onchange="handleDocumentFile(this, 1)">
+                                                        </div>
+                                                    </div>
+                                                    <div class="col-md-6">
+                                                        <div class="mb-3">
+                                                            <label class="form-label">Nội dung</label>
+                                                            <textarea class="form-control" name="doc_content[]" rows="6" placeholder="Hoặc nhập nội dung trực tiếp..."></textarea>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <div class="col-md-4">
+                                <div class="card">
+                                    <div class="card-header bg-warning text-dark">
+                                        <h6 class="mb-0"><i class="fas fa-robot me-2"></i>Bản tóm tắt AI chung</h6>
+                                    </div>
+                                    <div class="card-body">
+                                        <textarea class="form-control" name="group_summary" rows="20" placeholder="Nhập bản tóm tắt AI cho toàn bộ nhóm văn bản..."></textarea>
+                                        <div class="mt-3">
+                                            <small class="text-muted">
+                                                <i class="fas fa-info-circle me-1"></i>
+                                                Bản tóm tắt này sẽ được sử dụng cho toàn bộ nhóm văn bản
+                                            </small>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </form>
+
+                <div class="d-flex justify-content-between mt-4">
+                    <button class="btn btn-outline-secondary" onclick="goToStep(1)">
+                        <i class="fas fa-arrow-left me-2"></i>Quay lại
+                    </button>
+                    <button class="btn btn-primary" onclick="goToStep(3)">
+                        Tiếp theo <i class="fas fa-arrow-right ms-2"></i>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Step 3: Preview and Confirm -->
+            <div class="upload-step" id="upload-step-3" style="display: none;">
+                <h4 class="text-center mb-4">Bước 3: Xem trước và xác nhận</h4>
+                
+                <div id="preview-content">
+                    <!-- Preview content will be generated here -->
+                </div>
+
+                <div class="d-flex justify-content-between mt-4">
+                    <button class="btn btn-outline-secondary" onclick="goToStep(2)">
+                        <i class="fas fa-arrow-left me-2"></i>Quay lại
+                    </button>
+                    <button class="btn btn-success" onclick="submitUpload()">
+                        <i class="fas fa-check me-2"></i>Xác nhận Upload
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Success Modal -->
+    <div class="modal fade" id="successModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header bg-success text-white">
+                    <h5 class="modal-title">
+                        <i class="fas fa-check-circle me-2"></i>Upload thành công!
+                    </h5>
+                </div>
+                <div class="modal-body text-center">
+                    <i class="fas fa-check-circle text-success fa-3x mb-3"></i>
+                    <h5>Văn bản đã được upload thành công!</h5>
+                    <p class="text-muted">Văn bản đã sẵn sàng cho quá trình gán nhãn.</p>
+                </div>
+                <div class="modal-footer">
+                    <a href="dashboard.php" class="btn btn-primary">Về Dashboard</a>
+                    <button type="button" class="btn btn-outline-secondary" onclick="resetForm()">Upload thêm</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
+    <script>
+        let currentStep = 1;
+        let uploadType = '';
+        let documentCounter = 1;
+
+        // Step navigation
+        function goToStep(step) {
+            // Hide all steps
+            document.querySelectorAll('.upload-step').forEach(el => el.style.display = 'none');
+            
+            // Show target step
+            document.getElementById(`upload-step-${step}`).style.display = 'block';
+            
+            // Update step indicator
+            document.querySelectorAll('.step').forEach(el => el.classList.remove('active'));
+            for (let i = 1; i <= step; i++) {
+                const stepEl = document.getElementById(`step-${i}`);
+                if (i < step) {
+                    stepEl.classList.add('completed');
+                } else if (i === step) {
+                    stepEl.classList.add('active');
+                }
+            }
+            
+            currentStep = step;
+            
+            // Generate preview for step 3
+            if (step === 3) {
+                generatePreview();
+            }
+        }
+
+        // Upload type selection
+        function selectUploadType(type) {
+            uploadType = type;
+            document.getElementById('upload-type').value = type;
+            
+            // Update UI
+            document.querySelectorAll('.upload-type-card').forEach(card => {
+                card.classList.remove('selected');
+            });
+            document.querySelector(`[data-type="${type}"]`).classList.add('selected');
+            
+            // Show next button
+            document.getElementById('next-to-step-2').style.display = 'inline-block';
+            
+            // Prepare step 2 based on type
+            if (type === 'single') {
+                document.getElementById('single-upload').style.display = 'block';
+                document.getElementById('multi-upload').style.display = 'none';
+            } else {
+                document.getElementById('single-upload').style.display = 'none';
+                document.getElementById('multi-upload').style.display = 'block';
+            }
+        }
+
+        // Multi-document functions
+        function addDocument() {
+            documentCounter++;
+            const container = document.getElementById('documents-container');
+            
+            const documentHtml = `
+                <div class="document-item" data-doc-index="${documentCounter}">
+                    <div class="d-flex justify-content-between align-items-center mb-3">
+                        <h6 class="mb-0"><i class="fas fa-file-text me-2"></i>Văn bản #${documentCounter}</h6>
+                        <button type="button" class="btn btn-sm btn-outline-danger" onclick="removeDocument(${documentCounter})">
+                            <i class="fas fa-trash"></i>
+                        </button>
+                    </div>
+                    
+                    <div class="row">
+                        <div class="col-md-6">
+                            <div class="mb-3">
+                                <label class="form-label">Tiêu đề</label>
+                                <input type="text" class="form-control" name="doc_title[]" placeholder="Tiêu đề văn bản...">
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label">Upload file</label>
+                                <input type="file" class="form-control" name="doc_file[]" accept=".txt,.docx" onchange="handleDocumentFile(this, ${documentCounter})">
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="mb-3">
+                                <label class="form-label">Nội dung</label>
+                                <textarea class="form-control" name="doc_content[]" rows="6" placeholder="Hoặc nhập nội dung trực tiếp..."></textarea>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+            
+            container.insertAdjacentHTML('beforeend', documentHtml);
+            updateRemoveButtons();
+        }
+
+        function removeDocument(index) {
+            const element = document.querySelector(`[data-doc-index="${index}"]`);
+            if (element) {
+                element.remove();
+                updateRemoveButtons();
+            }
+        }
+
+        function updateRemoveButtons() {
+            const documents = document.querySelectorAll('.document-item');
+            documents.forEach((doc, index) => {
+                const removeBtn = doc.querySelector('.btn-outline-danger');
+                if (documents.length > 1) {
+                    removeBtn.style.display = 'inline-block';
+                } else {
+                    removeBtn.style.display = 'none';
+                }
+            });
+        }
+
+        function handleDocumentFile(input, index) {
+            if (input.files && input.files[0]) {
+                const file = input.files[0];
+                const reader = new FileReader();
+                
+                reader.onload = function(e) {
+                    const textarea = document.querySelector(`[data-doc-index="${index}"] textarea[name="doc_content[]"]`);
+                    textarea.value = e.target.result;
+                    
+                    // Mark as filled
+                    const docItem = document.querySelector(`[data-doc-index="${index}"]`);
+                    docItem.classList.add('filled');
+                };
+                
+                reader.readAsText(file);
+            }
+        }
+
+        // Preview generation
+        function generatePreview() {
+            const previewContainer = document.getElementById('preview-content');
+            let previewHtml = '';
+
+            if (uploadType === 'single') {
+                const title = document.querySelector('input[name="single_title"]').value;
+                const content = document.querySelector('textarea[name="single_content"]').value;
+                const summary = document.querySelector('textarea[name="single_summary"]').value;
+
+                previewHtml = `
+                    <div class="card">
+                        <div class="card-header bg-primary text-white">
+                            <h5 class="mb-0"><i class="fas fa-file-text me-2"></i>Văn bản đơn</h5>
+                        </div>
+                        <div class="card-body">
+                            <h6 class="text-primary">Tiêu đề:</h6>
+                            <p><strong>${title || 'Chưa có tiêu đề'}</strong></p>
+                            
+                            <h6 class="text-primary">Nội dung:</h6>
+                            <div class="border rounded p-3 bg-light" style="max-height: 200px; overflow-y: auto;">
+                                ${content || 'Chưa có nội dung'}
+                            </div>
+                            
+                            <h6 class="text-primary mt-3">Bản tóm tắt AI:</h6>
+                            <div class="border rounded p-3 bg-success bg-opacity-10" style="max-height: 150px; overflow-y: auto;">
+                                ${summary || 'Chưa có bản tóm tắt'}
+                            </div>
+                            
+                            <div class="row mt-3">
+                                <div class="col-md-4 text-center">
+                                    <div class="h5 text-info">${content.length}</div>
+                                    <small class="text-muted">Ký tự</small>
+                                </div>
+                                <div class="col-md-4 text-center">
+                                    <div class="h5 text-success">${content.trim() ? content.trim().split(/\\s+/).length : 0}</div>
+                                    <small class="text-muted">Từ</small>
+                                </div>
+                                <div class="col-md-4 text-center">
+                                    <div class="h5 text-warning">${content.split(/[.!?]+/).filter(s => s.trim()).length}</div>
+                                    <small class="text-muted">Câu</small>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            } else {
+                const groupTitle = document.querySelector('input[name="group_title"]').value;
+                const groupDescription = document.querySelector('textarea[name="group_description"]').value;
+                const groupSummary = document.querySelector('textarea[name="group_summary"]').value;
+                const documents = document.querySelectorAll('.document-item');
+
+                previewHtml = `
+                    <div class="card mb-4">
+                        <div class="card-header bg-info text-white">
+                            <h5 class="mb-0"><i class="fas fa-copy me-2"></i>Nhóm văn bản</h5>
+                        </div>
+                        <div class="card-body">
+                            <h6 class="text-info">Tiêu đề nhóm:</h6>
+                            <p><strong>${groupTitle || 'Chưa có tiêu đề'}</strong></p>
+                            
+                            <h6 class="text-info">Mô tả:</h6>
+                            <p>${groupDescription || 'Chưa có mô tả'}</p>
+                            
+                            <h6 class="text-info">Bản tóm tắt AI chung:</h6>
+                            <div class="border rounded p-3 bg-warning bg-opacity-10">
+                                ${groupSummary || 'Chưa có bản tóm tắt'}
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="row">
+                `;
+
+                documents.forEach((doc, index) => {
+                    const title = doc.querySelector('input[name="doc_title[]"]').value;
+                    const content = doc.querySelector('textarea[name="doc_content[]"]').value;
+                    
+                    previewHtml += `
+                        <div class="col-md-6 mb-3">
+                            <div class="card">
+                                <div class="card-header bg-light">
+                                    <h6 class="mb-0">Văn bản #${index + 1}</h6>
+                                </div>
+                                <div class="card-body">
+                                    <h6 class="text-primary">Tiêu đề:</h6>
+                                    <p><strong>${title || 'Chưa có tiêu đề'}</strong></p>
+                                    
+                                    <h6 class="text-primary">Nội dung:</h6>
+                                    <div class="border rounded p-2 bg-light" style="max-height: 150px; overflow-y: auto; font-size: 0.9rem;">
+                                        ${content ? content.substring(0, 200) + (content.length > 200 ? '...' : '') : 'Chưa có nội dung'}
+                                    </div>
+                                    
+                                    <div class="row mt-2">
+                                        <div class="col-4 text-center">
+                                            <small class="text-info">${content.length} ký tự</small>
+                                        </div>
+                                        <div class="col-4 text-center">
+                                            <small class="text-success">${content.trim() ? content.trim().split(/\\s+/).length : 0} từ</small>
+                                        </div>
+                                        <div class="col-4 text-center">
+                                            <small class="text-warning">${content.split(/[.!?]+/).filter(s => s.trim()).length} câu</small>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                });
+
+                previewHtml += '</div>';
+            }
+
+            previewContainer.innerHTML = previewHtml;
+        }
+
+        // Form submission
+        function submitUpload() {
+            const form = document.getElementById('upload-form');
+            const formData = new FormData(form);
+            
+            // Add upload type
+            formData.append('action', 'upload_documents');
+            
+            // Show loading
+            const submitBtn = event.target;
+            const originalText = submitBtn.innerHTML;
+            submitBtn.innerHTML = '<i class="fas fa-spinner fa-spin me-2"></i>Đang upload...';
+            submitBtn.disabled = true;
+            
+            // Simulate upload (replace with actual AJAX call)
+            setTimeout(() => {
+                // Show success modal
+                const successModal = new bootstrap.Modal(document.getElementById('successModal'));
+                successModal.show();
+                
+                // Reset button
+                submitBtn.innerHTML = originalText;
+                submitBtn.disabled = false;
+            }, 2000);
+        }
+
+        // Reset form
+        function resetForm() {
+            document.getElementById('upload-form').reset();
+            documentCounter = 1;
+            currentStep = 1;
+            uploadType = '';
+            
+            // Reset UI
+            document.querySelectorAll('.upload-type-card').forEach(card => {
+                card.classList.remove('selected');
+            });
+            document.getElementById('next-to-step-2').style.display = 'none';
+            
+            // Reset documents container
+            const container = document.getElementById('documents-container');
+            container.innerHTML = `
+                <div class="document-item" data-doc-index="1">
+                    <div class="d-flex justify-content-between align-items-center mb-3">
+                        <h6 class="mb-0"><i class="fas fa-file-text me-2"></i>Văn bản #1</h6>
+                        <button type="button" class="btn btn-sm btn-outline-danger" onclick="removeDocument(1)" style="display: none;">
+                            <i class="fas fa-trash"></i>
+                        </button>
+                    </div>
+                    
+                    <div class="row">
+                        <div class="col-md-6">
+                            <div class="mb-3">
+                                <label class="form-label">Tiêu đề</label>
+                                <input type="text" class="form-control" name="doc_title[]" placeholder="Tiêu đề văn bản...">
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label">Upload file</label>
+                                <input type="file" class="form-control" name="doc_file[]" accept=".txt,.docx" onchange="handleDocumentFile(this, 1)">
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="mb-3">
+                                <label class="form-label">Nội dung</label>
+                                <textarea class="form-control" name="doc_content[]" rows="6" placeholder="Hoặc nhập nội dung trực tiếp..."></textarea>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+            
+            // Go back to step 1
+            goToStep(1);
+            
+            // Close modal
+            bootstrap.Modal.getInstance(document.getElementById('successModal')).hide();
+        }
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', function() {
+            updateRemoveButtons();
+        });
+    </script>
+</body>
+</html>
