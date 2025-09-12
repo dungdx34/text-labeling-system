@@ -1,323 +1,298 @@
 <?php
-// Determine the correct path to database.php based on current file location
-if (file_exists(__DIR__ . '/../config/database.php')) {
-    require_once __DIR__ . '/../config/database.php';
-} elseif (file_exists('../config/database.php')) {
-    require_once '../config/database.php';
-} elseif (file_exists('config/database.php')) {
-    require_once 'config/database.php';
-} else {
-    die('Error: Cannot find database configuration file.');
-}
+// Complete Functions class with all required methods
 
 class Functions {
     private $conn;
     
     public function __construct() {
-        $database = new Database();
-        $this->conn = $database->getConnection();
+        // Database connection using MySQLi
+        $this->conn = new mysqli('localhost', 'root', '', 'text_labeling_system');
+        
+        if ($this->conn->connect_error) {
+            throw new Exception("Connection failed: " . $this->conn->connect_error);
+        }
+        
+        $this->conn->set_charset("utf8");
     }
     
-    public function createUser($username, $email, $password, $role, $full_name) {
+    /**
+     * Get dashboard statistics
+     */
+    public function getDashboardStats() {
+        try {
+            $stats = [];
+            
+            // Total documents
+            $result = $this->conn->query("SELECT COUNT(*) as total_documents FROM documents");
+            $stats['total_documents'] = $result ? $result->fetch_assoc()['total_documents'] : 0;
+            
+            // Total users by role
+            $result = $this->conn->query("SELECT role, COUNT(*) as count FROM users WHERE status = 'active' GROUP BY role");
+            if ($result) {
+                while ($row = $result->fetch_assoc()) {
+                    $stats['users_' . $row['role']] = $row['count'];
+                }
+            }
+            
+            // Set defaults if not found
+            $stats['users_admin'] = $stats['users_admin'] ?? 0;
+            $stats['users_labeler'] = $stats['users_labeler'] ?? 0;
+            
+            // Total labelings
+            $result = $this->conn->query("SELECT COUNT(*) as total_labelings FROM labelings");
+            $stats['total_labelings'] = $result ? $result->fetch_assoc()['total_labelings'] : 0;
+            
+            // Completed tasks
+            $result = $this->conn->query("SELECT COUNT(*) as completed_tasks FROM labelings WHERE status = 'completed'");
+            $stats['completed_tasks'] = $result ? $result->fetch_assoc()['completed_tasks'] : 0;
+            
+            // Pending tasks  
+            $result = $this->conn->query("SELECT COUNT(*) as pending_tasks FROM labelings WHERE status IN ('assigned', 'in_progress')");
+            $stats['pending_tasks'] = $result ? $result->fetch_assoc()['pending_tasks'] : 0;
+            
+            return $stats;
+            
+        } catch (Exception $e) {
+            error_log("Dashboard stats error: " . $e->getMessage());
+            return [
+                'total_documents' => 0,
+                'users_admin' => 0,
+                'users_labeler' => 0,
+                'total_labelings' => 0,
+                'completed_tasks' => 0,
+                'pending_tasks' => 0
+            ];
+        }
+    }
+    
+    /**
+     * Get active labelers
+     */
+    public function getActiveLabelers() {
+        try {
+            $query = "
+                SELECT u.*, COUNT(l.id) as active_tasks
+                FROM users u 
+                LEFT JOIN labelings l ON u.id = l.labeler_id AND l.status IN ('assigned', 'in_progress')
+                WHERE u.role = 'labeler' AND u.status = 'active'
+                GROUP BY u.id
+                ORDER BY active_tasks ASC, u.username
+            ";
+            
+            $result = $this->conn->query($query);
+            $labelers = [];
+            
+            if ($result) {
+                while ($row = $result->fetch_assoc()) {
+                    $labelers[] = $row;
+                }
+            }
+            
+            return ['success' => true, 'data' => $labelers];
+            
+        } catch (Exception $e) {
+            error_log("Get active labelers error: " . $e->getMessage());
+            return ['success' => false, 'data' => []];
+        }
+    }
+    
+    /**
+     * Get labeler tasks
+     */
+    public function getLabelerTasks($labeler_id) {
+        try {
+            $stmt = $this->conn->prepare("
+                SELECT l.*, d.title, dg.title as group_title, dg.group_type
+                FROM labelings l
+                LEFT JOIN documents d ON l.document_id = d.id
+                LEFT JOIN document_groups dg ON l.group_id = dg.id
+                WHERE l.labeler_id = ?
+                ORDER BY l.created_at DESC
+            ");
+            $stmt->bind_param("i", $labeler_id);
+            $stmt->execute();
+            $result = $stmt->get_result();
+            
+            $tasks = [];
+            while ($row = $result->fetch_assoc()) {
+                // Calculate progress based on status
+                switch ($row['status']) {
+                    case 'assigned':
+                        $row['progress'] = 0;
+                        break;
+                    case 'in_progress':
+                        $row['progress'] = 50;
+                        break;
+                    case 'completed':
+                        $row['progress'] = 100;
+                        break;
+                    default:
+                        $row['progress'] = 0;
+                }
+                
+                // Set title from group or document
+                if ($row['group_title']) {
+                    $row['title'] = $row['group_title'];
+                } elseif (!$row['title']) {
+                    $row['title'] = 'Untitled Task';
+                }
+                
+                $tasks[] = $row;
+            }
+            
+            return ['success' => true, 'data' => $tasks];
+            
+        } catch (Exception $e) {
+            error_log("Get labeler tasks error: " . $e->getMessage());
+            return ['success' => false, 'data' => []];
+        }
+    }
+    
+    /**
+     * Get completed tasks for a labeler
+     */
+    public function getCompletedTasks($labeler_id) {
+        try {
+            $stmt = $this->conn->prepare("
+                SELECT l.*, d.title, dg.title as group_title
+                FROM labelings l
+                LEFT JOIN documents d ON l.document_id = d.id
+                LEFT JOIN document_groups dg ON l.group_id = dg.id
+                WHERE l.labeler_id = ? AND l.status = 'completed'
+                ORDER BY l.completed_at DESC
+            ");
+            $stmt->bind_param("i", $labeler_id);
+            $stmt->execute();
+            $result = $stmt->get_result();
+            
+            $tasks = [];
+            while ($row = $result->fetch_assoc()) {
+                $row['title'] = $row['group_title'] ?: $row['title'] ?: 'Completed Task';
+                $tasks[] = $row;
+            }
+            
+            return ['success' => true, 'data' => $tasks];
+            
+        } catch (Exception $e) {
+            error_log("Get completed tasks error: " . $e->getMessage());
+            return ['success' => false, 'data' => []];
+        }
+    }
+    
+    /**
+     * Get available tasks for assignment
+     */
+    public function getAvailableTasks($type = 'single') {
+        try {
+            if ($type === 'single') {
+                $query = "
+                    SELECT d.*, u.username as uploaded_by_name
+                    FROM documents d
+                    JOIN users u ON d.uploaded_by = u.id
+                    LEFT JOIN labelings l ON d.id = l.document_id
+                    WHERE l.id IS NULL OR l.status = 'pending'
+                    ORDER BY d.created_at DESC
+                ";
+            } else {
+                $query = "
+                    SELECT dg.*, u.username as uploaded_by_name
+                    FROM document_groups dg
+                    JOIN users u ON dg.uploaded_by = u.id
+                    LEFT JOIN labelings l ON dg.id = l.group_id
+                    WHERE (l.id IS NULL OR l.status = 'pending') AND dg.status = 'pending'
+                    ORDER BY dg.created_at DESC
+                ";
+            }
+            
+            $result = $this->conn->query($query);
+            $tasks = [];
+            
+            if ($result) {
+                while ($row = $result->fetch_assoc()) {
+                    $tasks[] = $row;
+                }
+            }
+            
+            return ['success' => true, 'data' => $tasks];
+            
+        } catch (Exception $e) {
+            error_log("Get available tasks error: " . $e->getMessage());
+            return ['success' => false, 'data' => []];
+        }
+    }
+    
+    /**
+     * Create a new user
+     */
+    public function createUser($username, $password, $email, $role, $full_name = null) {
         try {
             $hashed_password = password_hash($password, PASSWORD_DEFAULT);
-            $query = "INSERT INTO users (username, email, password, role, full_name) VALUES (:username, :email, :password, :role, :full_name)";
-            $stmt = $this->conn->prepare($query);
-            $stmt->bindParam(':username', $username);
-            $stmt->bindParam(':email', $email);
-            $stmt->bindParam(':password', $hashed_password);
-            $stmt->bindParam(':role', $role);
-            $stmt->bindParam(':full_name', $full_name);
-            return $stmt->execute();
-        } catch(PDOException $e) {
-            return false;
-        }
-    }
-    
-    public function getUsers($role = null) {
-        $query = "SELECT id, username, email, role, full_name, created_at, is_active FROM users";
-        if ($role) {
-            $query .= " WHERE role = :role";
-        }
-        $query .= " ORDER BY created_at DESC";
-        $stmt = $this->conn->prepare($query);
-        if ($role) {
-            $stmt->bindParam(':role', $role);
-        }
-        $stmt->execute();
-        return $stmt->fetchAll(PDO::FETCH_ASSOC);
-    }
-    
-    public function updateUser($user_id, $username, $email, $role, $full_name, $is_active = 1) {
-        try {
-            $query = "UPDATE users SET username = :username, email = :email, role = :role, full_name = :full_name, is_active = :is_active WHERE id = :id";
-            $stmt = $this->conn->prepare($query);
-            $stmt->bindParam(':username', $username);
-            $stmt->bindParam(':email', $email);
-            $stmt->bindParam(':role', $role);
-            $stmt->bindParam(':full_name', $full_name);
-            $stmt->bindParam(':is_active', $is_active);
-            $stmt->bindParam(':id', $user_id);
-            return $stmt->execute();
-        } catch(PDOException $e) {
-            return false;
-        }
-    }
-    
-    public function deleteUser($user_id) {
-        try {
-            $query = "UPDATE users SET is_active = 0 WHERE id = :id";
-            $stmt = $this->conn->prepare($query);
-            $stmt->bindParam(':id', $user_id);
-            return $stmt->execute();
-        } catch(PDOException $e) {
-            return false;
-        }
-    }
-    
-    public function uploadDocument($title, $content, $ai_summary, $uploaded_by) {
-        try {
-            $query = "INSERT INTO documents (title, content, ai_summary, uploaded_by) VALUES (:title, :content, :ai_summary, :uploaded_by)";
-            $stmt = $this->conn->prepare($query);
-            $stmt->bindParam(':title', $title);
-            $stmt->bindParam(':content', $content);
-            $stmt->bindParam(':ai_summary', $ai_summary);
-            $stmt->bindParam(':uploaded_by', $uploaded_by);
-            return $stmt->execute();
-        } catch(PDOException $e) {
-            return false;
-        }
-    }
-    
-    public function getDocuments($status = null, $limit = null) {
-        $query = "SELECT d.*, u.full_name as uploaded_by_name FROM documents d 
-                  LEFT JOIN users u ON d.uploaded_by = u.id";
-        if ($status) {
-            $query .= " WHERE d.status = :status";
-        }
-        $query .= " ORDER BY d.created_at DESC";
-        if ($limit) {
-            $query .= " LIMIT :limit";
-        }
-        
-        $stmt = $this->conn->prepare($query);
-        if ($status) {
-            $stmt->bindParam(':status', $status);
-        }
-        if ($limit) {
-            $stmt->bindParam(':limit', $limit, PDO::PARAM_INT);
-        }
-        $stmt->execute();
-        return $stmt->fetchAll(PDO::FETCH_ASSOC);
-    }
-    
-    public function getDocument($id) {
-        $query = "SELECT * FROM documents WHERE id = :id";
-        $stmt = $this->conn->prepare($query);
-        $stmt->bindParam(':id', $id);
-        $stmt->execute();
-        return $stmt->fetch(PDO::FETCH_ASSOC);
-    }
-    
-    public function updateDocumentStatus($document_id, $status) {
-        try {
-            $query = "UPDATE documents SET status = :status WHERE id = :id";
-            $stmt = $this->conn->prepare($query);
-            $stmt->bindParam(':status', $status);
-            $stmt->bindParam(':id', $document_id);
-            return $stmt->execute();
-        } catch(PDOException $e) {
-            return false;
-        }
-    }
-    
-    public function getTextStyles() {
-        $query = "SELECT * FROM text_styles ORDER BY name";
-        $stmt = $this->conn->prepare($query);
-        $stmt->execute();
-        return $stmt->fetchAll(PDO::FETCH_ASSOC);
-    }
-    
-    public function saveLabelingStep($document_id, $labeler_id, $step_data) {
-        try {
-            // Check if labeling exists
-            $query = "SELECT id FROM labelings WHERE document_id = :document_id AND labeler_id = :labeler_id";
-            $stmt = $this->conn->prepare($query);
-            $stmt->bindParam(':document_id', $document_id);
-            $stmt->bindParam(':labeler_id', $labeler_id);
-            $stmt->execute();
             
-            if ($stmt->rowCount() > 0) {
-                // Update existing labeling
-                $labeling = $stmt->fetch(PDO::FETCH_ASSOC);
-                $update_query = "UPDATE labelings SET ";
-                $params = [];
-                
-                if (isset($step_data['important_sentences'])) {
-                    $update_query .= "important_sentences = :important_sentences, ";
-                    $params['important_sentences'] = json_encode($step_data['important_sentences']);
+            $stmt = $this->conn->prepare("
+                INSERT INTO users (username, password, email, role, full_name, status, is_active, created_at) 
+                VALUES (?, ?, ?, ?, ?, 'active', 1, NOW())
+            ");
+            $stmt->bind_param("sssss", $username, $hashed_password, $email, $role, $full_name);
+            
+            return $stmt->execute();
+            
+        } catch (Exception $e) {
+            error_log("Create user error: " . $e->getMessage());
+            return false;
+        }
+    }
+    
+    /**
+     * Get all users
+     */
+    public function getAllUsers() {
+        try {
+            $result = $this->conn->query("
+                SELECT id, username, email, role, full_name, status, created_at 
+                FROM users 
+                ORDER BY created_at DESC
+            ");
+            
+            $users = [];
+            if ($result) {
+                while ($row = $result->fetch_assoc()) {
+                    $users[] = $row;
                 }
-                if (isset($step_data['text_style_id'])) {
-                    $update_query .= "text_style_id = :text_style_id, ";
-                    $params['text_style_id'] = $step_data['text_style_id'];
-                }
-                if (isset($step_data['edited_summary'])) {
-                    $update_query .= "edited_summary = :edited_summary, status = 'completed', ";
-                    $params['edited_summary'] = $step_data['edited_summary'];
-                }
-                
-                $update_query .= "updated_at = CURRENT_TIMESTAMP WHERE id = :id";
-                $params['id'] = $labeling['id'];
-                
-                $update_stmt = $this->conn->prepare($update_query);
-                return $update_stmt->execute($params);
-            } else {
-                // Create new labeling
-                $insert_query = "INSERT INTO labelings (document_id, labeler_id, important_sentences, text_style_id, edited_summary, status) 
-                                VALUES (:document_id, :labeler_id, :important_sentences, :text_style_id, :edited_summary, :status)";
-                $insert_stmt = $this->conn->prepare($insert_query);
-                $insert_stmt->bindParam(':document_id', $document_id);
-                $insert_stmt->bindParam(':labeler_id', $labeler_id);
-                $important_sentences_json = json_encode($step_data['important_sentences'] ?? []);
-                $insert_stmt->bindParam(':important_sentences', $important_sentences_json);
-                $insert_stmt->bindParam(':text_style_id', $step_data['text_style_id'] ?? null);
-                $insert_stmt->bindParam(':edited_summary', $step_data['edited_summary'] ?? '');
-                $status = isset($step_data['edited_summary']) ? 'completed' : 'pending';
-                $insert_stmt->bindParam(':status', $status);
-                return $insert_stmt->execute();
             }
-        } catch(PDOException $e) {
-            return false;
+            
+            return ['success' => true, 'data' => $users];
+            
+        } catch (Exception $e) {
+            error_log("Get all users error: " . $e->getMessage());
+            return ['success' => false, 'data' => []];
         }
     }
     
-    public function getLabeling($document_id, $labeler_id) {
-        $query = "SELECT l.*, ts.name as text_style_name, d.title as document_title 
-                  FROM labelings l 
-                  LEFT JOIN text_styles ts ON l.text_style_id = ts.id 
-                  LEFT JOIN documents d ON l.document_id = d.id
-                  WHERE l.document_id = :document_id AND l.labeler_id = :labeler_id";
-        $stmt = $this->conn->prepare($query);
-        $stmt->bindParam(':document_id', $document_id);
-        $stmt->bindParam(':labeler_id', $labeler_id);
-        $stmt->execute();
-        return $stmt->fetch(PDO::FETCH_ASSOC);
-    }
-    
-    public function getLabelings($labeler_id = null, $status = null) {
-        $query = "SELECT l.*, d.title as document_title, u.full_name as labeler_name, 
-                         ts.name as text_style_name, r.full_name as reviewer_name
-                  FROM labelings l 
-                  LEFT JOIN documents d ON l.document_id = d.id
-                  LEFT JOIN users u ON l.labeler_id = u.id
-                  LEFT JOIN users r ON l.reviewer_id = r.id
-                  LEFT JOIN text_styles ts ON l.text_style_id = ts.id
-                  WHERE 1=1";
-        $params = [];
-        
-        if ($labeler_id) {
-            $query .= " AND l.labeler_id = :labeler_id";
-            $params['labeler_id'] = $labeler_id;
-        }
-        if ($status) {
-            $query .= " AND l.status = :status";
-            $params['status'] = $status;
-        }
-        
-        $query .= " ORDER BY l.updated_at DESC";
-        $stmt = $this->conn->prepare($query);
-        $stmt->execute($params);
-        return $stmt->fetchAll(PDO::FETCH_ASSOC);
-    }
-    
-    public function getLabelingById($labeling_id) {
-        $query = "SELECT l.*, d.title as document_title, d.content as document_content, 
-                         d.ai_summary, u.full_name as labeler_name, ts.name as text_style_name
-                  FROM labelings l 
-                  LEFT JOIN documents d ON l.document_id = d.id
-                  LEFT JOIN users u ON l.labeler_id = u.id
-                  LEFT JOIN text_styles ts ON l.text_style_id = ts.id
-                  WHERE l.id = :id";
-        $stmt = $this->conn->prepare($query);
-        $stmt->bindParam(':id', $labeling_id);
-        $stmt->execute();
-        return $stmt->fetch(PDO::FETCH_ASSOC);
-    }
-    
-    public function updateLabelingReview($labeling_id, $reviewer_id, $review_notes, $status) {
+    /**
+     * Update user status
+     */
+    public function updateUserStatus($user_id, $status) {
         try {
-            $query = "UPDATE labelings SET reviewer_id = :reviewer_id, review_notes = :review_notes, 
-                      status = :status, updated_at = CURRENT_TIMESTAMP WHERE id = :id";
-            $stmt = $this->conn->prepare($query);
-            $stmt->bindParam(':reviewer_id', $reviewer_id);
-            $stmt->bindParam(':review_notes', $review_notes);
-            $stmt->bindParam(':status', $status);
-            $stmt->bindParam(':id', $labeling_id);
+            $is_active = $status === 'active' ? 1 : 0;
+            
+            $stmt = $this->conn->prepare("UPDATE users SET status = ?, is_active = ? WHERE id = ?");
+            $stmt->bind_param("sii", $status, $is_active, $user_id);
+            
             return $stmt->execute();
-        } catch(PDOException $e) {
+            
+        } catch (Exception $e) {
+            error_log("Update user status error: " . $e->getMessage());
             return false;
         }
     }
     
-    public function getStatistics() {
-        $stats = [];
-        
-        // Total users by role
-        $query = "SELECT role, COUNT(*) as count FROM users WHERE is_active = 1 GROUP BY role";
-        $stmt = $this->conn->prepare($query);
-        $stmt->execute();
-        $user_stats = $stmt->fetchAll(PDO::FETCH_ASSOC);
-        
-        foreach($user_stats as $stat) {
-            $stats['users'][$stat['role']] = $stat['count'];
+    /**
+     * Close database connection
+     */
+    public function __destruct() {
+        if ($this->conn) {
+            $this->conn->close();
         }
-        
-        // Total documents by status
-        $query = "SELECT status, COUNT(*) as count FROM documents GROUP BY status";
-        $stmt = $this->conn->prepare($query);
-        $stmt->execute();
-        $doc_stats = $stmt->fetchAll(PDO::FETCH_ASSOC);
-        
-        foreach($doc_stats as $stat) {
-            $stats['documents'][$stat['status']] = $stat['count'];
-        }
-        
-        // Total labelings by status
-        $query = "SELECT status, COUNT(*) as count FROM labelings GROUP BY status";
-        $stmt = $this->conn->prepare($query);
-        $stmt->execute();
-        $labeling_stats = $stmt->fetchAll(PDO::FETCH_ASSOC);
-        
-        foreach($labeling_stats as $stat) {
-            $stats['labelings'][$stat['status']] = $stat['count'];
-        }
-        
-        return $stats;
-    }
-    
-    public function getRecentActivity($limit = 10) {
-        $query = "
-            SELECT 'document_uploaded' as type, d.title as description, d.created_at as timestamp, u.full_name as user_name
-            FROM documents d 
-            LEFT JOIN users u ON d.uploaded_by = u.id
-            
-            UNION ALL
-            
-            SELECT 'labeling_completed' as type, CONCAT('Completed labeling for: ', d.title) as description, 
-                   l.updated_at as timestamp, u.full_name as user_name
-            FROM labelings l 
-            LEFT JOIN documents d ON l.document_id = d.id
-            LEFT JOIN users u ON l.labeler_id = u.id
-            WHERE l.status = 'completed'
-            
-            ORDER BY timestamp DESC
-            LIMIT :limit
-        ";
-        
-        $stmt = $this->conn->prepare($query);
-        $stmt->bindParam(':limit', $limit, PDO::PARAM_INT);
-        $stmt->execute();
-        return $stmt->fetchAll(PDO::FETCH_ASSOC);
     }
 }
 ?>

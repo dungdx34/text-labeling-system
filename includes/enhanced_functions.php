@@ -1,7 +1,19 @@
 <?php
-require_once 'functions.php';
+// Enhanced Functions with proper database connection
 
-class EnhancedFunctions extends Functions {
+class EnhancedFunctions {
+    protected $conn;
+    
+    public function __construct() {
+        // Initialize database connection
+        $this->conn = new mysqli('localhost', 'root', '', 'text_labeling_system');
+        
+        if ($this->conn->connect_error) {
+            throw new Exception("Connection failed: " . $this->conn->connect_error);
+        }
+        
+        $this->conn->set_charset("utf8");
+    }
     
     /**
      * Process document upload for both single and multi-document types
@@ -200,13 +212,18 @@ class EnhancedFunctions extends Functions {
                 LEFT JOIN labelings l ON dg.id = l.group_id
             ";
             
+            $conditions = [];
             $params = [];
             $types = "";
             
             if ($status) {
-                $sql .= " WHERE dg.status = ?";
+                $conditions[] = "dg.status = ?";
                 $params[] = $status;
                 $types .= "s";
+            }
+            
+            if (!empty($conditions)) {
+                $sql .= " WHERE " . implode(" AND ", $conditions);
             }
             
             $sql .= " GROUP BY dg.id ORDER BY dg.created_at DESC LIMIT ? OFFSET ?";
@@ -230,114 +247,72 @@ class EnhancedFunctions extends Functions {
             
         } catch (Exception $e) {
             error_log("Get all groups error: " . $e->getMessage());
-            return ['success' => false, 'message' => 'Lỗi truy xuất danh sách'];
+            return ['success' => false, 'message' => 'Lỗi truy xuất danh sách', 'data' => []];
         }
     }
     
     /**
-     * Assign document group to labeler
+     * Get labeling statistics
      */
-    public function assignGroupToLabeler($groupId, $labelerId) {
+    public function getLabelingStats() {
         try {
-            // Check if group exists and is available
-            $stmt = $this->conn->prepare("SELECT status FROM document_groups WHERE id = ?");
-            $stmt->bind_param("i", $groupId);
-            $stmt->execute();
-            $result = $stmt->get_result();
+            $stats = [];
             
-            if ($result->num_rows === 0) {
-                return ['success' => false, 'message' => 'Không tìm thấy nhóm văn bản'];
-            }
-            
-            $group = $result->fetch_assoc();
-            if ($group['status'] !== 'pending') {
-                return ['success' => false, 'message' => 'Nhóm văn bản này đã được giao'];
-            }
-            
-            // Check if labeler exists
-            $stmt = $this->conn->prepare("SELECT id FROM users WHERE id = ? AND role = 'labeler'");
-            $stmt->bind_param("i", $labelerId);
-            $stmt->execute();
-            $result = $stmt->get_result();
-            
-            if ($result->num_rows === 0) {
-                return ['success' => false, 'message' => 'Không tìm thấy labeler'];
-            }
-            
-            // Create labeling assignment
-            $stmt = $this->conn->prepare("
-                INSERT INTO labelings (group_id, labeler_id, status, assigned_at) 
-                VALUES (?, ?, 'assigned', NOW())
+            // Group stats
+            $result = $this->conn->query("
+                SELECT 
+                    COUNT(*) as total_groups,
+                    SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending_groups,
+                    SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) as in_progress_groups,
+                    SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_groups
+                FROM document_groups
             ");
-            $stmt->bind_param("ii", $groupId, $labelerId);
-            $stmt->execute();
+            $stats['groups'] = $result ? $result->fetch_assoc() : [
+                'total_groups' => 0,
+                'pending_groups' => 0, 
+                'in_progress_groups' => 0,
+                'completed_groups' => 0
+            ];
             
-            // Update group status
-            $stmt = $this->conn->prepare("UPDATE document_groups SET status = 'in_progress' WHERE id = ?");
-            $stmt->bind_param("i", $groupId);
-            $stmt->execute();
+            // Document stats
+            $result = $this->conn->query("
+                SELECT 
+                    COUNT(*) as total_documents,
+                    COUNT(DISTINCT group_id) as groups_with_documents
+                FROM documents
+            ");
+            $stats['documents'] = $result ? $result->fetch_assoc() : [
+                'total_documents' => 0,
+                'groups_with_documents' => 0
+            ];
             
-            return ['success' => true, 'message' => 'Đã giao nhóm văn bản cho labeler'];
+            // Labeling stats
+            $result = $this->conn->query("
+                SELECT 
+                    COUNT(*) as total_labelings,
+                    COUNT(DISTINCT labeler_id) as active_labelers,
+                    SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_labelings
+                FROM labelings
+            ");
+            $stats['labelings'] = $result ? $result->fetch_assoc() : [
+                'total_labelings' => 0,
+                'active_labelers' => 0,
+                'completed_labelings' => 0
+            ];
+            
+            return ['success' => true, 'data' => $stats];
             
         } catch (Exception $e) {
-            error_log("Assign group error: " . $e->getMessage());
-            return ['success' => false, 'message' => 'Lỗi giao việc'];
-        }
-    }
-    
-    /**
-     * Save multi-document labeling results
-     */
-    public function saveMultiLabeling($groupId, $labelerId, $labelingData) {
-        try {
-            $this->conn->begin_transaction();
-            
-            // Validate labeling exists
-            $stmt = $this->conn->prepare("
-                SELECT id FROM labelings 
-                WHERE group_id = ? AND labeler_id = ?
-            ");
-            $stmt->bind_param("ii", $groupId, $labelerId);
-            $stmt->execute();
-            $result = $stmt->get_result();
-            
-            if ($result->num_rows === 0) {
-                throw new Exception("Không tìm thấy phiên gán nhãn");
-            }
-            
-            $labeling = $result->fetch_assoc();
-            $labelingId = $labeling['id'];
-            
-            // Update labeling with new data
-            $stmt = $this->conn->prepare("
-                UPDATE labelings SET 
-                    document_sentences = ?,
-                    ai_summary_edited = ?,
-                    status = 'completed',
-                    completed_at = NOW(),
-                    updated_at = NOW()
-                WHERE id = ?
-            ");
-            
-            $documentSentencesJson = json_encode($labelingData['document_sentences']);
-            $editedSummary = $labelingData['edited_summary'];
-            
-            $stmt->bind_param("ssi", $documentSentencesJson, $editedSummary, $labelingId);
-            $stmt->execute();
-            
-            // Update group status if needed
-            $stmt = $this->conn->prepare("UPDATE document_groups SET status = 'completed' WHERE id = ?");
-            $stmt->bind_param("i", $groupId);
-            $stmt->execute();
-            
-            $this->conn->commit();
-            
-            return ['success' => true, 'message' => 'Lưu kết quả gán nhãn thành công'];
-            
-        } catch (Exception $e) {
-            $this->conn->rollback();
-            error_log("Save multi labeling error: " . $e->getMessage());
-            return ['success' => false, 'message' => 'Lỗi lưu kết quả: ' . $e->getMessage()];
+            error_log("Get stats error: " . $e->getMessage());
+            return [
+                'success' => false, 
+                'message' => 'Lỗi truy xuất thống kê',
+                'data' => [
+                    'groups' => ['total_groups' => 0, 'pending_groups' => 0, 'in_progress_groups' => 0, 'completed_groups' => 0],
+                    'documents' => ['total_documents' => 0, 'groups_with_documents' => 0],
+                    'labelings' => ['total_labelings' => 0, 'active_labelers' => 0, 'completed_labelings' => 0]
+                ]
+            ];
         }
     }
     
@@ -419,53 +394,67 @@ class EnhancedFunctions extends Functions {
     }
     
     /**
-     * Get labeling statistics
+     * Save multi-document labeling results
      */
-    public function getLabelingStats() {
+    public function saveMultiLabeling($groupId, $labelerId, $labelingData) {
         try {
-            $stats = [];
+            $this->conn->begin_transaction();
             
-            // Group stats
+            // Validate labeling exists
             $stmt = $this->conn->prepare("
-                SELECT 
-                    COUNT(*) as total_groups,
-                    SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending_groups,
-                    SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) as in_progress_groups,
-                    SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_groups
-                FROM document_groups
+                SELECT id FROM labelings 
+                WHERE group_id = ? AND labeler_id = ?
             ");
+            $stmt->bind_param("ii", $groupId, $labelerId);
             $stmt->execute();
             $result = $stmt->get_result();
-            $stats['groups'] = $result->fetch_assoc();
             
-            // Document stats
+            if ($result->num_rows === 0) {
+                throw new Exception("Không tìm thấy phiên gán nhãn");
+            }
+            
+            $labeling = $result->fetch_assoc();
+            $labelingId = $labeling['id'];
+            
+            // Update labeling with new data
             $stmt = $this->conn->prepare("
-                SELECT 
-                    COUNT(*) as total_documents,
-                    COUNT(DISTINCT group_id) as groups_with_documents
-                FROM documents
+                UPDATE labelings SET 
+                    document_sentences = ?,
+                    ai_summary_edited = ?,
+                    status = 'completed',
+                    completed_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = ?
             ");
-            $stmt->execute();
-            $result = $stmt->get_result();
-            $stats['documents'] = $result->fetch_assoc();
             
-            // Labeling stats
-            $stmt = $this->conn->prepare("
-                SELECT 
-                    COUNT(*) as total_labelings,
-                    COUNT(DISTINCT labeler_id) as active_labelers,
-                    SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_labelings
-                FROM labelings
-            ");
-            $stmt->execute();
-            $result = $stmt->get_result();
-            $stats['labelings'] = $result->fetch_assoc();
+            $documentSentencesJson = json_encode($labelingData['document_sentences']);
+            $editedSummary = $labelingData['edited_summary'];
             
-            return ['success' => true, 'data' => $stats];
+            $stmt->bind_param("ssi", $documentSentencesJson, $editedSummary, $labelingId);
+            $stmt->execute();
+            
+            // Update group status if needed
+            $stmt = $this->conn->prepare("UPDATE document_groups SET status = 'completed' WHERE id = ?");
+            $stmt->bind_param("i", $groupId);
+            $stmt->execute();
+            
+            $this->conn->commit();
+            
+            return ['success' => true, 'message' => 'Lưu kết quả gán nhãn thành công'];
             
         } catch (Exception $e) {
-            error_log("Get stats error: " . $e->getMessage());
-            return ['success' => false, 'message' => 'Lỗi truy xuất thống kê'];
+            $this->conn->rollback();
+            error_log("Save multi labeling error: " . $e->getMessage());
+            return ['success' => false, 'message' => 'Lỗi lưu kết quả: ' . $e->getMessage()];
+        }
+    }
+    
+    /**
+     * Close database connection
+     */
+    public function __destruct() {
+        if ($this->conn) {
+            $this->conn->close();
         }
     }
 }
