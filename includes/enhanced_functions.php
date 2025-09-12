@@ -1,291 +1,472 @@
 <?php
-// Enhanced Functions class to support multi-document labeling
+require_once 'functions.php';
 
-class EnhancedFunctions {
-    private $conn;
+class EnhancedFunctions extends Functions {
     
-    public function __construct() {
-        $database = new Database();
-        $this->conn = $database->getConnection();
-    }
-    
-    // Document Groups Management
-    public function createDocumentGroup($title, $description, $group_type, $ai_summary, $uploaded_by) {
+    /**
+     * Process document upload for both single and multi-document types
+     */
+    public function processDocumentUpload($postData, $files = null) {
         try {
-            $query = "INSERT INTO document_groups (title, description, group_type, ai_summary, uploaded_by) 
-                      VALUES (:title, :description, :group_type, :ai_summary, :uploaded_by)";
-            $stmt = $this->conn->prepare($query);
-            $stmt->bindParam(':title', $title);
-            $stmt->bindParam(':description', $description);
-            $stmt->bindParam(':group_type', $group_type);
-            $stmt->bindParam(':ai_summary', $ai_summary);
-            $stmt->bindParam(':uploaded_by', $uploaded_by);
+            $uploadType = $postData['upload_type'];
             
-            if ($stmt->execute()) {
-                return $this->conn->lastInsertId();
+            if ($uploadType === 'single') {
+                return $this->processSingleDocument($postData, $files);
+            } elseif ($uploadType === 'multi') {
+                return $this->processMultiDocument($postData, $files);
+            } else {
+                return ['success' => false, 'message' => 'Loại upload không hợp lệ'];
             }
-            return false;
-        } catch(PDOException $e) {
-            error_log("Create document group error: " . $e->getMessage());
-            return false;
+        } catch (Exception $e) {
+            error_log("Enhanced upload error: " . $e->getMessage());
+            return ['success' => false, 'message' => 'Lỗi xử lý upload: ' . $e->getMessage()];
         }
     }
     
-    public function addDocumentToGroup($group_id, $title, $content, $document_order = 1) {
+    /**
+     * Process single document upload
+     */
+    private function processSingleDocument($postData, $files) {
+        $title = trim($postData['single_title']);
+        $content = trim($postData['single_content']);
+        $summary = trim($postData['single_summary']);
+        
+        // Validation
+        if (empty($title) || empty($content) || empty($summary)) {
+            return ['success' => false, 'message' => 'Vui lòng điền đầy đủ thông tin'];
+        }
+        
+        // Begin transaction
+        $this->conn->begin_transaction();
+        
         try {
-            $query = "INSERT INTO documents (title, content, group_id, document_order) 
-                      VALUES (:title, :content, :group_id, :document_order)";
-            $stmt = $this->conn->prepare($query);
-            $stmt->bindParam(':title', $title);
-            $stmt->bindParam(':content', $content);
-            $stmt->bindParam(':group_id', $group_id);
-            $stmt->bindParam(':document_order', $document_order);
-            
-            return $stmt->execute();
-        } catch(PDOException $e) {
-            return false;
-        }
-    }
-    
-    public function getDocumentGroups($status = null, $group_type = null) {
-        $query = "SELECT dg.*, u.full_name as uploaded_by_name,
-                         COUNT(d.id) as document_count
-                  FROM document_groups dg 
-                  LEFT JOIN users u ON dg.uploaded_by = u.id
-                  LEFT JOIN documents d ON dg.id = d.group_id
-                  WHERE 1=1";
-        
-        $params = [];
-        
-        if ($status) {
-            $query .= " AND dg.status = :status";
-            $params['status'] = $status;
-        }
-        
-        if ($group_type) {
-            $query .= " AND dg.group_type = :group_type";
-            $params['group_type'] = $group_type;
-        }
-        
-        $query .= " GROUP BY dg.id ORDER BY dg.created_at DESC";
-        
-        $stmt = $this->conn->prepare($query);
-        $stmt->execute($params);
-        return $stmt->fetchAll(PDO::FETCH_ASSOC);
-    }
-    
-    public function getDocumentGroup($group_id) {
-        $query = "SELECT dg.*, u.full_name as uploaded_by_name
-                  FROM document_groups dg 
-                  LEFT JOIN users u ON dg.uploaded_by = u.id
-                  WHERE dg.id = :id";
-        $stmt = $this->conn->prepare($query);
-        $stmt->bindParam(':id', $group_id);
-        $stmt->execute();
-        return $stmt->fetch(PDO::FETCH_ASSOC);
-    }
-    
-    public function getDocumentsInGroup($group_id) {
-        $query = "SELECT * FROM documents WHERE group_id = :group_id ORDER BY document_order ASC";
-        $stmt = $this->conn->prepare($query);
-        $stmt->bindParam(':group_id', $group_id);
-        $stmt->execute();
-        return $stmt->fetchAll(PDO::FETCH_ASSOC);
-    }
-    
-    // Enhanced labeling functions
-    public function saveMultiDocumentLabeling($group_id, $labeler_id, $labeling_data) {
-        try {
-            // Check if labeling exists
-            $query = "SELECT id FROM labelings WHERE group_id = :group_id AND labeler_id = :labeler_id";
-            $stmt = $this->conn->prepare($query);
-            $stmt->bindParam(':group_id', $group_id);
-            $stmt->bindParam(':labeler_id', $labeler_id);
+            // Create document group
+            $stmt = $this->conn->prepare("INSERT INTO document_groups (title, description, group_type, ai_summary, uploaded_by, created_at) VALUES (?, ?, 'single', ?, ?, NOW())");
+            $description = "Văn bản đơn lẻ: " . substr($content, 0, 100) . "...";
+            $stmt->bind_param("sssi", $title, $description, $summary, $_SESSION['user_id']);
             $stmt->execute();
             
-            if ($stmt->rowCount() > 0) {
-                // Update existing labeling
-                $labeling = $stmt->fetch(PDO::FETCH_ASSOC);
-                $update_query = "UPDATE labelings SET 
-                                document_sentences = :document_sentences,
-                                text_style_id = :text_style_id,
-                                edited_summary = :edited_summary,
-                                status = :status,
-                                updated_at = CURRENT_TIMESTAMP 
-                                WHERE id = :id";
-                
-                $update_stmt = $this->conn->prepare($update_query);
-                $update_stmt->bindParam(':document_sentences', json_encode($labeling_data['document_sentences']));
-                $update_stmt->bindParam(':text_style_id', $labeling_data['text_style_id'] ?? null);
-                $update_stmt->bindParam(':edited_summary', $labeling_data['edited_summary'] ?? '');
-                $update_stmt->bindParam(':status', $labeling_data['status'] ?? 'pending');
-                $update_stmt->bindParam(':id', $labeling['id']);
-                
-                return $update_stmt->execute();
-            } else {
-                // Create new labeling
-                $insert_query = "INSERT INTO labelings (group_id, labeler_id, document_sentences, text_style_id, edited_summary, status) 
-                                VALUES (:group_id, :labeler_id, :document_sentences, :text_style_id, :edited_summary, :status)";
-                
-                $insert_stmt = $this->conn->prepare($insert_query);
-                $insert_stmt->bindParam(':group_id', $group_id);
-                $insert_stmt->bindParam(':labeler_id', $labeler_id);
-                $insert_stmt->bindParam(':document_sentences', json_encode($labeling_data['document_sentences']));
-                $insert_stmt->bindParam(':text_style_id', $labeling_data['text_style_id'] ?? null);
-                $insert_stmt->bindParam(':edited_summary', $labeling_data['edited_summary'] ?? '');
-                $insert_stmt->bindParam(':status', $labeling_data['status'] ?? 'pending');
-                
-                return $insert_stmt->execute();
+            $groupId = $this->conn->insert_id;
+            
+            // Insert document
+            $stmt = $this->conn->prepare("INSERT INTO documents (title, content, group_id, document_order, uploaded_by, created_at) VALUES (?, ?, ?, 1, ?, NOW())");
+            $stmt->bind_param("ssii", $title, $content, $groupId, $_SESSION['user_id']);
+            $stmt->execute();
+            
+            $documentId = $this->conn->insert_id;
+            
+            // Commit transaction
+            $this->conn->commit();
+            
+            return [
+                'success' => true, 
+                'message' => 'Upload văn bản đơn thành công!',
+                'group_id' => $groupId,
+                'document_id' => $documentId
+            ];
+            
+        } catch (Exception $e) {
+            $this->conn->rollback();
+            throw $e;
+        }
+    }
+    
+    /**
+     * Process multi-document upload
+     */
+    private function processMultiDocument($postData, $files) {
+        $groupTitle = trim($postData['group_title']);
+        $groupDescription = trim($postData['group_description']) ?: '';
+        $groupSummary = trim($postData['group_summary']);
+        $docTitles = $postData['doc_title'] ?? [];
+        $docContents = $postData['doc_content'] ?? [];
+        
+        // Validation
+        if (empty($groupTitle) || empty($groupSummary)) {
+            return ['success' => false, 'message' => 'Vui lòng điền tiêu đề nhóm và bản tóm tắt AI'];
+        }
+        
+        if (empty($docTitles) || empty($docContents)) {
+            return ['success' => false, 'message' => 'Cần có ít nhất một văn bản'];
+        }
+        
+        // Validate each document
+        for ($i = 0; $i < count($docTitles); $i++) {
+            if (empty(trim($docTitles[$i])) || empty(trim($docContents[$i]))) {
+                return ['success' => false, 'message' => "Văn bản #" . ($i + 1) . " chưa đầy đủ thông tin"];
             }
-        } catch(PDOException $e) {
-            error_log("Save multi-document labeling error: " . $e->getMessage());
-            return false;
-        }
-    }
-    
-    public function getMultiDocumentLabeling($group_id, $labeler_id) {
-        $query = "SELECT l.*, ts.name as text_style_name, dg.title as group_title, dg.group_type
-                  FROM labelings l 
-                  LEFT JOIN text_styles ts ON l.text_style_id = ts.id 
-                  LEFT JOIN document_groups dg ON l.group_id = dg.id
-                  WHERE l.group_id = :group_id AND l.labeler_id = :labeler_id";
-        $stmt = $this->conn->prepare($query);
-        $stmt->bindParam(':group_id', $group_id);
-        $stmt->bindParam(':labeler_id', $labeler_id);
-        $stmt->execute();
-        return $stmt->fetch(PDO::FETCH_ASSOC);
-    }
-    
-    public function getAllLabelings($labeler_id = null, $status = null, $group_type = null) {
-        $query = "SELECT l.*, dg.title as group_title, dg.group_type, u.full_name as labeler_name, 
-                         ts.name as text_style_name, r.full_name as reviewer_name
-                  FROM labelings l 
-                  LEFT JOIN document_groups dg ON l.group_id = dg.id
-                  LEFT JOIN users u ON l.labeler_id = u.id
-                  LEFT JOIN users r ON l.reviewer_id = r.id
-                  LEFT JOIN text_styles ts ON l.text_style_id = ts.id
-                  WHERE 1=1";
-        
-        $params = [];
-        
-        if ($labeler_id) {
-            $query .= " AND l.labeler_id = :labeler_id";
-            $params['labeler_id'] = $labeler_id;
         }
         
-        if ($status) {
-            $query .= " AND l.status = :status";
-            $params['status'] = $status;
-        }
+        // Begin transaction
+        $this->conn->begin_transaction();
         
-        if ($group_type) {
-            $query .= " AND dg.group_type = :group_type";
-            $params['group_type'] = $group_type;
-        }
-        
-        $query .= " ORDER BY l.updated_at DESC";
-        $stmt = $this->conn->prepare($query);
-        $stmt->execute($params);
-        return $stmt->fetchAll(PDO::FETCH_ASSOC);
-    }
-    
-    public function getLabelingById($labeling_id) {
-        $query = "SELECT l.*, dg.title as group_title, dg.group_type, dg.ai_summary as group_ai_summary,
-                         u.full_name as labeler_name, ts.name as text_style_name
-                  FROM labelings l 
-                  LEFT JOIN document_groups dg ON l.group_id = dg.id
-                  LEFT JOIN users u ON l.labeler_id = u.id
-                  LEFT JOIN text_styles ts ON l.text_style_id = ts.id
-                  WHERE l.id = :id";
-        $stmt = $this->conn->prepare($query);
-        $stmt->bindParam(':id', $labeling_id);
-        $stmt->execute();
-        return $stmt->fetch(PDO::FETCH_ASSOC);
-    }
-    
-    public function updateLabelingReview($labeling_id, $reviewer_id, $review_notes, $status) {
         try {
-            $query = "UPDATE labelings SET reviewer_id = :reviewer_id, review_notes = :review_notes, 
-                      status = :status, updated_at = CURRENT_TIMESTAMP WHERE id = :id";
-            $stmt = $this->conn->prepare($query);
-            $stmt->bindParam(':reviewer_id', $reviewer_id);
-            $stmt->bindParam(':review_notes', $review_notes);
-            $stmt->bindParam(':status', $status);
-            $stmt->bindParam(':id', $labeling_id);
+            // Create document group
+            $stmt = $this->conn->prepare("INSERT INTO document_groups (title, description, group_type, ai_summary, uploaded_by, created_at) VALUES (?, ?, 'multi', ?, ?, NOW())");
+            $stmt->bind_param("sssi", $groupTitle, $groupDescription, $groupSummary, $_SESSION['user_id']);
+            $stmt->execute();
             
-            $result = $stmt->execute();
+            $groupId = $this->conn->insert_id;
             
-            // Update group status if reviewed
-            if ($result && $status === 'reviewed') {
-                $labeling = $this->getLabelingById($labeling_id);
-                if ($labeling && $labeling['group_id']) {
-                    $this->updateDocumentGroupStatus($labeling['group_id'], 'reviewed');
-                }
+            // Insert documents
+            $documentIds = [];
+            for ($i = 0; $i < count($docTitles); $i++) {
+                $title = trim($docTitles[$i]);
+                $content = trim($docContents[$i]);
+                $order = $i + 1;
+                
+                $stmt = $this->conn->prepare("INSERT INTO documents (title, content, group_id, document_order, uploaded_by, created_at) VALUES (?, ?, ?, ?, ?, NOW())");
+                $stmt->bind_param("ssiii", $title, $content, $groupId, $order, $_SESSION['user_id']);
+                $stmt->execute();
+                
+                $documentIds[] = $this->conn->insert_id;
             }
             
-            return $result;
-        } catch(PDOException $e) {
-            error_log("Update labeling review error: " . $e->getMessage());
-            return false;
+            // Commit transaction
+            $this->conn->commit();
+            
+            return [
+                'success' => true, 
+                'message' => 'Upload nhóm văn bản thành công! (' . count($docTitles) . ' văn bản)',
+                'group_id' => $groupId,
+                'document_ids' => $documentIds
+            ];
+            
+        } catch (Exception $e) {
+            $this->conn->rollback();
+            throw $e;
         }
     }
     
-    public function updateDocumentGroupStatus($group_id, $status) {
+    /**
+     * Get document group details with all documents
+     */
+    public function getDocumentGroup($groupId) {
         try {
-            $query = "UPDATE document_groups SET status = :status WHERE id = :id";
-            $stmt = $this->conn->prepare($query);
-            $stmt->bindParam(':status', $status);
-            $stmt->bindParam(':id', $group_id);
-            return $stmt->execute();
-        } catch(PDOException $e) {
-            return false;
+            // Get group info
+            $stmt = $this->conn->prepare("
+                SELECT dg.*, u.username as uploaded_by_name 
+                FROM document_groups dg 
+                LEFT JOIN users u ON dg.uploaded_by = u.id 
+                WHERE dg.id = ?
+            ");
+            $stmt->bind_param("i", $groupId);
+            $stmt->execute();
+            $result = $stmt->get_result();
+            
+            if ($result->num_rows === 0) {
+                return ['success' => false, 'message' => 'Không tìm thấy nhóm văn bản'];
+            }
+            
+            $group = $result->fetch_assoc();
+            
+            // Get documents in group
+            $stmt = $this->conn->prepare("
+                SELECT * FROM documents 
+                WHERE group_id = ? 
+                ORDER BY document_order ASC
+            ");
+            $stmt->bind_param("i", $groupId);
+            $stmt->execute();
+            $result = $stmt->get_result();
+            
+            $documents = [];
+            while ($row = $result->fetch_assoc()) {
+                $documents[] = $row;
+            }
+            
+            $group['documents'] = $documents;
+            
+            return ['success' => true, 'data' => $group];
+            
+        } catch (Exception $e) {
+            error_log("Get group error: " . $e->getMessage());
+            return ['success' => false, 'message' => 'Lỗi truy xuất dữ liệu'];
         }
     }
     
-    // Statistics for enhanced system
-    public function getEnhancedStatistics() {
-        $stats = [];
-        
-        // Group statistics
-        $query = "SELECT group_type, status, COUNT(*) as count FROM document_groups GROUP BY group_type, status";
-        $stmt = $this->conn->prepare($query);
-        $stmt->execute();
-        $group_stats = $stmt->fetchAll(PDO::FETCH_ASSOC);
-        
-        foreach($group_stats as $stat) {
-            $stats['groups'][$stat['group_type']][$stat['status']] = $stat['count'];
+    /**
+     * Get all document groups for listing
+     */
+    public function getAllDocumentGroups($status = null, $limit = 50, $offset = 0) {
+        try {
+            $sql = "
+                SELECT dg.*, u.username as uploaded_by_name,
+                       COUNT(d.id) as document_count,
+                       COUNT(l.id) as labeling_count
+                FROM document_groups dg 
+                LEFT JOIN users u ON dg.uploaded_by = u.id 
+                LEFT JOIN documents d ON dg.id = d.group_id
+                LEFT JOIN labelings l ON dg.id = l.group_id
+            ";
+            
+            $params = [];
+            $types = "";
+            
+            if ($status) {
+                $sql .= " WHERE dg.status = ?";
+                $params[] = $status;
+                $types .= "s";
+            }
+            
+            $sql .= " GROUP BY dg.id ORDER BY dg.created_at DESC LIMIT ? OFFSET ?";
+            $params[] = $limit;
+            $params[] = $offset;
+            $types .= "ii";
+            
+            $stmt = $this->conn->prepare($sql);
+            if (!empty($params)) {
+                $stmt->bind_param($types, ...$params);
+            }
+            $stmt->execute();
+            $result = $stmt->get_result();
+            
+            $groups = [];
+            while ($row = $result->fetch_assoc()) {
+                $groups[] = $row;
+            }
+            
+            return ['success' => true, 'data' => $groups];
+            
+        } catch (Exception $e) {
+            error_log("Get all groups error: " . $e->getMessage());
+            return ['success' => false, 'message' => 'Lỗi truy xuất danh sách'];
         }
-        
-        // Labeling statistics by group type
-        $query = "SELECT dg.group_type, l.status, COUNT(*) as count 
-                  FROM labelings l 
-                  JOIN document_groups dg ON l.group_id = dg.id 
-                  GROUP BY dg.group_type, l.status";
-        $stmt = $this->conn->prepare($query);
-        $stmt->execute();
-        $labeling_stats = $stmt->fetchAll(PDO::FETCH_ASSOC);
-        
-        foreach($labeling_stats as $stat) {
-            $stats['labelings'][$stat['group_type']][$stat['status']] = $stat['count'];
-        }
-        
-        return $stats;
     }
     
-    // Utility functions
-    public function splitIntoSentences($text) {
-        // Enhanced sentence splitting for Vietnamese text
-        $sentences = preg_split('/(?<=[.!?])\s+(?=[A-ZÀÁÂÃÈÉÊÌÍÒÓÔÕÙÚĂĐĨŨƠƯỲ])/u', $text, -1, PREG_SPLIT_NO_EMPTY);
-        return array_map('trim', $sentences);
+    /**
+     * Assign document group to labeler
+     */
+    public function assignGroupToLabeler($groupId, $labelerId) {
+        try {
+            // Check if group exists and is available
+            $stmt = $this->conn->prepare("SELECT status FROM document_groups WHERE id = ?");
+            $stmt->bind_param("i", $groupId);
+            $stmt->execute();
+            $result = $stmt->get_result();
+            
+            if ($result->num_rows === 0) {
+                return ['success' => false, 'message' => 'Không tìm thấy nhóm văn bản'];
+            }
+            
+            $group = $result->fetch_assoc();
+            if ($group['status'] !== 'pending') {
+                return ['success' => false, 'message' => 'Nhóm văn bản này đã được giao'];
+            }
+            
+            // Check if labeler exists
+            $stmt = $this->conn->prepare("SELECT id FROM users WHERE id = ? AND role = 'labeler'");
+            $stmt->bind_param("i", $labelerId);
+            $stmt->execute();
+            $result = $stmt->get_result();
+            
+            if ($result->num_rows === 0) {
+                return ['success' => false, 'message' => 'Không tìm thấy labeler'];
+            }
+            
+            // Create labeling assignment
+            $stmt = $this->conn->prepare("
+                INSERT INTO labelings (group_id, labeler_id, status, assigned_at) 
+                VALUES (?, ?, 'assigned', NOW())
+            ");
+            $stmt->bind_param("ii", $groupId, $labelerId);
+            $stmt->execute();
+            
+            // Update group status
+            $stmt = $this->conn->prepare("UPDATE document_groups SET status = 'in_progress' WHERE id = ?");
+            $stmt->bind_param("i", $groupId);
+            $stmt->execute();
+            
+            return ['success' => true, 'message' => 'Đã giao nhóm văn bản cho labeler'];
+            
+        } catch (Exception $e) {
+            error_log("Assign group error: " . $e->getMessage());
+            return ['success' => false, 'message' => 'Lỗi giao việc'];
+        }
     }
     
-    public function generateSummaryStatistics($summary) {
-        return [
-            'word_count' => str_word_count($summary),
-            'char_count' => mb_strlen($summary, 'UTF-8'),
-            'sentence_count' => count($this->splitIntoSentences($summary)),
-            'paragraph_count' => count(array_filter(explode("\n", $summary)))
-        ];
+    /**
+     * Save multi-document labeling results
+     */
+    public function saveMultiLabeling($groupId, $labelerId, $labelingData) {
+        try {
+            $this->conn->begin_transaction();
+            
+            // Validate labeling exists
+            $stmt = $this->conn->prepare("
+                SELECT id FROM labelings 
+                WHERE group_id = ? AND labeler_id = ?
+            ");
+            $stmt->bind_param("ii", $groupId, $labelerId);
+            $stmt->execute();
+            $result = $stmt->get_result();
+            
+            if ($result->num_rows === 0) {
+                throw new Exception("Không tìm thấy phiên gán nhãn");
+            }
+            
+            $labeling = $result->fetch_assoc();
+            $labelingId = $labeling['id'];
+            
+            // Update labeling with new data
+            $stmt = $this->conn->prepare("
+                UPDATE labelings SET 
+                    document_sentences = ?,
+                    ai_summary_edited = ?,
+                    status = 'completed',
+                    completed_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = ?
+            ");
+            
+            $documentSentencesJson = json_encode($labelingData['document_sentences']);
+            $editedSummary = $labelingData['edited_summary'];
+            
+            $stmt->bind_param("ssi", $documentSentencesJson, $editedSummary, $labelingId);
+            $stmt->execute();
+            
+            // Update group status if needed
+            $stmt = $this->conn->prepare("UPDATE document_groups SET status = 'completed' WHERE id = ?");
+            $stmt->bind_param("i", $groupId);
+            $stmt->execute();
+            
+            $this->conn->commit();
+            
+            return ['success' => true, 'message' => 'Lưu kết quả gán nhãn thành công'];
+            
+        } catch (Exception $e) {
+            $this->conn->rollback();
+            error_log("Save multi labeling error: " . $e->getMessage());
+            return ['success' => false, 'message' => 'Lỗi lưu kết quả: ' . $e->getMessage()];
+        }
+    }
+    
+    /**
+     * Get labeling task for labeler
+     */
+    public function getLabelingTask($groupId, $labelerId) {
+        try {
+            $stmt = $this->conn->prepare("
+                SELECT l.*, dg.title as group_title, dg.description as group_description,
+                       dg.ai_summary, dg.group_type
+                FROM labelings l
+                JOIN document_groups dg ON l.group_id = dg.id
+                WHERE l.group_id = ? AND l.labeler_id = ?
+            ");
+            $stmt->bind_param("ii", $groupId, $labelerId);
+            $stmt->execute();
+            $result = $stmt->get_result();
+            
+            if ($result->num_rows === 0) {
+                return ['success' => false, 'message' => 'Không tìm thấy nhiệm vụ'];
+            }
+            
+            $task = $result->fetch_assoc();
+            
+            // Get documents
+            $stmt = $this->conn->prepare("
+                SELECT * FROM documents 
+                WHERE group_id = ? 
+                ORDER BY document_order ASC
+            ");
+            $stmt->bind_param("i", $groupId);
+            $stmt->execute();
+            $result = $stmt->get_result();
+            
+            $documents = [];
+            while ($row = $result->fetch_assoc()) {
+                // Split content into sentences
+                $sentences = $this->splitIntoSentences($row['content']);
+                $row['sentences'] = $sentences;
+                $documents[] = $row;
+            }
+            
+            $task['documents'] = $documents;
+            
+            // Parse existing labeling data if available
+            if ($task['document_sentences']) {
+                $task['existing_labeling'] = json_decode($task['document_sentences'], true);
+            }
+            
+            return ['success' => true, 'data' => $task];
+            
+        } catch (Exception $e) {
+            error_log("Get labeling task error: " . $e->getMessage());
+            return ['success' => false, 'message' => 'Lỗi truy xuất nhiệm vụ'];
+        }
+    }
+    
+    /**
+     * Split text into sentences
+     */
+    private function splitIntoSentences($text) {
+        // Basic sentence splitting for Vietnamese
+        $sentences = preg_split('/[.!?]+/', $text, -1, PREG_SPLIT_NO_EMPTY);
+        $result = [];
+        
+        foreach ($sentences as $index => $sentence) {
+            $sentence = trim($sentence);
+            if (!empty($sentence)) {
+                $result[] = [
+                    'id' => $index + 1,
+                    'text' => $sentence,
+                    'selected' => false
+                ];
+            }
+        }
+        
+        return $result;
+    }
+    
+    /**
+     * Get labeling statistics
+     */
+    public function getLabelingStats() {
+        try {
+            $stats = [];
+            
+            // Group stats
+            $stmt = $this->conn->prepare("
+                SELECT 
+                    COUNT(*) as total_groups,
+                    SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending_groups,
+                    SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) as in_progress_groups,
+                    SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_groups
+                FROM document_groups
+            ");
+            $stmt->execute();
+            $result = $stmt->get_result();
+            $stats['groups'] = $result->fetch_assoc();
+            
+            // Document stats
+            $stmt = $this->conn->prepare("
+                SELECT 
+                    COUNT(*) as total_documents,
+                    COUNT(DISTINCT group_id) as groups_with_documents
+                FROM documents
+            ");
+            $stmt->execute();
+            $result = $stmt->get_result();
+            $stats['documents'] = $result->fetch_assoc();
+            
+            // Labeling stats
+            $stmt = $this->conn->prepare("
+                SELECT 
+                    COUNT(*) as total_labelings,
+                    COUNT(DISTINCT labeler_id) as active_labelers,
+                    SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_labelings
+                FROM labelings
+            ");
+            $stmt->execute();
+            $result = $stmt->get_result();
+            $stats['labelings'] = $result->fetch_assoc();
+            
+            return ['success' => true, 'data' => $stats];
+            
+        } catch (Exception $e) {
+            error_log("Get stats error: " . $e->getMessage());
+            return ['success' => false, 'message' => 'Lỗi truy xuất thống kê'];
+        }
     }
 }
 ?>

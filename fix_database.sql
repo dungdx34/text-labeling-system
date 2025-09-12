@@ -1,12 +1,45 @@
--- Enhanced Database Structure for Text Labeling System
--- Version: 2.0 - Multi-Document Support
--- Date: 2025-09-12
+-- Fix Enhanced Database Structure - Handle Missing Columns
+-- Run this BEFORE the main enhanced_database.sql script
 
 -- ========================================
--- 1. CREATE NEW TABLES
+-- 1. CHECK AND CREATE MISSING COLUMNS
 -- ========================================
 
--- Document groups table for multi-document labeling
+-- First, let's see what columns exist in labelings table
+SELECT COLUMN_NAME 
+FROM INFORMATION_SCHEMA.COLUMNS 
+WHERE TABLE_SCHEMA = DATABASE() 
+AND TABLE_NAME = 'labelings';
+
+-- Add missing columns to labelings table if they don't exist
+ALTER TABLE labelings 
+ADD COLUMN IF NOT EXISTS selected_sentences JSON NULL,
+ADD COLUMN IF NOT EXISTS text_style_id INT NULL,
+ADD COLUMN IF NOT EXISTS edited_summary TEXT NULL;
+
+-- Add missing columns that the enhanced script expects
+ALTER TABLE labelings
+ADD COLUMN IF NOT EXISTS group_id INT NULL AFTER document_id,
+ADD COLUMN IF NOT EXISTS document_sentences JSON NULL AFTER selected_sentences,
+ADD COLUMN IF NOT EXISTS ai_summary_edited TEXT NULL AFTER edited_summary,
+ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMP NULL AFTER updated_at,
+ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP NULL AFTER assigned_at;
+
+-- Check if documents table has the necessary columns
+ALTER TABLE documents 
+ADD COLUMN IF NOT EXISTS group_id INT NULL AFTER id,
+ADD COLUMN IF NOT EXISTS document_order INT DEFAULT 1 AFTER group_id;
+
+-- Check if users table has the necessary columns
+ALTER TABLE users
+ADD COLUMN IF NOT EXISTS full_name VARCHAR(255) NULL AFTER username,
+ADD COLUMN IF NOT EXISTS last_login TIMESTAMP NULL AFTER created_at,
+ADD COLUMN IF NOT EXISTS status ENUM('active', 'inactive', 'suspended') DEFAULT 'active' AFTER email;
+
+-- ========================================
+-- 2. CREATE DOCUMENT_GROUPS TABLE
+-- ========================================
+
 CREATE TABLE IF NOT EXISTS document_groups (
     id INT PRIMARY KEY AUTO_INCREMENT,
     title VARCHAR(255) NOT NULL,
@@ -16,70 +49,11 @@ CREATE TABLE IF NOT EXISTS document_groups (
     uploaded_by INT NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    status ENUM('pending', 'in_progress', 'completed', 'reviewed') DEFAULT 'pending',
-    INDEX idx_group_status (status),
-    INDEX idx_group_type (group_type),
-    INDEX idx_uploaded_by (uploaded_by),
-    INDEX idx_created_at (created_at)
+    status ENUM('pending', 'in_progress', 'completed', 'reviewed') DEFAULT 'pending'
 );
 
 -- ========================================
--- 2. ALTER EXISTING TABLES
--- ========================================
-
--- Add new columns to documents table
-ALTER TABLE documents 
-ADD COLUMN IF NOT EXISTS group_id INT NULL AFTER id,
-ADD COLUMN IF NOT EXISTS document_order INT DEFAULT 1 AFTER group_id;
-
--- Add new columns to labelings table  
-ALTER TABLE labelings
-ADD COLUMN IF NOT EXISTS group_id INT NULL AFTER document_id,
-ADD COLUMN IF NOT EXISTS document_sentences JSON NULL AFTER selected_sentences,
-ADD COLUMN IF NOT EXISTS ai_summary_edited TEXT NULL AFTER edited_summary,
-ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMP NULL AFTER updated_at,
-ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP NULL AFTER assigned_at;
-
--- Add new columns to users table (if not exists)
-ALTER TABLE users
-ADD COLUMN IF NOT EXISTS full_name VARCHAR(255) NULL AFTER username,
-ADD COLUMN IF NOT EXISTS last_login TIMESTAMP NULL AFTER created_at,
-ADD COLUMN IF NOT EXISTS status ENUM('active', 'inactive', 'suspended') DEFAULT 'active' AFTER email;
-
--- ========================================
--- 3. CREATE FOREIGN KEY CONSTRAINTS
--- ========================================
-
--- Add foreign key for document_groups.uploaded_by -> users.id
-ALTER TABLE document_groups 
-ADD CONSTRAINT IF NOT EXISTS fk_document_groups_uploaded_by 
-FOREIGN KEY (uploaded_by) REFERENCES users(id) ON DELETE CASCADE;
-
--- Add foreign key for documents.group_id -> document_groups.id
-ALTER TABLE documents 
-ADD CONSTRAINT IF NOT EXISTS fk_documents_group_id 
-FOREIGN KEY (group_id) REFERENCES document_groups(id) ON DELETE CASCADE;
-
--- Add foreign key for labelings.group_id -> document_groups.id
-ALTER TABLE labelings 
-ADD CONSTRAINT IF NOT EXISTS fk_labelings_group_id 
-FOREIGN KEY (group_id) REFERENCES document_groups(id) ON DELETE CASCADE;
-
--- ========================================
--- 4. CREATE ADDITIONAL INDEXES
--- ========================================
-
--- Performance indexes for documents table
-CREATE INDEX IF NOT EXISTS idx_documents_group_id ON documents(group_id);
-CREATE INDEX IF NOT EXISTS idx_documents_group_order ON documents(group_id, document_order);
-
--- Performance indexes for labelings table
-CREATE INDEX IF NOT EXISTS idx_labelings_group_id ON labelings(group_id);
-CREATE INDEX IF NOT EXISTS idx_labelings_status ON labelings(status);
-CREATE INDEX IF NOT EXISTS idx_labelings_labeler_status ON labelings(labeler_id, status);
-
--- ========================================
--- 5. CREATE ADDITIONAL TABLES
+-- 3. CREATE OTHER MISSING TABLES
 -- ========================================
 
 -- Labeling activity logs table
@@ -90,15 +64,7 @@ CREATE TABLE IF NOT EXISTS labeling_logs (
     labeler_id INT NOT NULL,
     action ENUM('assigned', 'started', 'saved', 'completed', 'reviewed') NOT NULL,
     details JSON NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_logs_group_id (group_id),
-    INDEX idx_logs_document_id (document_id),
-    INDEX idx_logs_labeler_id (labeler_id),
-    INDEX idx_logs_action (action),
-    INDEX idx_logs_created_at (created_at),
-    FOREIGN KEY (group_id) REFERENCES document_groups(id) ON DELETE CASCADE,
-    FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE,
-    FOREIGN KEY (labeler_id) REFERENCES users(id) ON DELETE CASCADE
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Text styles table for labeling options
@@ -108,8 +74,7 @@ CREATE TABLE IF NOT EXISTS text_styles (
     description TEXT,
     style_config JSON,
     is_active BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_styles_active (is_active)
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- User preferences table
@@ -119,10 +84,108 @@ CREATE TABLE IF NOT EXISTS user_preferences (
     preference_key VARCHAR(100) NOT NULL,
     preference_value JSON,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    UNIQUE KEY uk_user_preference (user_id, preference_key),
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );
+
+-- ========================================
+-- 4. ADD FOREIGN KEYS AND INDEXES
+-- ========================================
+
+-- Add indexes first (they don't have IF NOT EXISTS, so we'll use a different approach)
+
+-- Check and add indexes for documents
+SET @query = (
+    SELECT IF(
+        (SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS 
+         WHERE TABLE_SCHEMA = DATABASE() 
+         AND TABLE_NAME = 'documents' 
+         AND INDEX_NAME = 'idx_documents_group_id') = 0,
+        'CREATE INDEX idx_documents_group_id ON documents(group_id);',
+        'SELECT "Index idx_documents_group_id already exists" as notice;'
+    )
+);
+PREPARE stmt FROM @query;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+-- Check and add indexes for labelings
+SET @query = (
+    SELECT IF(
+        (SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS 
+         WHERE TABLE_SCHEMA = DATABASE() 
+         AND TABLE_NAME = 'labelings' 
+         AND INDEX_NAME = 'idx_labelings_group_id') = 0,
+        'CREATE INDEX idx_labelings_group_id ON labelings(group_id);',
+        'SELECT "Index idx_labelings_group_id already exists" as notice;'
+    )
+);
+PREPARE stmt FROM @query;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+-- Add more indexes
+CREATE INDEX IF NOT EXISTS idx_document_groups_status ON document_groups(status);
+CREATE INDEX IF NOT EXISTS idx_document_groups_type ON document_groups(group_type);
+CREATE INDEX IF NOT EXISTS idx_labelings_status ON labelings(status);
+
+-- ========================================
+-- 5. ADD FOREIGN KEYS (WITH ERROR HANDLING)
+-- ========================================
+
+-- Add foreign keys with proper error handling
+-- We'll check if foreign keys exist before adding them
+
+-- Function to safely add foreign key
+DELIMITER $$
+
+CREATE OR REPLACE PROCEDURE AddForeignKeyIfNotExists(
+    IN tableName VARCHAR(64),
+    IN constraintName VARCHAR(64),
+    IN foreignKeyDef TEXT
+)
+BEGIN
+    DECLARE fk_count INT DEFAULT 0;
+    
+    SELECT COUNT(*) INTO fk_count
+    FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+    WHERE CONSTRAINT_SCHEMA = DATABASE()
+    AND TABLE_NAME = tableName
+    AND CONSTRAINT_NAME = constraintName;
+    
+    IF fk_count = 0 THEN
+        SET @sql = CONCAT('ALTER TABLE ', tableName, ' ADD CONSTRAINT ', constraintName, ' ', foreignKeyDef);
+        PREPARE stmt FROM @sql;
+        EXECUTE stmt;
+        DEALLOCATE PREPARE stmt;
+        SELECT CONCAT('Added foreign key: ', constraintName) as result;
+    ELSE
+        SELECT CONCAT('Foreign key already exists: ', constraintName) as result;
+    END IF;
+END$$
+
+DELIMITER ;
+
+-- Add foreign keys safely
+CALL AddForeignKeyIfNotExists('document_groups', 'fk_document_groups_uploaded_by', 
+    'FOREIGN KEY (uploaded_by) REFERENCES users(id) ON DELETE CASCADE');
+
+CALL AddForeignKeyIfNotExists('documents', 'fk_documents_group_id', 
+    'FOREIGN KEY (group_id) REFERENCES document_groups(id) ON DELETE CASCADE');
+
+CALL AddForeignKeyIfNotExists('labelings', 'fk_labelings_group_id', 
+    'FOREIGN KEY (group_id) REFERENCES document_groups(id) ON DELETE CASCADE');
+
+CALL AddForeignKeyIfNotExists('labeling_logs', 'fk_logs_group_id', 
+    'FOREIGN KEY (group_id) REFERENCES document_groups(id) ON DELETE CASCADE');
+
+CALL AddForeignKeyIfNotExists('labeling_logs', 'fk_logs_document_id', 
+    'FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE');
+
+CALL AddForeignKeyIfNotExists('labeling_logs', 'fk_logs_labeler_id', 
+    'FOREIGN KEY (labeler_id) REFERENCES users(id) ON DELETE CASCADE');
+
+CALL AddForeignKeyIfNotExists('user_preferences', 'fk_preferences_user_id', 
+    'FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE');
 
 -- ========================================
 -- 6. INSERT SAMPLE DATA
@@ -143,9 +206,9 @@ SELECT
     'Bộ sưu tập các bài viết về trí tuệ nhân tạo và machine learning',
     'multi',
     'Trí tuệ nhân tạo đang phát triển mạnh mẽ và tác động sâu rộng đến nhiều lĩnh vực như y tế, giáo dục, và kinh doanh. Công nghệ AI giúp tự động hóa quy trình, cải thiện hiệu quả và tạo ra những giải pháp thông minh cho tương lai.',
-    1,
+    (SELECT id FROM users WHERE role = 'admin' LIMIT 1),
     'pending'
-WHERE EXISTS (SELECT 1 FROM users WHERE id = 1 LIMIT 1);
+WHERE EXISTS (SELECT 1 FROM users WHERE role = 'admin' LIMIT 1);
 
 INSERT IGNORE INTO document_groups (id, title, description, group_type, ai_summary, uploaded_by, status)
 SELECT 
@@ -154,65 +217,12 @@ SELECT
     'Một bài viết về xu hướng giáo dục hiện đại và công nghệ',
     'single',
     'Giáo dục hiện đại đang chuyển đổi số mạnh mẽ với việc ứng dụng công nghệ vào giảng dạy và học tập. Phương pháp học tập cá nhân hóa và học trực tuyến đang trở thành xu thế chủ đạo trong thời đại 4.0.',
-    1,
+    (SELECT id FROM users WHERE role = 'admin' LIMIT 1),
     'pending'
-WHERE EXISTS (SELECT 1 FROM users WHERE id = 1 LIMIT 1);
-
--- Insert sample documents for groups (only if document_groups exist)
-INSERT IGNORE INTO documents (id, title, content, group_id, document_order, uploaded_by)
-SELECT 
-    1001,
-    'AI trong Y tế',
-    'Trí tuệ nhân tạo đang cách mạng hóa ngành y tế thông qua chẩn đoán hình ảnh, phát hiện bệnh sớm, và hỗ trợ điều trị. Các hệ thống AI có thể phân tích hàng triệu hình ảnh X-quang, CT scan trong thời gian ngắn với độ chính xác cao. Điều này giúp các bác sĩ đưa ra quyết định nhanh chóng và chính xác hơn.',
-    1,
-    1,
-    1
-WHERE EXISTS (SELECT 1 FROM document_groups WHERE id = 1 LIMIT 1);
-
-INSERT IGNORE INTO documents (id, title, content, group_id, document_order, uploaded_by)
-SELECT 
-    1002,
-    'AI trong Giáo dục',
-    'Công nghệ AI đang thay đổi cách chúng ta học tập và giảng dạy. Hệ thống học tập thích ứng có thể cá nhân hóa trải nghiệm học tập cho từng học sinh. Chatbot giáo dục cung cấp hỗ trợ 24/7, trong khi phân tích học tập giúp giáo viên theo dõi tiến độ học sinh một cách hiệu quả.',
-    1,
-    2,
-    1
-WHERE EXISTS (SELECT 1 FROM document_groups WHERE id = 1 LIMIT 1);
-
-INSERT IGNORE INTO documents (id, title, content, group_id, document_order, uploaded_by)
-SELECT 
-    1003,
-    'Xu hướng Giáo dục Hiện đại',
-    'Giáo dục thế kỷ 21 đòi hỏi phương pháp tiếp cận mới. Học tập trực tuyến, thực tế ảo, và gamification đang tạo ra môi trường học tập tương tác và hấp dẫn. Học sinh không chỉ tiếp thu kiến thức mà còn phát triển kỹ năng tư duy phản biện, sáng tạo và giải quyết vấn đề. Giáo viên trở thành người hướng dẫn, hỗ trợ học sinh khám phá và xây dựng kiến thức.',
-    2,
-    1,
-    1
-WHERE EXISTS (SELECT 1 FROM document_groups WHERE id = 2 LIMIT 1);
+WHERE EXISTS (SELECT 1 FROM users WHERE role = 'admin' LIMIT 1);
 
 -- ========================================
--- 7. UPDATE EXISTING DATA
--- ========================================
-
--- Update existing documents to link with document groups (if needed)
--- This should be done carefully in production
-UPDATE documents d1 
-LEFT JOIN document_groups dg ON d1.uploaded_by = dg.uploaded_by 
-SET d1.group_id = dg.id 
-WHERE d1.group_id IS NULL 
-AND dg.group_type = 'single' 
-AND NOT EXISTS (
-    SELECT 1 FROM documents d2 
-    WHERE d2.group_id = dg.id AND d2.id != d1.id
-);
-
--- Update labelings table for backward compatibility
-UPDATE labelings l
-JOIN documents d ON l.document_id = d.id
-SET l.group_id = d.group_id
-WHERE l.group_id IS NULL AND d.group_id IS NOT NULL;
-
--- ========================================
--- 8. CREATE VIEWS FOR EASIER QUERYING
+-- 7. CREATE VIEWS
 -- ========================================
 
 -- View for group statistics
@@ -223,25 +233,25 @@ SELECT
     dg.group_type,
     dg.status,
     dg.created_at,
-    u.username as uploaded_by_name,
+    COALESCE(u.username, u.full_name, 'Unknown') as uploaded_by_name,
     COUNT(DISTINCT d.id) as document_count,
     COUNT(DISTINCT l.labeler_id) as labeler_count,
     SUM(CASE WHEN l.status = 'completed' THEN 1 ELSE 0 END) as completed_labelings,
-    AVG(CASE WHEN l.status = 'completed' THEN 
+    AVG(CASE WHEN l.status = 'completed' AND l.assigned_at IS NOT NULL AND l.completed_at IS NOT NULL THEN 
         TIMESTAMPDIFF(HOUR, l.assigned_at, l.completed_at) 
         ELSE NULL END) as avg_completion_hours
 FROM document_groups dg
 LEFT JOIN users u ON dg.uploaded_by = u.id
 LEFT JOIN documents d ON dg.id = d.group_id
 LEFT JOIN labelings l ON dg.id = l.group_id
-GROUP BY dg.id;
+GROUP BY dg.id, dg.title, dg.group_type, dg.status, dg.created_at, u.username, u.full_name;
 
 -- View for labeler performance
 CREATE OR REPLACE VIEW v_labeler_performance AS
 SELECT 
     u.id,
     u.username,
-    u.full_name,
+    COALESCE(u.full_name, u.username) as display_name,
     COUNT(DISTINCT l.group_id) as total_groups_assigned,
     COUNT(DISTINCT CASE WHEN l.status = 'completed' THEN l.group_id END) as groups_completed,
     COUNT(DISTINCT CASE WHEN l.status IN ('assigned', 'in_progress') THEN l.group_id END) as groups_in_progress,
@@ -251,14 +261,14 @@ SELECT
     MAX(l.completed_at) as last_completion
 FROM users u
 LEFT JOIN labelings l ON u.id = l.labeler_id
-WHERE u.role = 'labeler'
-GROUP BY u.id;
+WHERE u.role = 'labeler' AND u.status = 'active'
+GROUP BY u.id, u.username, u.full_name;
 
 -- ========================================
--- 9. CREATE STORED PROCEDURES
+-- 8. CREATE STORED PROCEDURES
 -- ========================================
 
-DELIMITER //
+DELIMITER $$
 
 -- Procedure to assign a group to a labeler
 CREATE OR REPLACE PROCEDURE sp_assign_group_to_labeler(
@@ -269,6 +279,13 @@ BEGIN
     DECLARE v_group_exists INT DEFAULT 0;
     DECLARE v_labeler_exists INT DEFAULT 0;
     DECLARE v_already_assigned INT DEFAULT 0;
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        RESIGNAL;
+    END;
+    
+    START TRANSACTION;
     
     -- Check if group exists and is pending
     SELECT COUNT(*) INTO v_group_exists 
@@ -305,9 +322,10 @@ BEGIN
         INSERT INTO labeling_logs (group_id, labeler_id, action, details)
         VALUES (p_group_id, p_labeler_id, 'assigned', JSON_OBJECT('assigned_at', NOW()));
         
+        COMMIT;
         SELECT 'SUCCESS' as status, 'Group assigned successfully' as message;
     END IF;
-END //
+END$$
 
 -- Procedure to complete a labeling task
 CREATE OR REPLACE PROCEDURE sp_complete_labeling(
@@ -318,6 +336,13 @@ CREATE OR REPLACE PROCEDURE sp_complete_labeling(
 )
 BEGIN
     DECLARE v_labeling_id INT DEFAULT 0;
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        RESIGNAL;
+    END;
+    
+    START TRANSACTION;
     
     -- Get labeling ID
     SELECT id INTO v_labeling_id 
@@ -344,57 +369,35 @@ BEGIN
         -- Log the completion
         INSERT INTO labeling_logs (group_id, labeler_id, action, details)
         VALUES (p_group_id, p_labeler_id, 'completed', 
-                JSON_OBJECT('completed_at', NOW(), 'sentences_count', JSON_LENGTH(p_document_sentences)));
+                JSON_OBJECT('completed_at', NOW(), 'sentences_count', 
+                    CASE WHEN p_document_sentences IS NOT NULL 
+                         THEN JSON_LENGTH(p_document_sentences) 
+                         ELSE 0 END));
         
+        COMMIT;
         SELECT 'SUCCESS' as status, 'Labeling completed successfully' as message;
     END IF;
-END //
+END$$
 
 DELIMITER ;
 
--- ========================================
--- 10. FINAL CHECKS AND CLEANUP
--- ========================================
-
--- Update AUTO_INCREMENT values to avoid conflicts
-ALTER TABLE document_groups AUTO_INCREMENT = 1000;
-ALTER TABLE labeling_logs AUTO_INCREMENT = 1;
-
--- Optimize tables
-OPTIMIZE TABLE document_groups;
-OPTIMIZE TABLE documents;
-OPTIMIZE TABLE labelings;
-OPTIMIZE TABLE labeling_logs;
+-- Clean up the helper procedure
+DROP PROCEDURE IF EXISTS AddForeignKeyIfNotExists;
 
 -- ========================================
--- MIGRATION NOTES
+-- 9. FINAL VERIFICATION
 -- ========================================
-/*
-IMPORTANT NOTES FOR MIGRATION:
 
-1. BACKUP FIRST: Always backup your database before running this script!
+-- Show final table structure
+SELECT 'VERIFICATION: Tables created successfully' as status;
 
-2. EXISTING DATA: This script is designed to preserve existing data while adding new features.
+SELECT 
+    TABLE_NAME, 
+    TABLE_ROWS,
+    CREATE_TIME
+FROM INFORMATION_SCHEMA.TABLES 
+WHERE TABLE_SCHEMA = DATABASE() 
+AND TABLE_NAME IN ('document_groups', 'documents', 'labelings', 'labeling_logs', 'text_styles', 'users')
+ORDER BY TABLE_NAME;
 
-3. FOREIGN KEYS: The script uses IF NOT EXISTS clauses to avoid errors on repeated runs.
-
-4. SAMPLE DATA: Sample data will only be inserted if corresponding users exist.
-
-5. PERFORMANCE: New indexes are created to improve query performance.
-
-6. VIEWS: New views provide convenient access to aggregated data.
-
-7. STORED PROCEDURES: Provide consistent business logic for common operations.
-
-8. MANUAL STEPS AFTER MIGRATION:
-   - Test the new multi-document features
-   - Update any existing single documents to use groups if needed
-   - Configure text styles according to your requirements
-   - Train users on the new multi-document interface
-
-9. ROLLBACK PLAN: Keep this script and consider creating a rollback script if needed.
-
-10. MONITORING: Monitor database performance after migration and adjust indexes if needed.
-*/
-
-SELECT 'Enhanced database migration completed successfully!' as status;
+SELECT 'Database structure updated successfully!' as final_status;

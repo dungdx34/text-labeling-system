@@ -1,204 +1,271 @@
 <?php
-// labeler/save_multi_labeling.php - Save multi-document labeling data
 require_once '../includes/auth.php';
 require_once '../includes/enhanced_functions.php';
 
-$auth = new Auth();
-$auth->requireRole('labeler');
+// Check if user is labeler
+if ($_SESSION['role'] !== 'labeler') {
+    http_response_code(403);
+    echo json_encode(['success' => false, 'message' => 'Không có quyền truy cập']);
+    exit;
+}
 
+// Set content type to JSON
 header('Content-Type: application/json');
 
-// Get JSON input
-$json = file_get_contents('php://input');
-$data = json_decode($json, true);
-
-if (!$data) {
-    echo json_encode(['success' => false, 'message' => 'Invalid JSON data']);
-    exit();
-}
-
-$enhancedFunctions = new EnhancedFunctions();
-$labeler_id = $_SESSION['user_id'];
-$group_id = $data['group_id'] ?? 0;
-
-if (!$group_id) {
-    echo json_encode(['success' => false, 'message' => 'Invalid group ID']);
-    exit();
-}
-
-// Validate group exists and is available for labeling
-$group = $enhancedFunctions->getDocumentGroup($group_id);
-if (!$group) {
-    echo json_encode(['success' => false, 'message' => 'Document group not found']);
-    exit();
-}
-
-// Prepare labeling data
-$labeling_data = [];
-
-// Validate and sanitize selected sentences for each document
-if (isset($data['document_sentences'])) {
-    $document_sentences = $data['document_sentences'];
-    
-    if (is_array($document_sentences)) {
-        $validated_sentences = [];
-        
-        foreach ($document_sentences as $doc_index => $sentences) {
-            if (is_numeric($doc_index) && is_array($sentences)) {
-                $validated_doc_sentences = [];
-                
-                foreach ($sentences as $sentence_index) {
-                    if (is_numeric($sentence_index) && $sentence_index >= 0) {
-                        $validated_doc_sentences[] = intval($sentence_index);
-                    }
-                }
-                
-                if (!empty($validated_doc_sentences)) {
-                    $validated_sentences[intval($doc_index)] = $validated_doc_sentences;
-                }
-            }
-        }
-        
-        $labeling_data['document_sentences'] = $validated_sentences;
-    }
-}
-
-// Validate text style ID
-if (isset($data['text_style_id'])) {
-    $style_id = $data['text_style_id'];
-    if (is_numeric($style_id)) {
-        // Verify the style exists
-        $functions = new Functions();
-        $styles = $functions->getTextStyles();
-        $valid_style = false;
-        
-        foreach ($styles as $style) {
-            if ($style['id'] == $style_id) {
-                $valid_style = true;
-                break;
-            }
-        }
-        
-        if ($valid_style) {
-            $labeling_data['text_style_id'] = intval($style_id);
-        }
-    }
-}
-
-// Validate and sanitize edited summary
-if (isset($data['edited_summary'])) {
-    $summary = trim($data['edited_summary']);
-    if (strlen($summary) <= 10000) { // Reasonable limit for summary length
-        $labeling_data['edited_summary'] = $summary;
-    } else {
-        echo json_encode(['success' => false, 'message' => 'Summary is too long (max 10000 characters)']);
-        exit();
-    }
-}
-
-// Check if this is a finalization request
-$is_finalize = ($data['action'] ?? '') === 'finalize';
-
-// Validate required data for finalization
-if ($is_finalize) {
-    // Check if any sentences are selected
-    $total_selected = 0;
-    if (isset($labeling_data['document_sentences'])) {
-        foreach ($labeling_data['document_sentences'] as $sentences) {
-            $total_selected += count($sentences);
-        }
-    }
-    
-    if ($total_selected === 0) {
-        echo json_encode(['success' => false, 'message' => 'Please select at least one important sentence from the documents']);
-        exit();
-    }
-    
-    if (empty($labeling_data['text_style_id'])) {
-        echo json_encode(['success' => false, 'message' => 'Please select a text style']);
-        exit();
-    }
-    
-    if (empty($labeling_data['edited_summary'])) {
-        echo json_encode(['success' => false, 'message' => 'Please provide an edited summary']);
-        exit();
-    }
-    
-    // Additional validation for summary quality
-    $summary = $labeling_data['edited_summary'];
-    $word_count = str_word_count($summary);
-    
-    if ($word_count < 15) {
-        echo json_encode(['success' => false, 'message' => 'Summary must be at least 15 words long']);
-        exit();
-    }
-    
-    if ($word_count > 1000) {
-        echo json_encode(['success' => false, 'message' => 'Summary is too long (max 1000 words)']);
-        exit();
-    }
-    
-    // Set status for finalization
-    $labeling_data['status'] = 'completed';
-} else {
-    $labeling_data['status'] = 'pending';
-}
-
 try {
-    // Save the multi-document labeling data
-    $result = $enhancedFunctions->saveMultiDocumentLabeling($group_id, $labeler_id, $labeling_data);
+    // Get POST data
+    $input = file_get_contents('php://input');
+    $data = json_decode($input, true);
     
-    if ($result) {
-        // Update group status if finalizing
-        if ($is_finalize) {
-            $enhancedFunctions->updateDocumentGroupStatus($group_id, 'completed');
-            
-            // Log the completion
-            error_log("Multi-document labeling completed - Group ID: $group_id, Labeler ID: $labeler_id");
-        }
-        
-        $response = [
-            'success' => true, 
-            'message' => $is_finalize ? 'Multi-document labeling completed successfully' : 'Progress saved successfully'
-        ];
-        
-        // Add progress information
-        $total_selected = 0;
-        if (isset($labeling_data['document_sentences'])) {
-            foreach ($labeling_data['document_sentences'] as $sentences) {
-                $total_selected += count($sentences);
-            }
-        }
-        
-        $documents_processed = isset($labeling_data['document_sentences']) 
-            ? count($labeling_data['document_sentences']) 
-            : 0;
-        
-        $response['progress'] = [
-            'total_sentences_selected' => $total_selected,
-            'documents_processed' => $documents_processed,
-            'has_style' => !empty($labeling_data['text_style_id']),
-            'has_summary' => !empty($labeling_data['edited_summary']),
-            'is_completed' => $is_finalize
-        ];
-        
-        // Add summary statistics if available
-        if (!empty($labeling_data['edited_summary'])) {
-            $summary = $labeling_data['edited_summary'];
-            $response['summary_stats'] = [
-                'word_count' => str_word_count($summary),
-                'char_count' => mb_strlen($summary, 'UTF-8'),
-                'sentence_count' => count(preg_split('/[.!?]+/', $summary, -1, PREG_SPLIT_NO_EMPTY)),
-                'paragraph_count' => count(array_filter(explode("\n", $summary)))
-            ];
-        }
-        
-        echo json_encode($response);
-    } else {
-        echo json_encode(['success' => false, 'message' => 'Failed to save multi-document labeling data']);
+    if (!$data) {
+        throw new Exception('Dữ liệu không hợp lệ');
     }
+    
+    // Validate required fields
+    if (!isset($data['group_id']) || !isset($data['action'])) {
+        throw new Exception('Thiếu thông tin bắt buộc');
+    }
+    
+    $groupId = intval($data['group_id']);
+    $action = $data['action'];
+    $labelerId = $_SESSION['user_id'];
+    
+    $ef = new EnhancedFunctions();
+    
+    switch ($action) {
+        case 'save_progress':
+            handleSaveProgress($ef, $groupId, $labelerId, $data);
+            break;
+            
+        case 'submit_completed':
+            handleSubmitCompleted($ef, $groupId, $labelerId, $data);
+            break;
+            
+        case 'auto_save':
+            handleAutoSave($ef, $groupId, $labelerId, $data);
+            break;
+            
+        default:
+            throw new Exception('Action không hợp lệ');
+    }
+    
 } catch (Exception $e) {
-    error_log("Save multi-document labeling error: " . $e->getMessage());
-    echo json_encode(['success' => false, 'message' => 'An error occurred while saving: ' . $e->getMessage()]);
+    error_log("Save multi labeling error: " . $e->getMessage());
+    http_response_code(400);
+    echo json_encode([
+        'success' => false,
+        'message' => $e->getMessage()
+    ]);
+}
+
+/**
+ * Save labeling progress (not completed)
+ */
+function handleSaveProgress($ef, $groupId, $labelerId, $data) {
+    $labelingData = prepareLabelingData($data);
+    
+    try {
+        global $conn;
+        
+        // Update labeling with progress
+        $stmt = $conn->prepare("
+            UPDATE labelings SET 
+                document_sentences = ?,
+                ai_summary_edited = ?,
+                status = 'in_progress',
+                updated_at = NOW()
+            WHERE group_id = ? AND labeler_id = ?
+        ");
+        
+        $documentSentencesJson = json_encode($labelingData['document_sentences']);
+        $editedSummary = $labelingData['edited_summary'];
+        
+        $stmt->bind_param("ssii", $documentSentencesJson, $editedSummary, $groupId, $labelerId);
+        $stmt->execute();
+        
+        if ($stmt->affected_rows > 0) {
+            echo json_encode([
+                'success' => true,
+                'message' => 'Đã lưu tiến độ thành công',
+                'timestamp' => date('H:i:s')
+            ]);
+        } else {
+            throw new Exception('Không tìm thấy nhiệm vụ hoặc không có thay đổi');
+        }
+        
+    } catch (Exception $e) {
+        throw new Exception('Lỗi lưu tiến độ: ' . $e->getMessage());
+    }
+}
+
+/**
+ * Submit completed labeling
+ */
+function handleSubmitCompleted($ef, $groupId, $labelerId, $data) {
+    $labelingData = prepareLabelingData($data);
+    
+    // Validate completion requirements
+    $totalSelected = 0;
+    foreach ($labelingData['document_sentences'] as $docSentences) {
+        $totalSelected += count($docSentences);
+    }
+    
+    if ($totalSelected === 0) {
+        throw new Exception('Cần chọn ít nhất một câu để hoàn thành');
+    }
+    
+    if (empty(trim($labelingData['edited_summary']))) {
+        throw new Exception('Cần chỉnh sửa bản tóm tắt để hoàn thành');
+    }
+    
+    $result = $ef->saveMultiLabeling($groupId, $labelerId, $labelingData);
+    
+    if ($result['success']) {
+        // Add completion statistics
+        $result['statistics'] = [
+            'total_selected_sentences' => $totalSelected,
+            'documents_processed' => count($labelingData['document_sentences']),
+            'summary_length' => strlen($labelingData['edited_summary']),
+            'completion_time' => date('Y-m-d H:i:s')
+        ];
+    }
+    
+    echo json_encode($result);
+}
+
+/**
+ * Auto-save functionality
+ */
+function handleAutoSave($ef, $groupId, $labelerId, $data) {
+    try {
+        $labelingData = prepareLabelingData($data);
+        
+        global $conn;
+        
+        // Simple update without status change
+        $stmt = $conn->prepare("
+            UPDATE labelings SET 
+                document_sentences = ?,
+                ai_summary_edited = ?,
+                updated_at = NOW()
+            WHERE group_id = ? AND labeler_id = ?
+        ");
+        
+        $documentSentencesJson = json_encode($labelingData['document_sentences']);
+        $editedSummary = $labelingData['edited_summary'];
+        
+        $stmt->bind_param("ssii", $documentSentencesJson, $editedSummary, $groupId, $labelerId);
+        $stmt->execute();
+        
+        echo json_encode([
+            'success' => true,
+            'message' => 'Auto-saved',
+            'timestamp' => date('H:i:s')
+        ]);
+        
+    } catch (Exception $e) {
+        // For auto-save, we don't want to show errors to user
+        error_log("Auto-save error: " . $e->getMessage());
+        echo json_encode([
+            'success' => false,
+            'message' => 'Auto-save failed silently'
+        ]);
+    }
+}
+
+/**
+ * Prepare labeling data from request
+ */
+function prepareLabelingData($data) {
+    $documentSentences = [];
+    $editedSummary = '';
+    
+    // Extract document sentences
+    if (isset($data['document_sentences'])) {
+        foreach ($data['document_sentences'] as $docId => $sentences) {
+            $documentSentences[intval($docId)] = array_map('intval', $sentences);
+        }
+    }
+    
+    // Extract edited summary
+    if (isset($data['edited_summary'])) {
+        $editedSummary = trim($data['edited_summary']);
+    }
+    
+    return [
+        'document_sentences' => $documentSentences,
+        'edited_summary' => $editedSummary
+    ];
+}
+
+/**
+ * Validate labeling data
+ */
+function validateLabelingData($labelingData) {
+    $errors = [];
+    
+    // Check if any sentences are selected
+    $totalSelected = 0;
+    foreach ($labelingData['document_sentences'] as $sentences) {
+        $totalSelected += count($sentences);
+    }
+    
+    if ($totalSelected === 0) {
+        $errors[] = 'Cần chọn ít nhất một câu';
+    }
+    
+    // Check summary length
+    $summaryLength = strlen($labelingData['edited_summary']);
+    if ($summaryLength < 10) {
+        $errors[] = 'Bản tóm tắt quá ngắn (tối thiểu 10 ký tự)';
+    }
+    
+    if ($summaryLength > 5000) {
+        $errors[] = 'Bản tóm tắt quá dài (tối đa 5000 ký tự)';
+    }
+    
+    return $errors;
+}
+
+/**
+ * Log labeling activity
+ */
+function logLabelingActivity($groupId, $labelerId, $action, $details = []) {
+    try {
+        global $conn;
+        
+        $stmt = $conn->prepare("
+            INSERT INTO labeling_logs (group_id, labeler_id, action, details, created_at) 
+            VALUES (?, ?, ?, ?, NOW())
+        ");
+        
+        $detailsJson = json_encode($details);
+        $stmt->bind_param("iiss", $groupId, $labelerId, $action, $detailsJson);
+        $stmt->execute();
+        
+    } catch (Exception $e) {
+        // Don't throw error for logging, just record it
+        error_log("Logging error: " . $e->getMessage());
+    }
+}
+
+/**
+ * Get labeling statistics for response
+ */
+function getLabelingStats($labelingData) {
+    $totalSentences = 0;
+    $selectedSentences = 0;
+    $documentsProcessed = count($labelingData['document_sentences']);
+    
+    foreach ($labelingData['document_sentences'] as $sentences) {
+        $selectedSentences += count($sentences);
+    }
+    
+    return [
+        'documents_processed' => $documentsProcessed,
+        'selected_sentences' => $selectedSentences,
+        'summary_length' => strlen($labelingData['edited_summary']),
+        'completion_percentage' => $totalSentences > 0 ? round(($selectedSentences / $totalSentences) * 100, 2) : 0
+    ];
 }
 ?>
