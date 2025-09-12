@@ -294,5 +294,261 @@ class Functions {
             $this->conn->close();
         }
     }
+	
+		/**
+	 * Get all labelings for a user
+	 */
+	public function getLabelings($user_id = null) {
+		try {
+			$query = "
+				SELECT l.*, d.title, d.content, d.ai_summary, u.username as labeler_name
+				FROM labelings l
+				LEFT JOIN documents d ON l.document_id = d.id
+				LEFT JOIN users u ON l.labeler_id = u.id
+			";
+			
+			$params = [];
+			$types = "";
+			
+			if ($user_id !== null) {
+				$query .= " WHERE l.labeler_id = ?";
+				$params[] = $user_id;
+				$types .= "i";
+			}
+			
+			$query .= " ORDER BY l.created_at DESC";
+			
+			$stmt = $this->conn->prepare($query);
+			if (!empty($params)) {
+				$stmt->bind_param($types, ...$params);
+			}
+			$stmt->execute();
+			$result = $stmt->get_result();
+			
+			$labelings = [];
+			while ($row = $result->fetch_assoc()) {
+				$labelings[] = $row;
+			}
+			
+			return ['success' => true, 'data' => $labelings];
+			
+		} catch (Exception $e) {
+			error_log("Get labelings error: " . $e->getMessage());
+			return ['success' => false, 'data' => []];
+		}
+	}
+
+	/**
+	 * Get labeler tasks with enhanced information
+	 */
+	public function getLabelerTasks($labeler_id) {
+		try {
+			$stmt = $this->conn->prepare("
+				SELECT l.*, d.title, d.content, d.ai_summary, 
+					   CASE 
+						   WHEN l.status = 'assigned' THEN 'Đã giao'
+						   WHEN l.status = 'in_progress' THEN 'Đang làm'
+						   WHEN l.status = 'completed' THEN 'Hoàn thành'
+						   ELSE 'Không xác định'
+					   END as status_text,
+					   CASE 
+						   WHEN l.status = 'assigned' THEN 0
+						   WHEN l.status = 'in_progress' THEN 50
+						   WHEN l.status = 'completed' THEN 100
+						   ELSE 0
+					   END as progress
+				FROM labelings l
+				LEFT JOIN documents d ON l.document_id = d.id
+				WHERE l.labeler_id = ?
+				ORDER BY l.created_at DESC
+			");
+			$stmt->bind_param("i", $labeler_id);
+			$stmt->execute();
+			$result = $stmt->get_result();
+			
+			$tasks = [];
+			while ($row = $result->fetch_assoc()) {
+				// Add default title if empty
+				if (empty($row['title'])) {
+					$row['title'] = 'Untitled Document #' . $row['id'];
+				}
+				
+				// Format dates
+				$row['created_at_formatted'] = date('d/m/Y H:i', strtotime($row['created_at']));
+				if ($row['completed_at']) {
+					$row['completed_at_formatted'] = date('d/m/Y H:i', strtotime($row['completed_at']));
+				}
+				
+				$tasks[] = $row;
+			}
+			
+			return ['success' => true, 'data' => $tasks];
+			
+		} catch (Exception $e) {
+			error_log("Get labeler tasks error: " . $e->getMessage());
+			return ['success' => false, 'data' => []];
+		}
+	}
+
+	/**
+	 * Get completed tasks for a labeler
+	 */
+	public function getCompletedTasks($labeler_id) {
+		try {
+			$stmt = $this->conn->prepare("
+				SELECT l.*, d.title, d.content
+				FROM labelings l
+				LEFT JOIN documents d ON l.document_id = d.id
+				WHERE l.labeler_id = ? AND l.status = 'completed'
+				ORDER BY l.completed_at DESC
+			");
+			$stmt->bind_param("i", $labeler_id);
+			$stmt->execute();
+			$result = $stmt->get_result();
+			
+			$tasks = [];
+			while ($row = $result->fetch_assoc()) {
+				if (empty($row['title'])) {
+					$row['title'] = 'Completed Document #' . $row['id'];
+				}
+				$row['completed_at_formatted'] = date('d/m/Y H:i', strtotime($row['completed_at']));
+				$tasks[] = $row;
+			}
+			
+			return ['success' => true, 'data' => $tasks];
+			
+		} catch (Exception $e) {
+			error_log("Get completed tasks error: " . $e->getMessage());
+			return ['success' => false, 'data' => []];
+		}
+	}
+
+	/**
+	 * Get available tasks for assignment
+	 */
+	public function getAvailableTasks($type = 'single', $limit = 10) {
+		try {
+			$query = "
+				SELECT d.*, 
+					   COUNT(l.id) as assignment_count,
+					   MAX(l.created_at) as last_assigned
+				FROM documents d
+				LEFT JOIN labelings l ON d.id = l.document_id
+				WHERE d.status = 'active'
+			";
+			
+			if ($type === 'single') {
+				$query .= " AND d.document_type = 'single'";
+			}
+			
+			$query .= "
+				GROUP BY d.id
+				HAVING assignment_count < 3
+				ORDER BY d.created_at DESC
+				LIMIT ?
+			";
+			
+			$stmt = $this->conn->prepare($query);
+			$stmt->bind_param("i", $limit);
+			$stmt->execute();
+			$result = $stmt->get_result();
+			
+			$tasks = [];
+			while ($row = $result->fetch_assoc()) {
+				if (empty($row['title'])) {
+					$row['title'] = 'Available Document #' . $row['id'];
+				}
+				
+				// Calculate content preview
+				$row['content_preview'] = mb_substr($row['content'], 0, 200) . '...';
+				$row['word_count'] = str_word_count(strip_tags($row['content']));
+				$row['created_at_formatted'] = date('d/m/Y', strtotime($row['created_at']));
+				
+				$tasks[] = $row;
+			}
+			
+			return ['success' => true, 'data' => $tasks];
+			
+		} catch (Exception $e) {
+			error_log("Get available tasks error: " . $e->getMessage());
+			return ['success' => false, 'data' => []];
+		}
+	}
+
+	/**
+	 * Assign task to labeler
+	 */
+	public function assignTask($document_id, $labeler_id) {
+		try {
+			// Check if already assigned
+			$stmt = $this->conn->prepare("
+				SELECT COUNT(*) as count 
+				FROM labelings 
+				WHERE document_id = ? AND labeler_id = ? AND status != 'completed'
+			");
+			$stmt->bind_param("ii", $document_id, $labeler_id);
+			$stmt->execute();
+			$result = $stmt->get_result()->fetch_assoc();
+			
+			if ($result['count'] > 0) {
+				return ['success' => false, 'message' => 'Task already assigned to this labeler'];
+			}
+			
+			// Create new assignment
+			$stmt = $this->conn->prepare("
+				INSERT INTO labelings (document_id, labeler_id, status, created_at)
+				VALUES (?, ?, 'assigned', NOW())
+			");
+			$stmt->bind_param("ii", $document_id, $labeler_id);
+			
+			if ($stmt->execute()) {
+				return ['success' => true, 'message' => 'Task assigned successfully', 'labeling_id' => $this->conn->insert_id];
+			} else {
+				return ['success' => false, 'message' => 'Failed to assign task'];
+			}
+			
+		} catch (Exception $e) {
+			error_log("Assign task error: " . $e->getMessage());
+			return ['success' => false, 'message' => 'Error assigning task'];
+		}
+	}
+
+	/**
+	 * Get task statistics for labeler
+	 */
+	public function getLabelerStats($labeler_id) {
+		try {
+			$stats = [
+				'total' => 0,
+				'completed' => 0,
+				'in_progress' => 0,
+				'assigned' => 0
+			];
+			
+			$stmt = $this->conn->prepare("
+				SELECT status, COUNT(*) as count
+				FROM labelings
+				WHERE labeler_id = ?
+				GROUP BY status
+			");
+			$stmt->bind_param("i", $labeler_id);
+			$stmt->execute();
+			$result = $stmt->get_result();
+			
+			while ($row = $result->fetch_assoc()) {
+				$stats[$row['status']] = (int)$row['count'];
+				$stats['total'] += (int)$row['count'];
+			}
+			
+			// Calculate completion rate
+			$stats['completion_rate'] = $stats['total'] > 0 ? round(($stats['completed'] / $stats['total']) * 100, 2) : 0;
+			
+			return ['success' => true, 'data' => $stats];
+			
+		} catch (Exception $e) {
+			error_log("Get labeler stats error: " . $e->getMessage());
+			return ['success' => false, 'data' => ['total' => 0, 'completed' => 0, 'in_progress' => 0, 'assigned' => 0, 'completion_rate' => 0]];
+		}
+	}
 }
 ?>
