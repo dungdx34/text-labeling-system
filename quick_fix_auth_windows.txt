@@ -1,0 +1,25 @@
+@echo off
+echo Fixing auth.php includes...
+
+REM Backup and remove auth.php
+cd includes
+if exist auth.php (
+    copy auth.php auth.php.backup
+    del auth.php
+    echo auth.php removed successfully
+) else (
+    echo auth.php not found
+)
+
+cd ..
+
+REM Remove auth.php includes from all PHP files
+echo Removing auth.php includes from PHP files...
+
+REM Use PowerShell to replace auth.php includes
+powershell -Command "(Get-Content admin\*.php) -replace \"require_once.*auth\.php.*\", \"// require_once auth.php - REMOVED\" | Set-Content admin\*.php"
+powershell -Command "(Get-Content labeler\*.php) -replace \"require_once.*auth\.php.*\", \"// require_once auth.php - REMOVED\" | Set-Content labeler\*.php"
+powershell -Command "(Get-Content reviewer\*.php) -replace \"require_once.*auth\.php.*\", \"// require_once auth.php - REMOVED\" | Set-Content reviewer\*.php"
+
+echo Done! Please test your website now.
+pause

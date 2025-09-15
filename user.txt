@@ -1,0 +1,3 @@
+UPDATE users SET password = '$2y$10$/mEZfg3Bp73e26RiLvLIw.QhIdV5CWZ67UKSjwj3m84O90YN3r3SW' WHERE username = 'admin'; 
+UPDATE users SET password = '$2y$10$/mEZfg3Bp73e26RiLvLIw.QhIdV5CWZ67UKSjwj3m84O90YN3r3SW' WHERE username = 'labeler1'; 
+UPDATE users SET password = '$2y$10$/mEZfg3Bp73e26RiLvLIw.QhIdV5CWZ67UKSjwj3m84O90YN3r3SW' WHERE username = 'labeler2'; 

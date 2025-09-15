@@ -1,510 +1,633 @@
 <?php
-$page_title = 'Gán nhãn tài liệu';
-require_once '../includes/auth.php';
+session_start();
+
+// Include files in correct order (database first, then functions)
+require_once '../config/database.php';
 require_once '../includes/functions.php';
 
-$auth = new Auth();
-$auth->requireRole('labeler');
+// Check authentication using function from functions.php
+requireRole('labeler');
 
-$functions = new Functions();
-$document_id = $_GET['document_id'] ?? 0;
+$user_id = $_SESSION['user_id'];
+$username = $_SESSION['username'] ?? 'Unknown';
 
-if (!$document_id) {
-    header('Location: dashboard.php');
+// Get group_id from URL
+$group_id = isset($_GET['group_id']) ? (int)$_GET['group_id'] : 0;
+
+if (!$group_id) {
+    header('Location: dashboard.php?error=no_group_id');
     exit();
 }
 
-$document = $functions->getDocument($document_id);
-if (!$document) {
-    header('Location: dashboard.php');
-    exit();
+try {
+    // Get document group info
+    $group = getDocumentGroup($group_id);
+    
+    if (!$group) {
+        header('Location: dashboard.php?error=group_not_found');
+        exit();
+    }
+    
+    // Check if user is assigned to this group
+    if ($group['assigned_labeler'] != $user_id) {
+        header('Location: dashboard.php?error=not_assigned');
+        exit();
+    }
+    
+    // Get documents in this group
+    $documents = getDocumentsByGroup($group_id);
+    
+    // Check if labeling already exists
+    $existing_labeling = getLabeling($group_id, $user_id);
+    
+    // Initialize variables
+    $selected_sentences = [];
+    $edited_summary = $group['ai_summary'];
+    $text_style = '';
+    
+    if ($existing_labeling) {
+        $selected_sentences = json_decode($existing_labeling['selected_sentences'] ?? '[]', true);
+        $edited_summary = $existing_labeling['edited_summary'] ?? $group['ai_summary'];
+        $text_style = $existing_labeling['text_style'] ?? '';
+    }
+
+} catch (Exception $e) {
+    $error_message = "Lỗi khi tải dữ liệu: " . $e->getMessage();
 }
-
-$text_styles = $functions->getTextStyles();
-$existing_labeling = $functions->getLabeling($document_id, $_SESSION['user_id']);
-
-// Parse existing data
-$selected_sentences = [];
-$selected_style = null;
-$edited_summary = '';
-
-if ($existing_labeling) {
-    $selected_sentences = json_decode($existing_labeling['important_sentences'] ?? '[]', true) ?: [];
-    $selected_style = $existing_labeling['text_style_id'];
-    $edited_summary = $existing_labeling['edited_summary'] ?? '';
-}
-
-// Split document content into sentences
-$sentences = preg_split('/(?<=[.!?])\s+/', $document['content'], -1, PREG_SPLIT_NO_EMPTY);
-
-require_once '../includes/header.php';
 ?>
 
-<div class="container-fluid">
-    <div class="row">
-        <!-- Sidebar -->
-        <div class="col-md-2 p-0">
-            <div class="sidebar p-3">
-                <nav class="nav flex-column">
-                    <a class="nav-link" href="dashboard.php">
-                        <i class="fas fa-tachometer-alt me-2"></i>Dashboard
-                    </a>
-                    <a class="nav-link active" href="#">
-                        <i class="fas fa-tags me-2"></i>Gán nhãn
-                    </a>
-                    <a class="nav-link" href="my_tasks.php">
-                        <i class="fas fa-tasks me-2"></i>Công việc của tôi
-                    </a>
-                </nav>
-            </div>
-        </div>
-        
-        <!-- Main Content -->
-        <div class="col-md-10">
-            <div class="main-content">
-                <!-- Header -->
-                <div class="d-flex justify-content-between align-items-center mb-4">
-                    <div>
-                        <h2 class="text-gradient">
-                            <i class="fas fa-tags me-2"></i>Gán nhãn tài liệu
-                        </h2>
-                        <div class="d-flex align-items-center gap-3">
-                            <span class="text-muted">Tài liệu: <strong><?php echo htmlspecialchars($document['title']); ?></strong></span>
-                            <span id="unsaved-indicator" class="badge bg-warning" style="display: none;">
-                                <i class="fas fa-exclamation-triangle me-1"></i>Chưa lưu
-                            </span>
-                        </div>
-                    </div>
-                    <div class="d-flex gap-2">
-                        <button class="btn btn-outline-secondary" onclick="history.back()">
-                            <i class="fas fa-arrow-left me-2"></i>Quay lại
-                        </button>
-                        <button class="btn btn-outline-info" data-bs-toggle="modal" data-bs-target="#helpModal">
-                            <i class="fas fa-question-circle me-2"></i>Trợ giúp
-                        </button>
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gán nhãn văn bản - Text Labeling System</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="../css/style.css" rel="stylesheet">
+    <style>
+        .sentence {
+            padding: 8px 12px;
+            margin: 4px 0;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            border: 2px solid transparent;
+            line-height: 1.6;
+            background-color: #f8f9fa;
+        }
+        .sentence:hover {
+            background-color: #e9ecef;
+            border-color: #007bff;
+        }
+        .sentence.selected {
+            background-color: #d4edda;
+            border-color: #28a745;
+            color: #155724;
+        }
+        .summary-editor {
+            min-height: 300px;
+            resize: vertical;
+            border: 2px solid #dee2e6;
+            border-radius: 10px;
+            padding: 15px;
+        }
+        .summary-editor:focus {
+            border-color: #007bff;
+            box-shadow: 0 0 0 0.2rem rgba(0,123,255,.25);
+        }
+        .progress-step {
+            display: flex;
+            justify-content: center;
+            margin: 30px 0;
+        }
+        .step {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            background: #e9ecef;
+            color: #6c757d;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 10px;
+            font-weight: bold;
+            transition: all 0.3s ease;
+        }
+        .step.active {
+            background: #007bff;
+            color: white;
+        }
+        .step.completed {
+            background: #28a745;
+            color: white;
+        }
+    </style>
+</head>
+<body>
+    <?php include '../includes/header.php'; ?>
+
+    <div class="container-fluid">
+        <div class="row">
+            <!-- Sidebar -->
+            <nav class="col-md-3 col-lg-2 d-md-block bg-light sidebar">
+                <div class="position-sticky pt-3">
+                    <ul class="nav flex-column">
+                        <li class="nav-item">
+                            <a class="nav-link" href="dashboard.php">
+                                <i class="fas fa-tachometer-alt me-2"></i>Dashboard
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link" href="my_tasks.php">
+                                <i class="fas fa-tasks me-2"></i>My Tasks
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link active" href="labeling.php">
+                                <i class="fas fa-edit me-2"></i>Labeling
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link" href="multi_labeling.php">
+                                <i class="fas fa-copy me-2"></i>Multi Labeling
+                            </a>
+                        </li>
+                    </ul>
+                </div>
+            </nav>
+
+            <!-- Main content -->
+            <main class="col-md-9 ms-sm-auto col-lg-10 px-md-4">
+                <div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
+                    <h1 class="h2">
+                        <i class="fas fa-edit me-2 text-primary"></i>
+                        Gán nhãn văn bản
+                    </h1>
+                    <div class="btn-toolbar mb-2 mb-md-0">
+                        <a href="dashboard.php" class="btn btn-outline-secondary">
+                            <i class="fas fa-arrow-left me-2"></i>Quay lại Dashboard
+                        </a>
                     </div>
                 </div>
-                
-                <!-- Document Info Card -->
+
+                <?php if (isset($error_message)): ?>
+                    <div class="alert alert-danger" role="alert">
+                        <i class="fas fa-exclamation-triangle me-2"></i>
+                        <?php echo $error_message; ?>
+                    </div>
+                <?php endif; ?>
+
+                <!-- Group Information -->
                 <div class="card mb-4">
+                    <div class="card-header bg-primary text-white">
+                        <h5 class="mb-0">
+                            <i class="fas fa-info-circle me-2"></i>
+                            Thông tin văn bản
+                        </h5>
+                    </div>
                     <div class="card-body">
                         <div class="row">
                             <div class="col-md-8">
-                                <h5 class="card-title text-primary">
-                                    <i class="fas fa-file-text me-2"></i><?php echo htmlspecialchars($document['title']); ?>
-                                </h5>
-                                <p class="card-text text-muted mb-2">
-                                    <i class="fas fa-calendar me-2"></i>Ngày upload: <?php echo date('d/m/Y H:i', strtotime($document['created_at'])); ?>
-                                </p>
-                                <p class="card-text text-muted">
-                                    <i class="fas fa-align-left me-2"></i>Độ dài: <?php echo strlen($document['content']); ?> ký tự | 
-                                    <?php echo count($sentences); ?> câu
-                                </p>
+                                <h6 class="text-primary">Tiêu đề:</h6>
+                                <p class="mb-2"><strong><?php echo htmlspecialchars($group['title']); ?></strong></p>
+                                
+                                <h6 class="text-primary">Mô tả:</h6>
+                                <p class="mb-2"><?php echo htmlspecialchars($group['description'] ?? ''); ?></p>
                             </div>
                             <div class="col-md-4">
-                                <div class="text-end">
-                                    <div class="progress mb-2" style="height: 8px;">
-                                        <div class="progress-bar bg-primary" id="overall-progress" style="width: 0%"></div>
-                                    </div>
-                                    <small class="text-muted">Tiến độ hoàn thành: <span id="progress-text">0%</span></small>
-                                </div>
+                                <h6 class="text-primary">Thông tin khác:</h6>
+                                <p class="mb-1"><strong>Loại:</strong> <?php echo $group['group_type'] === 'multi' ? 'Đa văn bản' : 'Đơn văn bản'; ?></p>
+                                <p class="mb-1"><strong>Số văn bản:</strong> <?php echo count($documents); ?></p>
+                                <p class="mb-0"><strong>Ngày tạo:</strong> <?php echo date('d/m/Y H:i', strtotime($group['created_at'])); ?></p>
                             </div>
                         </div>
                     </div>
                 </div>
-                
-                <!-- Step Indicator -->
-                <div class="step-indicator mb-4">
-                    <div class="step <?php echo empty($selected_sentences) ? 'active' : 'completed'; ?>" id="step-indicator-1">
-                        <span>1</span>
-                    </div>
-                    <div class="step <?php echo !$selected_style ? '' : (empty($edited_summary) ? 'active' : 'completed'); ?>" id="step-indicator-2">
-                        <span>2</span>
-                    </div>
-                    <div class="step <?php echo empty($edited_summary) ? '' : 'active'; ?>" id="step-indicator-3">
-                        <span>3</span>
-                    </div>
+
+                <!-- Progress Steps -->
+                <div class="progress-step">
+                    <div class="step active" id="step-1">1</div>
+                    <div class="step" id="step-2">2</div>
+                    <div class="step" id="step-3">3</div>
                 </div>
-                
-                <input type="hidden" id="document-id" value="<?php echo $document_id; ?>">
-                
-                <!-- Step 1: Select Important Sentences -->
-                <div class="labeling-step" id="step-1">
-                    <div class="labeling-interface">
-                        <div class="d-flex justify-content-between align-items-center mb-4">
-                            <h4 class="text-primary">
-                                <i class="fas fa-mouse-pointer me-2"></i>Bước 1: Chọn các câu quan trọng
-                            </h4>
-                            <div class="d-flex align-items-center gap-3">
-                                <span class="badge bg-primary fs-6">
-                                    Đã chọn: <span id="selected-count" class="fw-bold">0</span> câu
-                                </span>
-                                <button class="btn btn-sm btn-outline-secondary" onclick="clearAllSelections()">
-                                    <i class="fas fa-eraser me-1"></i>Xóa tất cả
-                                </button>
-                            </div>
-                        </div>
-                        
-                        <div class="alert alert-info">
-                            <i class="fas fa-lightbulb me-2"></i>
-                            <strong>Hướng dẫn:</strong> Click vào các câu mà bạn cho là quan trọng và có ý nghĩa chính trong văn bản. 
-                            Các câu được chọn sẽ được highlight màu xanh.
-                        </div>
-                        
-                        <div class="document-content border rounded p-4" style="max-height: 500px; overflow-y: auto; background: #fafafa;">
-                            <?php foreach ($sentences as $index => $sentence): ?>
-                                <div class="sentence-selectable <?php echo in_array($index, $selected_sentences) ? 'sentence-selected' : ''; ?>" 
-                                     data-index="<?php echo $index; ?>">
-                                    <?php echo htmlspecialchars(trim($sentence)); ?>
-                                </div>
-                            <?php endforeach; ?>
-                        </div>
-                        
-                        <div class="d-flex justify-content-between align-items-center mt-4">
-                            <div class="text-muted">
-                                <i class="fas fa-info-circle me-2"></i>
-                                Tổng số câu: <?php echo count($sentences); ?>
-                            </div>
-                            <button type="button" class="btn btn-primary btn-next-step">
-                                Tiếp theo: Chọn phong cách <i class="fas fa-arrow-right ms-2"></i>
-                            </button>
-                        </div>
-                    </div>
-                </div>
-                
-                <!-- Step 2: Select Text Style -->
-                <div class="labeling-step" id="step-2" style="display: none;">
-                    <div class="labeling-interface">
-                        <div class="d-flex justify-content-between align-items-center mb-4">
-                            <h4 class="text-primary">
-                                <i class="fas fa-palette me-2"></i>Bước 2: Chọn phong cách văn bản
-                            </h4>
-                            <span class="badge bg-info fs-6" id="selected-style-badge" style="display: none;">
-                                Đã chọn phong cách
-                            </span>
-                        </div>
-                        
-                        <div class="alert alert-info">
-                            <i class="fas fa-lightbulb me-2"></i>
-                            <strong>Hướng dẫn:</strong> Chọn một phong cách văn bản phù hợp nhất với nội dung tài liệu.
-                        </div>
-                        
+
+                <!-- Navigation Tabs -->
+                <ul class="nav nav-tabs" id="labelingTabs" role="tablist">
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link active" id="step1-tab" data-bs-toggle="tab" data-bs-target="#step1" type="button">
+                            <i class="fas fa-mouse-pointer me-2"></i>Bước 1: Chọn câu quan trọng
+                        </button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="step2-tab" data-bs-toggle="tab" data-bs-target="#step2" type="button">
+                            <i class="fas fa-palette me-2"></i>Bước 2: Xác định phong cách
+                        </button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="step3-tab" data-bs-toggle="tab" data-bs-target="#step3" type="button">
+                            <i class="fas fa-edit me-2"></i>Bước 3: Chỉnh sửa tóm tắt
+                        </button>
+                    </li>
+                </ul>
+
+                <!-- Tab Content -->
+                <div class="tab-content" id="labelingTabContent">
+                    <!-- Step 1: Select Important Sentences -->
+                    <div class="tab-pane fade show active" id="step1" role="tabpanel">
                         <div class="row">
-                            <?php foreach ($text_styles as $style): ?>
-                            <div class="col-lg-6 mb-3">
-                                <div class="text-style-option <?php echo $selected_style == $style['id'] ? 'selected' : ''; ?>" 
-                                     data-style-id="<?php echo $style['id']; ?>">
-                                    <div class="d-flex align-items-start">
-                                        <i class="fas fa-check-circle text-success me-3 mt-1" style="font-size: 1.2rem; opacity: 0;"></i>
-                                        <div class="flex-grow-1">
-                                            <h6 class="mb-2"><?php echo htmlspecialchars($style['name']); ?></h6>
-                                            <p class="text-muted small mb-0"><?php echo htmlspecialchars($style['description']); ?></p>
+                            <div class="col-md-8">
+                                <!-- Documents -->
+                                <?php if (!empty($documents)): ?>
+                                    <?php foreach ($documents as $index => $document): ?>
+                                        <div class="card mb-3">
+                                            <div class="card-header bg-light">
+                                                <h6 class="mb-0">
+                                                    <i class="fas fa-file-text me-2"></i>
+                                                    <?php echo htmlspecialchars($document['title']); ?>
+                                                </h6>
+                                            </div>
+                                            <div class="card-body">
+                                                <div class="document-content" data-document-id="<?php echo $document['id']; ?>">
+                                                    <?php
+                                                    $sentences = preg_split('/(?<=[.!?])\s+/', $document['content'], -1, PREG_SPLIT_NO_EMPTY);
+                                                    foreach ($sentences as $sentence_index => $sentence):
+                                                        $sentence_id = $document['id'] . '_' . $sentence_index;
+                                                        $is_selected = in_array($sentence_id, $selected_sentences);
+                                                    ?>
+                                                        <div class="sentence <?php echo $is_selected ? 'selected' : ''; ?>" 
+                                                             data-sentence-id="<?php echo $sentence_id; ?>"
+                                                             data-document-id="<?php echo $document['id']; ?>"
+                                                             data-sentence-index="<?php echo $sentence_index; ?>">
+                                                            <?php echo htmlspecialchars(trim($sentence)); ?>
+                                                        </div>
+                                                    <?php endforeach; ?>
+                                                </div>
+                                            </div>
                                         </div>
+                                    <?php endforeach; ?>
+                                <?php else: ?>
+                                    <div class="alert alert-warning">
+                                        <i class="fas fa-exclamation-triangle me-2"></i>
+                                        Không có văn bản nào trong nhóm này.
                                     </div>
-                                </div>
+                                <?php endif; ?>
                             </div>
-                            <?php endforeach; ?>
-                        </div>
-                        
-                        <div class="d-flex justify-content-between mt-4">
-                            <button type="button" class="btn btn-outline-secondary btn-prev-step">
-                                <i class="fas fa-arrow-left me-2"></i>Quay lại: Chọn câu
-                            </button>
-                            <button type="button" class="btn btn-primary btn-next-step">
-                                Tiếp theo: Chỉnh sửa tóm tắt <i class="fas fa-arrow-right ms-2"></i>
-                            </button>
-                        </div>
-                    </div>
-                </div>
-                
-                <!-- Step 3: Edit AI Summary -->
-                <div class="labeling-step" id="step-3" style="display: none;">
-                    <div class="labeling-interface">
-                        <div class="d-flex justify-content-between align-items-center mb-4">
-                            <h4 class="text-primary">
-                                <i class="fas fa-edit me-2"></i>Bước 3: Chỉnh sửa bản tóm tắt
-                            </h4>
-                            <div class="d-flex gap-2">
-                                <button class="btn btn-sm btn-outline-info" onclick="suggestSummary()">
-                                    <i class="fas fa-magic me-1"></i>Gợi ý AI
-                                </button>
-                                <button class="btn btn-sm btn-outline-secondary" onclick="resetSummary()">
-                                    <i class="fas fa-undo me-1"></i>Khôi phục gốc
-                                </button>
-                            </div>
-                        </div>
-                        
-                        <div class="alert alert-info">
-                            <i class="fas fa-lightbulb me-2"></i>
-                            <strong>Hướng dẫn:</strong> Chỉnh sửa bản tóm tắt để phù hợp với nội dung và các câu quan trọng đã chọn. 
-                            Hãy đảm bảo tóm tắt ngắn gọn, súc tích và bao quát được ý chính.
-                        </div>
-                        
-                        <?php if ($document['ai_summary']): ?>
-                        <div class="row mb-4">
-                            <div class="col-md-6">
+
+                            <div class="col-md-4">
+                                <!-- Selected Sentences Summary -->
                                 <div class="card">
-                                    <div class="card-header bg-light">
+                                    <div class="card-header bg-success text-white">
                                         <h6 class="mb-0">
-                                            <i class="fas fa-robot me-2"></i>Bản tóm tắt gốc của AI
+                                            <i class="fas fa-list me-2"></i>
+                                            Câu đã chọn (<span id="selected-count">0</span>)
                                         </h6>
                                     </div>
                                     <div class="card-body">
-                                        <div class="original-summary">
-                                            <?php echo nl2br(htmlspecialchars($document['ai_summary'])); ?>
+                                        <div id="selected-sentences-summary">
+                                            <div class="text-muted text-center py-3">
+                                                <i class="fas fa-info-circle me-2"></i>
+                                                Chưa chọn câu nào
+                                            </div>
+                                        </div>
+                                        <div class="mt-3">
+                                            <button type="button" class="btn btn-primary w-100" onclick="goToStep(2)">
+                                                Tiếp theo <i class="fas fa-arrow-right ms-2"></i>
+                                            </button>
                                         </div>
                                     </div>
                                 </div>
                             </div>
+                        </div>
+                    </div>
+
+                    <!-- Step 2: Text Style -->
+                    <div class="tab-pane fade" id="step2" role="tabpanel">
+                        <div class="card">
+                            <div class="card-header bg-warning text-dark">
+                                <h5 class="mb-0">
+                                    <i class="fas fa-palette me-2"></i>
+                                    Xác định phong cách văn bản
+                                </h5>
+                            </div>
+                            <div class="card-body">
+                                <div class="row">
+                                    <div class="col-md-6">
+                                        <h6>Chọn phong cách văn bản phù hợp:</h6>
+                                        <div class="form-check mb-3">
+                                            <input class="form-check-input" type="radio" name="text_style" id="formal" value="formal" <?php echo $text_style === 'formal' ? 'checked' : ''; ?>>
+                                            <label class="form-check-label" for="formal">
+                                                <strong>Trang trọng</strong> - Ngôn ngữ chính thức, khách quan
+                                            </label>
+                                        </div>
+                                        <div class="form-check mb-3">
+                                            <input class="form-check-input" type="radio" name="text_style" id="informal" value="informal" <?php echo $text_style === 'informal' ? 'checked' : ''; ?>>
+                                            <label class="form-check-label" for="informal">
+                                                <strong>Thân thiện</strong> - Ngôn ngữ gần gụi, dễ hiểu
+                                            </label>
+                                        </div>
+                                        <div class="form-check mb-3">
+                                            <input class="form-check-input" type="radio" name="text_style" id="academic" value="academic" <?php echo $text_style === 'academic' ? 'checked' : ''; ?>>
+                                            <label class="form-check-label" for="academic">
+                                                <strong>Học thuật</strong> - Ngôn ngữ chuyên môn, chi tiết
+                                            </label>
+                                        </div>
+                                        <div class="form-check mb-3">
+                                            <input class="form-check-input" type="radio" name="text_style" id="news" value="news" <?php echo $text_style === 'news' ? 'checked' : ''; ?>>
+                                            <label class="form-check-label" for="news">
+                                                <strong>Báo chí</strong> - Ngôn ngữ tin tức, súc tích
+                                            </label>
+                                        </div>
+                                    </div>
+                                    <div class="col-md-6">
+                                        <h6>Hướng dẫn:</h6>
+                                        <div class="alert alert-info">
+                                            <ul class="mb-0">
+                                                <li><strong>Trang trọng:</strong> Phù hợp với văn bản công việc, báo cáo</li>
+                                                <li><strong>Thân thiện:</strong> Phù hợp với blog, bài viết cá nhân</li>
+                                                <li><strong>Học thuật:</strong> Phù hợp với nghiên cứu, luận văn</li>
+                                                <li><strong>Báo chí:</strong> Phù hợp với tin tức, bài viết truyền thông</li>
+                                            </ul>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="d-flex justify-content-between mt-4">
+                                    <button type="button" class="btn btn-outline-secondary" onclick="goToStep(1)">
+                                        <i class="fas fa-arrow-left me-2"></i>Quay lại
+                                    </button>
+                                    <button type="button" class="btn btn-primary" onclick="goToStep(3)">
+                                        Tiếp theo <i class="fas fa-arrow-right ms-2"></i>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Step 3: Edit Summary -->
+                    <div class="tab-pane fade" id="step3" role="tabpanel">
+                        <div class="row">
+                            <div class="col-md-6">
+                                <div class="card">
+                                    <div class="card-header bg-secondary text-white">
+                                        <h6 class="mb-0">
+                                            <i class="fas fa-robot me-2"></i>
+                                            Bản tóm tắt AI gốc
+                                        </h6>
+                                    </div>
+                                    <div class="card-body">
+                                        <div class="border rounded p-3 bg-light" style="min-height: 300px;">
+                                            <?php echo nl2br(htmlspecialchars($group['ai_summary'])); ?>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
                             <div class="col-md-6">
                                 <div class="card">
                                     <div class="card-header bg-primary text-white">
                                         <h6 class="mb-0">
-                                            <i class="fas fa-edit me-2"></i>Bản tóm tắt đã chỉnh sửa
+                                            <i class="fas fa-edit me-2"></i>
+                                            Bản tóm tắt đã chỉnh sửa
                                         </h6>
                                     </div>
                                     <div class="card-body p-0">
-                                        <textarea class="form-control summary-editor border-0" 
+                                        <textarea class="summary-editor border-0 w-100" 
                                                   id="edited-summary" 
-                                                  placeholder="Chỉnh sửa bản tóm tắt ở đây..."
-                                                  data-auto-resize><?php echo htmlspecialchars($edited_summary ?: $document['ai_summary']); ?></textarea>
+                                                  placeholder="Chỉnh sửa bản tóm tắt dựa trên các câu đã chọn và phong cách đã xác định..."><?php echo htmlspecialchars($edited_summary); ?></textarea>
                                     </div>
                                 </div>
                             </div>
                         </div>
-                        <?php else: ?>
-                        <div class="mb-4">
-                            <label for="edited-summary" class="form-label fw-bold">Tạo bản tóm tắt:</label>
-                            <textarea class="form-control summary-editor" 
-                                      id="edited-summary" 
-                                      rows="8"
-                                      placeholder="Vui lòng tạo bản tóm tắt cho tài liệu này..."
-                                      data-auto-resize><?php echo htmlspecialchars($edited_summary); ?></textarea>
-                        </div>
-                        <?php endif; ?>
-                        
-                        <!-- Summary Statistics -->
-                        <div class="row mb-4">
-                            <div class="col-md-4">
-                                <div class="card bg-light">
-                                    <div class="card-body text-center">
-                                        <div class="fs-4 fw-bold text-primary" id="word-count">0</div>
-                                        <small class="text-muted">Số từ</small>
-                                    </div>
-                                </div>
-                            </div>
-                            <div class="col-md-4">
-                                <div class="card bg-light">
-                                    <div class="card-body text-center">
-                                        <div class="fs-4 fw-bold text-success" id="char-count">0</div>
-                                        <small class="text-muted">Ký tự</small>
-                                    </div>
-                                </div>
-                            </div>
-                            <div class="col-md-4">
-                                <div class="card bg-light">
-                                    <div class="card-body text-center">
-                                        <div class="fs-4 fw-bold text-info" id="sentence-count">0</div>
-                                        <small class="text-muted">Câu</small>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                        
-                        <div class="alert alert-success">
-                            <i class="fas fa-check-circle me-2"></i>
-                            <strong>Lưu ý:</strong> Sau khi hoàn thành, công việc gán nhãn sẽ được gửi đến reviewer để kiểm tra.
-                        </div>
-                        
+
                         <div class="d-flex justify-content-between mt-4">
-                            <button type="button" class="btn btn-outline-secondary btn-prev-step">
-                                <i class="fas fa-arrow-left me-2"></i>Quay lại: Chọn phong cách
+                            <button type="button" class="btn btn-outline-secondary" onclick="goToStep(2)">
+                                <i class="fas fa-arrow-left me-2"></i>Quay lại
                             </button>
-                            <div class="d-flex gap-2">
-                                <button type="button" class="btn btn-outline-primary" onclick="saveAsDraft()">
+                            <div>
+                                <button type="button" class="btn btn-success me-2" onclick="saveDraft()">
                                     <i class="fas fa-save me-2"></i>Lưu nháp
                                 </button>
-                                <button type="button" class="btn btn-success" onclick="labelingSystem.finalizeLabelingb()">
-                                    <i class="fas fa-check me-2"></i>Hoàn thành gán nhãn
+                                <button type="button" class="btn btn-primary" onclick="completeLabeling()">
+                                    <i class="fas fa-check me-2"></i>Hoàn thành
                                 </button>
                             </div>
                         </div>
                     </div>
                 </div>
-            </div>
+            </main>
         </div>
     </div>
-</div>
 
-<!-- Bootstrap JS -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
-<script src="../js/script.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
+    <script>
+        let selectedSentences = <?php echo json_encode($selected_sentences); ?>;
+        let autoSaveTimer;
 
-<script>
-// Initialize selected sentences and style from existing data
-document.addEventListener('DOMContentLoaded', function() {
-    labelingSystem = new LabelingSystem();
-    
-    // Set existing selected sentences
-    <?php if (!empty($selected_sentences)): ?>
-    labelingSystem.selectedSentences = <?php echo json_encode($selected_sentences); ?>;
-    labelingSystem.updateSelectedSentencesDisplay();
-    <?php endif; ?>
-    
-    // Set existing selected style
-    <?php if ($selected_style): ?>
-    labelingSystem.selectedTextStyle = '<?php echo $selected_style; ?>';
-    document.querySelector(`[data-style-id="${labelingSystem.selectedTextStyle}"]`)?.classList.add('selected');
-    updateStyleSelection();
-    <?php endif; ?>
-    
-    // Initialize summary counter
-    updateSummaryStats();
-    
-    // Auto-resize textareas
-    initializeAutoResize();
-    
-    // Update overall progress
-    updateOverallProgress();
-});
-
-// Text style selection visual feedback
-function updateStyleSelection() {
-    document.querySelectorAll('.text-style-option').forEach(option => {
-        const icon = option.querySelector('.fa-check-circle');
-        if (option.classList.contains('selected')) {
-            icon.style.opacity = '1';
-            document.getElementById('selected-style-badge').style.display = 'inline';
-        } else {
-            icon.style.opacity = '0';
-        }
-    });
-}
-
-// Add click handlers for text styles
-document.querySelectorAll('.text-style-option').forEach(option => {
-    option.addEventListener('click', function() {
-        updateStyleSelection();
-    });
-});
-
-// Summary statistics
-function updateSummaryStats() {
-    const textarea = document.getElementById('edited-summary');
-    if (!textarea) return;
-    
-    const text = textarea.value;
-    const words = text.trim() ? text.trim().split(/\s+/).length : 0;
-    const chars = text.length;
-    const sentences = text.trim() ? text.split(/[.!?]+/).filter(s => s.trim()).length : 0;
-    
-    document.getElementById('word-count').textContent = words;
-    document.getElementById('char-count').textContent = chars;
-    document.getElementById('sentence-count').textContent = sentences;
-}
-
-// Add event listener for summary textarea
-document.getElementById('edited-summary')?.addEventListener('input', updateSummaryStats);
-
-// Clear all sentence selections
-function clearAllSelections() {
-    if (confirm('Bạn có chắc muốn xóa tất cả câu đã chọn?')) {
-        document.querySelectorAll('.sentence-selected').forEach(sentence => {
-            sentence.classList.remove('sentence-selected');
+        // Initialize page
+        document.addEventListener('DOMContentLoaded', function() {
+            updateSelectedSentencesDisplay();
+            setupAutoSave();
         });
-        labelingSystem.selectedSentences = [];
-        labelingSystem.updateSelectedSentencesDisplay();
-        labelingSystem.markUnsavedChanges();
-    }
-}
 
-// Save as draft
-function saveAsDraft() {
-    if (labelingSystem) {
-        labelingSystem.autoSave();
-        showToast('Đã lưu nháp thành công', 'success');
-    }
-}
+        // Sentence selection
+        document.addEventListener('click', function(e) {
+            if (e.target.classList.contains('sentence')) {
+                const sentenceId = e.target.getAttribute('data-sentence-id');
+                
+                if (e.target.classList.contains('selected')) {
+                    // Deselect
+                    e.target.classList.remove('selected');
+                    selectedSentences = selectedSentences.filter(id => id !== sentenceId);
+                } else {
+                    // Select
+                    e.target.classList.add('selected');
+                    selectedSentences.push(sentenceId);
+                }
+                
+                updateSelectedSentencesDisplay();
+                autoSave();
+            }
+        });
 
-// Reset to original summary
-function resetSummary() {
-    if (confirm('Bạn có chắc muốn khôi phục về bản tóm tắt gốc?')) {
-        const originalSummary = `<?php echo addslashes($document['ai_summary'] ?? ''); ?>`;
-        document.getElementById('edited-summary').value = originalSummary;
-        updateSummaryStats();
-        labelingSystem.markUnsavedChanges();
-    }
-}
-
-// Suggest AI improvements (placeholder)
-function suggestSummary() {
-    showToast('Tính năng gợi ý AI đang được phát triển', 'info');
-}
-
-// Update overall progress
-function updateOverallProgress() {
-    let progress = 0;
-    
-    // Step 1: Sentence selection (33%)
-    if (labelingSystem.selectedSentences.length > 0) {
-        progress += 33;
-    }
-    
-    // Step 2: Style selection (33%)
-    if (labelingSystem.selectedTextStyle) {
-        progress += 33;
-    }
-    
-    // Step 3: Summary editing (34%)
-    const summary = document.getElementById('edited-summary')?.value || '';
-    if (summary.trim().length > 10) {
-        progress += 34;
-    }
-    
-    document.getElementById('overall-progress').style.width = `${progress}%`;
-    document.getElementById('progress-text').textContent = `${progress}%`;
-}
-
-// Override labelingSystem methods to update progress
-const originalToggleSentence = labelingSystem.toggleSentenceSelection;
-labelingSystem.toggleSentenceSelection = function(sentence, index) {
-    originalToggleSentence.call(this, sentence, index);
-    updateOverallProgress();
-};
-
-const originalSelectStyle = labelingSystem.selectTextStyle;
-labelingSystem.selectTextStyle = function(option) {
-    originalSelectStyle.call(this, option);
-    updateOverallProgress();
-    updateStyleSelection();
-};
-
-// Update progress on summary change
-document.getElementById('edited-summary')?.addEventListener('input', updateOverallProgress);
-
-// Keyboard shortcuts for labeling
-document.addEventListener('keydown', function(e) {
-    // Ctrl + Enter to finalize
-    if (e.ctrlKey && e.key === 'Enter') {
-        e.preventDefault();
-        if (labelingSystem.currentStep === 3) {
-            labelingSystem.finalizeLabelingb();
+        // Update selected sentences display
+        function updateSelectedSentencesDisplay() {
+            const container = document.getElementById('selected-sentences-summary');
+            const countElement = document.getElementById('selected-count');
+            
+            countElement.textContent = selectedSentences.length;
+            
+            if (selectedSentences.length === 0) {
+                container.innerHTML = `
+                    <div class="text-muted text-center py-3">
+                        <i class="fas fa-info-circle me-2"></i>
+                        Chưa chọn câu nào
+                    </div>
+                `;
+                return;
+            }
+            
+            let html = '';
+            selectedSentences.forEach(sentenceId => {
+                const sentenceElement = document.querySelector(`[data-sentence-id="${sentenceId}"]`);
+                if (sentenceElement) {
+                    const text = sentenceElement.textContent.trim();
+                    html += `
+                        <div class="alert alert-success small mb-2">
+                            <button class="btn-close btn-close-sm float-end" onclick="removeSentence('${sentenceId}')"></button>
+                            ${text}
+                        </div>
+                    `;
+                }
+            });
+            
+            container.innerHTML = html;
         }
-    }
-    
-    // Escape to clear selection in step 1
-    if (e.key === 'Escape' && labelingSystem.currentStep === 1) {
-        clearAllSelections();
-    }
-});
 
-// Auto-save every 30 seconds
-setInterval(() => {
-    if (labelingSystem && labelingSystem.hasUnsavedChanges) {
-        labelingSystem.autoSave();
-    }
-}, 30000);
-</script>
+        // Remove sentence
+        function removeSentence(sentenceId) {
+            const sentenceElement = document.querySelector(`[data-sentence-id="${sentenceId}"]`);
+            if (sentenceElement) {
+                sentenceElement.classList.remove('selected');
+            }
+            selectedSentences = selectedSentences.filter(id => id !== sentenceId);
+            updateSelectedSentencesDisplay();
+            autoSave();
+        }
 
+        // Step navigation
+        function goToStep(step) {
+            // Update progress steps
+            document.querySelectorAll('.step').forEach(el => el.classList.remove('active'));
+            for (let i = 1; i <= step; i++) {
+                const stepEl = document.getElementById(`step-${i}`);
+                if (i < step) {
+                    stepEl.classList.add('completed');
+                } else if (i === step) {
+                    stepEl.classList.add('active');
+                }
+            }
+            
+            // Switch tabs
+            const tabTrigger = document.querySelector(`#step${step}-tab`);
+            if (tabTrigger) {
+                const tab = new bootstrap.Tab(tabTrigger);
+                tab.show();
+            }
+        }
+
+        // Text style change
+        document.addEventListener('change', function(e) {
+            if (e.target.name === 'text_style') {
+                autoSave();
+            }
+        });
+
+        // Summary editing
+        document.getElementById('edited-summary').addEventListener('input', function() {
+            autoSave();
+        });
+
+        // Auto save setup
+        function setupAutoSave() {
+            setInterval(function() {
+                autoSave();
+            }, 30000);
+        }
+
+        // Auto save function
+        function autoSave() {
+            clearTimeout(autoSaveTimer);
+            autoSaveTimer = setTimeout(function() {
+                saveData(false);
+            }, 2000);
+        }
+
+        // Save data
+        function saveData(showMessage = false) {
+            const data = {
+                group_id: <?php echo $group_id; ?>,
+                selected_sentences: selectedSentences,
+                text_style: document.querySelector('input[name="text_style"]:checked')?.value || '',
+                edited_summary: document.getElementById('edited-summary').value,
+                is_draft: true
+            };
+
+            fetch('save_labeling.php', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(data)
+            })
+            .then(response => response.json())
+            .then(result => {
+                if (showMessage && result.success) {
+                    alert('Đã lưu nháp thành công!');
+                }
+            })
+            .catch(error => {
+                console.error('Auto-save error:', error);
+            });
+        }
+
+        // Save draft
+        function saveDraft() {
+            saveData(true);
+        }
+
+        // Complete labeling
+        function completeLabeling() {
+            if (selectedSentences.length === 0) {
+                alert('Vui lòng chọn ít nhất một câu quan trọng!');
+                goToStep(1);
+                return;
+            }
+
+            const textStyle = document.querySelector('input[name="text_style"]:checked');
+            if (!textStyle) {
+                alert('Vui lòng chọn phong cách văn bản!');
+                goToStep(2);
+                return;
+            }
+
+            const editedSummary = document.getElementById('edited-summary').value.trim();
+            if (!editedSummary) {
+                alert('Vui lòng chỉnh sửa bản tóm tắt!');
+                goToStep(3);
+                return;
+            }
+
+            if (confirm('Bạn có chắc chắn muốn hoàn thành công việc gán nhãn này?')) {
+                const data = {
+                    group_id: <?php echo $group_id; ?>,
+                    selected_sentences: selectedSentences,
+                    text_style: textStyle.value,
+                    edited_summary: editedSummary,
+                    is_draft: false
+                };
+
+                fetch('save_labeling.php', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(data)
+                })
+                .then(response => response.json())
+                .then(result => {
+                    if (result.success) {
+                        alert('Hoàn thành gán nhãn thành công!');
+                        window.location.href = 'dashboard.php';
+                    } else {
+                        alert('Có lỗi xảy ra: ' + (result.error || 'Unknown error'));
+                    }
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    alert('Có lỗi xảy ra khi lưu dữ liệu!');
+                });
+            }
+        }
+    </script>
 </body>
 </html>
