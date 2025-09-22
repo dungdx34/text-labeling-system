@@ -1,28 +1,27 @@
 <?php
-session_start();
+// index.php - Complete Fixed Version
+require_once 'config/database.php';
+require_once 'includes/auth.php';
 
-// Nếu chưa đăng nhập, chuyển đến trang login
-if (!isset($_SESSION['user_id'])) {
+// Initialize database connection
+$database = new Database();
+$pdo = $database->getConnection();
+
+// Check if user is logged in
+if (Auth::isLoggedIn()) {
+    $user = Auth::getCurrentUser();
+    
+    // Prevent infinite redirect by checking current path
+    $current_path = $_SERVER['REQUEST_URI'];
+    $script_name = basename($_SERVER['SCRIPT_NAME']);
+    
+    // Only redirect if we're specifically on index.php
+    if ($script_name === 'index.php' || strpos($current_path, '/index.php') !== false) {
+        Auth::redirectToRoleDashboard($user['role']);
+    }
+} else {
+    // Redirect to login if not authenticated
     header('Location: login.php');
-    exit();
+    exit;
 }
-
-// Redirect dựa trên vai trò
-switch ($_SESSION['role']) {
-    case 'admin':
-        header('Location: admin/dashboard.php');
-        break;
-    case 'labeler':
-        header('Location: labeler/dashboard.php');
-        break;
-    case 'reviewer':
-        header('Location: reviewer/dashboard.php');
-        break;
-    default:
-        // Nếu role không hợp lệ, logout và redirect về login
-        session_destroy();
-        header('Location: login.php?error=invalid_role');
-        break;
-}
-exit();
 ?>
