@@ -1,12 +1,4 @@
 <?php
-// Bắt lỗi và khởi tạo session an toàn
-error_reporting(E_ALL);
-ini_set('display_errors', 1);
-
-if (session_status() == PHP_SESSION_NONE) {
-    session_start();
-}
-
 require_once '../includes/auth.php';
 require_once '../config/database.php';
 
@@ -17,93 +9,67 @@ $database = new Database();
 $db = $database->getConnection();
 $current_user = getCurrentUser();
 
-$error_message = '';
+// Lấy thông tin công việc của reviewer
+try {
+    // Assignments cần review (đã hoàn thành nhưng chưa được review)
+    $query = "SELECT COUNT(*) as total FROM assignments WHERE status = 'completed'";
+    $stmt = $db->prepare($query);
+    $stmt->execute();
+    $available_for_review = $stmt->fetch(PDO::FETCH_ASSOC)['total'];
 
-// Lấy thông tin thống kê cho reviewer
-$available_for_review = 0;
-$total_reviews = 0;
-$approved_reviews = 0;
-$rejected_reviews = 0;
-$pending_reviews = [];
-$recent_reviews = [];
+    // Tổng số reviews đã thực hiện
+    $query = "SELECT COUNT(*) as total FROM reviews WHERE reviewer_id = ?";
+    $stmt = $db->prepare($query);
+    $stmt->bindParam(1, $current_user['id']);
+    $stmt->execute();
+    $total_reviews = $stmt->fetch(PDO::FETCH_ASSOC)['total'];
 
-if ($db) {
-    try {
-        // Assignments cần review (đã hoàn thành nhưng chưa được review)
-        $query = "SELECT COUNT(*) as total 
-                  FROM assignments a 
-                  WHERE a.status = 'completed' 
-                  AND a.id NOT IN (SELECT assignment_id FROM reviews WHERE assignment_id = a.id)";
-        $stmt = $db->prepare($query);
-        $stmt->execute();
-        $available_for_review = $stmt->fetch(PDO::FETCH_ASSOC)['total'];
+    // Reviews đã approved
+    $query = "SELECT COUNT(*) as total FROM reviews WHERE reviewer_id = ? AND status = 'approved'";
+    $stmt = $db->prepare($query);
+    $stmt->bindParam(1, $current_user['id']);
+    $stmt->execute();
+    $approved_reviews = $stmt->fetch(PDO::FETCH_ASSOC)['total'];
 
-        // Tổng số reviews đã thực hiện
-        $query = "SELECT COUNT(*) as total FROM reviews WHERE reviewer_id = ?";
-        $stmt = $db->prepare($query);
-        $stmt->execute([$current_user['id']]);
-        $total_reviews = $stmt->fetch(PDO::FETCH_ASSOC)['total'];
+    // Reviews bị rejected
+    $query = "SELECT COUNT(*) as total FROM reviews WHERE reviewer_id = ? AND status = 'rejected'";
+    $stmt = $db->prepare($query);
+    $stmt->bindParam(1, $current_user['id']);
+    $stmt->execute();
+    $rejected_reviews = $stmt->fetch(PDO::FETCH_ASSOC)['total'];
 
-        // Reviews đã approved
-        $query = "SELECT COUNT(*) as total FROM reviews WHERE reviewer_id = ? AND status = 'approved'";
-        $stmt = $db->prepare($query);
-        $stmt->execute([$current_user['id']]);
-        $approved_reviews = $stmt->fetch(PDO::FETCH_ASSOC)['total'];
+    // Lấy danh sách assignments cần review
+    $query = "SELECT a.*, d.title, d.content, d.ai_summary, d.type, u.full_name as labeler_name,
+                     lr.selected_sentences, lr.writing_style, lr.edited_summary,
+                     lr.completed_at
+              FROM assignments a 
+              JOIN documents d ON a.document_id = d.id 
+              JOIN users u ON a.user_id = u.id
+              LEFT JOIN labeling_results lr ON a.id = lr.assignment_id AND lr.document_id = d.id
+              WHERE a.status = 'completed' 
+              AND a.id NOT IN (SELECT assignment_id FROM reviews)
+              ORDER BY a.updated_at DESC 
+              LIMIT 10";
+    $stmt = $db->prepare($query);
+    $stmt->execute();
+    $pending_reviews = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-        // Reviews bị rejected
-        $query = "SELECT COUNT(*) as total FROM reviews WHERE reviewer_id = ? AND status = 'rejected'";
-        $stmt = $db->prepare($query);
-        $stmt->execute([$current_user['id']]);
-        $rejected_reviews = $stmt->fetch(PDO::FETCH_ASSOC)['total'];
+    // Lấy reviews gần đây của reviewer này
+    $query = "SELECT r.*, a.id as assignment_id, d.title, u.full_name as labeler_name
+              FROM reviews r
+              JOIN assignments a ON r.assignment_id = a.id
+              JOIN documents d ON a.document_id = d.id
+              JOIN users u ON a.user_id = u.id
+              WHERE r.reviewer_id = ?
+              ORDER BY r.created_at DESC 
+              LIMIT 5";
+    $stmt = $db->prepare($query);
+    $stmt->bindParam(1, $current_user['id']);
+    $stmt->execute();
+    $recent_reviews = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-        // Lấy danh sách assignments cần review
-        $query = "SELECT a.*, 
-                         CASE 
-                             WHEN a.type = 'single' THEN d.title 
-                             WHEN a.type = 'multi' THEN dg.title 
-                         END as title,
-                         CASE 
-                             WHEN a.type = 'single' THEN d.content 
-                             WHEN a.type = 'multi' THEN dg.description 
-                         END as content,
-                         u.full_name as labeler_name,
-                         lr.selected_sentences, lr.writing_style, lr.edited_summary,
-                         lr.completed_at
-                  FROM assignments a 
-                  LEFT JOIN documents d ON a.document_id = d.id AND a.type = 'single'
-                  LEFT JOIN document_groups dg ON a.group_id = dg.id AND a.type = 'multi'
-                  LEFT JOIN users u ON a.user_id = u.id
-                  LEFT JOIN labeling_results lr ON a.id = lr.assignment_id
-                  WHERE a.status = 'completed' 
-                  AND a.id NOT IN (SELECT assignment_id FROM reviews WHERE assignment_id = a.id)
-                  ORDER BY a.updated_at DESC 
-                  LIMIT 10";
-        $stmt = $db->prepare($query);
-        $stmt->execute();
-        $pending_reviews = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-        // Lấy reviews gần đây của reviewer này
-        $query = "SELECT r.*, a.id as assignment_id, 
-                         CASE 
-                             WHEN a.type = 'single' THEN d.title 
-                             WHEN a.type = 'multi' THEN dg.title 
-                         END as title,
-                         u.full_name as labeler_name
-                  FROM reviews r
-                  LEFT JOIN assignments a ON r.assignment_id = a.id
-                  LEFT JOIN documents d ON a.document_id = d.id AND a.type = 'single'
-                  LEFT JOIN document_groups dg ON a.group_id = dg.id AND a.type = 'multi'
-                  LEFT JOIN users u ON a.user_id = u.id
-                  WHERE r.reviewer_id = ?
-                  ORDER BY r.created_at DESC 
-                  LIMIT 5";
-        $stmt = $db->prepare($query);
-        $stmt->execute([$current_user['id']]);
-        $recent_reviews = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-    } catch (Exception $e) {
-        $error_message = 'Lỗi khi lấy thống kê: ' . $e->getMessage();
-    }
+} catch (PDOException $e) {
+    $error = "Lỗi database: " . $e->getMessage();
 }
 ?>
 <!DOCTYPE html>
@@ -150,7 +116,6 @@ if ($db) {
             padding: 25px;
             box-shadow: 0 5px 15px rgba(0,0,0,0.1);
             border: none;
-            margin-bottom: 20px;
             transition: transform 0.3s ease;
         }
         .stat-card:hover {
@@ -187,13 +152,6 @@ if ($db) {
         .status-approved { background: #d4edda; color: #155724; }
         .status-rejected { background: #f8d7da; color: #721c24; }
         .status-needs_revision { background: #d1ecf1; color: #0c5460; }
-        .error-box {
-            background: #f8d7da;
-            border: 1px solid #f5c6cb;
-            border-radius: 8px;
-            padding: 20px;
-            margin: 20px 0;
-        }
     </style>
 </head>
 <body>
@@ -244,10 +202,10 @@ if ($db) {
             </div>
         </div>
 
-        <?php if ($error_message): ?>
-            <div class="error-box">
-                <h4><i class="fas fa-exclamation-triangle me-2"></i>Lỗi</h4>
-                <p><?php echo htmlspecialchars($error_message); ?></p>
+        <?php if (isset($error)): ?>
+            <div class="alert alert-danger">
+                <i class="fas fa-exclamation-circle me-2"></i>
+                <?php echo htmlspecialchars($error); ?>
             </div>
         <?php endif; ?>
 
@@ -366,14 +324,14 @@ if ($db) {
                                     <?php foreach ($pending_reviews as $review): ?>
                                         <tr>
                                             <td>
-                                                <div class="fw-bold"><?php echo htmlspecialchars(substr($review['title'] ?: 'No title', 0, 30)); ?>...</div>
+                                                <div class="fw-bold"><?php echo htmlspecialchars(substr($review['title'], 0, 30)); ?>...</div>
                                                 <small class="text-muted">
-                                                    <?php echo htmlspecialchars(substr(strip_tags($review['content'] ?: ''), 0, 50)); ?>...
+                                                    <?php echo htmlspecialchars(substr(strip_tags($review['content']), 0, 50)); ?>...
                                                 </small>
                                             </td>
                                             <td>
                                                 <span class="badge bg-info">
-                                                    <?php echo htmlspecialchars($review['labeler_name'] ?: 'Unknown'); ?>
+                                                    <?php echo htmlspecialchars($review['labeler_name']); ?>
                                                 </span>
                                             </td>
                                             <td>
@@ -382,7 +340,7 @@ if ($db) {
                                                 </span>
                                             </td>
                                             <td>
-                                                <small><?php echo $review['completed_at'] ? date('d/m/Y H:i', strtotime($review['completed_at'])) : 'N/A'; ?></small>
+                                                <small><?php echo date('d/m/Y H:i', strtotime($review['completed_at'])); ?></small>
                                             </td>
                                             <td>
                                                 <a href="review.php?id=<?php echo $review['id']; ?>" class="btn btn-sm btn-primary">
@@ -420,7 +378,7 @@ if ($db) {
                                     <div class="card border-0 shadow-sm">
                                         <div class="card-body">
                                             <div class="d-flex justify-content-between align-items-start mb-2">
-                                                <h6 class="card-title mb-0"><?php echo htmlspecialchars(substr($review['title'] ?: 'No title', 0, 30)); ?>...</h6>
+                                                <h6 class="card-title mb-0"><?php echo htmlspecialchars(substr($review['title'], 0, 30)); ?>...</h6>
                                                 <?php
                                                 $status_class = 'status-' . $review['status'];
                                                 $status_text = '';
@@ -444,12 +402,12 @@ if ($db) {
                                                 </span>
                                             </div>
                                             <p class="card-text">
-                                                <small class="text-muted">Người gán nhãn: <?php echo htmlspecialchars($review['labeler_name'] ?: 'Unknown'); ?></small>
+                                                <small class="text-muted">Người gán nhãn: <?php echo htmlspecialchars($review['labeler_name']); ?></small>
                                             </p>
                                             <div class="d-flex justify-content-between align-items-center">
                                                 <div class="rating">
                                                     <?php for ($i = 1; $i <= 5; $i++): ?>
-                                                        <i class="fas fa-star <?php echo $i <= ($review['rating'] ?: 0) ? 'text-warning' : 'text-muted'; ?>"></i>
+                                                        <i class="fas fa-star <?php echo $i <= $review['rating'] ? 'text-warning' : 'text-muted'; ?>"></i>
                                                     <?php endfor; ?>
                                                 </div>
                                                 <small class="text-muted"><?php echo date('d/m/Y', strtotime($review['created_at'])); ?></small>

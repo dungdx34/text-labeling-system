@@ -1,509 +1,502 @@
 <?php
 require_once '../includes/auth.php';
+require_once '../config/database.php';
 
-// Check if user is admin
-if ($_SESSION['role'] !== 'admin') {
-    header('Location: ../index.php');
-    exit;
+// Kiểm tra quyền admin
+requireRole('admin');
+
+$database = new Database();
+$db = $database->getConnection();
+$current_user = getCurrentUser();
+
+// Lấy thống kê tổng quan
+try {
+    // Tổng số người dùng theo role
+    $query = "SELECT role, COUNT(*) as count FROM users WHERE status = 'active' GROUP BY role";
+    $stmt = $db->prepare($query);
+    $stmt->execute();
+    $user_stats = [];
+    while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+        $user_stats[$row['role']] = $row['count'];
+    }
+    
+    // Thống kê văn bản
+    $query = "SELECT 
+                COUNT(*) as total_documents,
+                SUM(CASE WHEN type = 'single' THEN 1 ELSE 0 END) as single_docs,
+                SUM(CASE WHEN type = 'multi' THEN 1 ELSE 0 END) as multi_docs
+              FROM documents WHERE status = 'active'";
+    $stmt = $db->prepare($query);
+    $stmt->execute();
+    $doc_stats = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    // Thống kê assignments
+    $query = "SELECT 
+                status,
+                COUNT(*) as count
+              FROM assignments 
+              GROUP BY status";
+    $stmt = $db->prepare($query);
+    $stmt->execute();
+    $assignment_stats = [];
+    while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+        $assignment_stats[$row['status']] = $row['count'];
+    }
+    
+    // Hiệu suất người gán nhãn
+    $query = "SELECT 
+                u.full_name,
+                COUNT(a.id) as total_assignments,
+                SUM(CASE WHEN a.status = 'completed' THEN 1 ELSE 0 END) as completed,
+                ROUND(AVG(CASE WHEN a.status = 'completed' THEN 
+                    TIMESTAMPDIFF(HOUR, a.created_at, a.updated_at) 
+                ELSE NULL END), 2) as avg_completion_hours
+              FROM users u
+              LEFT JOIN assignments a ON u.id = a.user_id
+              WHERE u.role = 'labeler' AND u.status = 'active'
+              GROUP BY u.id, u.full_name
+              ORDER BY completed DESC";
+    $stmt = $db->prepare($query);
+    $stmt->execute();
+    $labeler_performance = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    
+    // Thống kê theo thời gian (7 ngày gần đây)
+    $query = "SELECT 
+                DATE(created_at) as date,
+                COUNT(*) as assignments_created
+              FROM assignments 
+              WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
+              GROUP BY DATE(created_at)
+              ORDER BY date DESC";
+    $stmt = $db->prepare($query);
+    $stmt->execute();
+    $daily_stats = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    
+    // Top văn bản được gán nhiều nhất
+    $query = "SELECT 
+                d.title,
+                COUNT(a.id) as assignment_count
+              FROM documents d
+              JOIN assignments a ON d.id = a.document_id
+              WHERE d.status = 'active'
+              GROUP BY d.id, d.title
+              ORDER BY assignment_count DESC
+              LIMIT 10";
+    $stmt = $db->prepare($query);
+    $stmt->execute();
+    $top_documents = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    
+    // Thống kê reviews
+    $query = "SELECT 
+                status,
+                COUNT(*) as count,
+                AVG(rating) as avg_rating
+              FROM reviews 
+              GROUP BY status";
+    $stmt = $db->prepare($query);
+    $stmt->execute();
+    $review_stats = [];
+    while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+        $review_stats[$row['status']] = $row;
+    }
+    
+} catch (Exception $e) {
+    $error_message = 'Lỗi khi lấy thống kê: ' . $e->getMessage();
 }
-
-// Direct database connection for statistics
-$conn = new mysqli('localhost', 'root', '', 'text_labeling_system');
-
-if ($conn->connect_error) {
-    die("Connection failed: " . $conn->connect_error);
-}
-
-// Get basic statistics directly
-function getBasicStats($conn) {
-    $stats = [];
-    
-    // Total users
-    $result = $conn->query("SELECT COUNT(*) as count FROM users WHERE status = 'active'");
-    $stats['total_users'] = $result ? $result->fetch_assoc()['count'] : 0;
-    
-    // Total documents  
-    $result = $conn->query("SELECT COUNT(*) as count FROM documents");
-    $stats['total_documents'] = $result ? $result->fetch_assoc()['count'] : 0;
-    
-    // Total labelings
-    $result = $conn->query("SELECT COUNT(*) as count FROM labelings");
-    $stats['total_labelings'] = $result ? $result->fetch_assoc()['count'] : 0;
-    
-    // Total groups (if table exists)
-    $tableExists = $conn->query("SHOW TABLES LIKE 'document_groups'");
-    if ($tableExists && $tableExists->num_rows > 0) {
-        $result = $conn->query("SELECT COUNT(*) as count FROM document_groups");
-        $stats['total_groups'] = $result ? $result->fetch_assoc()['count'] : 0;
-    } else {
-        $stats['total_groups'] = 0;
-    }
-    
-    // User roles
-    $stats['user_roles'] = [];
-    $result = $conn->query("SELECT role, COUNT(*) as count FROM users WHERE status = 'active' GROUP BY role");
-    if ($result) {
-        while ($row = $result->fetch_assoc()) {
-            $stats['user_roles'][$row['role']] = $row['count'];
-        }
-    }
-    
-    // Labeling status
-    $stats['labeling_status'] = [];
-    $result = $conn->query("SELECT status, COUNT(*) as count FROM labelings GROUP BY status");
-    if ($result) {
-        while ($row = $result->fetch_assoc()) {
-            $stats['labeling_status'][$row['status']] = $row['count'];
-        }
-    }
-    
-    // Group status (if table exists)
-    $stats['group_status'] = [];
-    if ($tableExists && $tableExists->num_rows > 0) {
-        $result = $conn->query("SELECT status, COUNT(*) as count FROM document_groups GROUP BY status");
-        if ($result) {
-            while ($row = $result->fetch_assoc()) {
-                $stats['group_status'][$row['status']] = $row['count'];
-            }
-        }
-    }
-    
-    return $stats;
-}
-
-$stats = getBasicStats($conn);
-
-include '../includes/header.php';
 ?>
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Báo cáo - Text Labeling System</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <style>
+        body { 
+            background: #f8f9fa; 
+            font-family: 'Segoe UI', sans-serif; 
+        }
+        .sidebar {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            position: fixed;
+            left: 0;
+            top: 0;
+            width: 250px;
+            padding: 20px 0;
+            z-index: 1000;
+        }
+        .main-content {
+            margin-left: 250px;
+            padding: 20px;
+        }
+        .nav-link {
+            color: rgba(255,255,255,0.8);
+            padding: 12px 25px;
+            border-radius: 0;
+            transition: all 0.3s ease;
+        }
+        .nav-link:hover, .nav-link.active {
+            background: rgba(255,255,255,0.1);
+            color: white;
+            transform: translateX(5px);
+        }
+        .stat-card {
+            background: white;
+            border-radius: 15px;
+            padding: 25px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            border: none;
+            margin-bottom: 20px;
+        }
+        .chart-container {
+            background: white;
+            border-radius: 15px;
+            padding: 25px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        .metric-card {
+            text-align: center;
+            padding: 20px;
+            border-radius: 10px;
+            margin-bottom: 15px;
+        }
+        .metric-number {
+            font-size: 2rem;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+        .metric-label {
+            color: #6c757d;
+            font-size: 0.9rem;
+        }
+    </style>
+</head>
+<body>
+    <!-- Sidebar -->
+    <nav class="sidebar">
+        <div class="text-center text-white mb-4">
+            <i class="fas fa-tags fa-2x mb-2"></i>
+            <h5>Admin Panel</h5>
+            <small>Xin chào, <?php echo htmlspecialchars($current_user['full_name']); ?></small>
+        </div>
+        
+        <ul class="nav flex-column">
+            <li class="nav-item">
+                <a class="nav-link" href="dashboard.php">
+                    <i class="fas fa-tachometer-alt me-2"></i>Dashboard
+                </a>
+            </li>
+            <li class="nav-item">
+                <a class="nav-link" href="users.php">
+                    <i class="fas fa-users me-2"></i>Quản lý người dùng
+                </a>
+            </li>
+            <li class="nav-item">
+                <a class="nav-link" href="upload.php">
+                    <i class="fas fa-upload me-2"></i>Upload văn bản
+                </a>
+            </li>
+            <li class="nav-item">
+                <a class="nav-link" href="documents.php">
+                    <i class="fas fa-file-text me-2"></i>Quản lý văn bản
+                </a>
+            </li>
+            <li class="nav-item">
+                <a class="nav-link" href="assignments.php">
+                    <i class="fas fa-tasks me-2"></i>Phân công công việc
+                </a>
+            </li>
+            <li class="nav-item">
+                <a class="nav-link active" href="reports.php">
+                    <i class="fas fa-chart-bar me-2"></i>Báo cáo
+                </a>
+            </li>
+            <li class="nav-item mt-3">
+                <a class="nav-link" href="../logout.php">
+                    <i class="fas fa-sign-out-alt me-2"></i>Đăng xuất
+                </a>
+            </li>
+        </ul>
+    </nav>
 
-<div class="container-fluid">
-    <div class="row">
-        <!-- Sidebar -->
-        <nav class="col-md-2 d-none d-md-block bg-light sidebar">
-            <div class="sidebar-sticky">
-                <ul class="nav flex-column">
-                    <li class="nav-item">
-                        <a class="nav-link" href="dashboard.php">
-                            <i class="fas fa-tachometer-alt me-2"></i>Dashboard
-                        </a>
-                    </li>
-                    <li class="nav-item">
-                        <a class="nav-link" href="enhanced_upload.php">
-                            <i class="fas fa-cloud-upload-alt me-2"></i>Enhanced Upload
-                        </a>
-                    </li>
-                    <li class="nav-item">
-                        <a class="nav-link" href="users.php">
-                            <i class="fas fa-users me-2"></i>Quản lý người dùng
-                        </a>
-                    </li>
-                    <li class="nav-item">
-                        <a class="nav-link active" href="reports.php">
-                            <i class="fas fa-chart-bar me-2"></i>Báo cáo
-                        </a>
-                    </li>
-                </ul>
+    <!-- Main Content -->
+    <div class="main-content">
+        <div class="d-flex justify-content-between align-items-center mb-4">
+            <h2 class="text-dark">Báo cáo & Thống kê</h2>
+            <div class="text-muted">
+                <i class="fas fa-calendar me-1"></i>
+                Cập nhật: <?php echo date('d/m/Y H:i'); ?>
             </div>
-        </nav>
+        </div>
 
-        <!-- Main content -->
-        <main class="col-md-10 ms-sm-auto px-md-4">
-            <div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
-                <h1 class="h2">
-                    <i class="fas fa-chart-bar text-info me-2"></i>Báo cáo hệ thống
-                </h1>
-                <div class="btn-toolbar mb-2 mb-md-0">
-                    <div class="btn-group me-2">
-                        <button type="button" class="btn btn-sm btn-outline-secondary" onclick="exportData('all')">
-                            <i class="fas fa-download"></i> Export CSV
-                        </button>
+        <!-- Overview Stats -->
+        <div class="row">
+            <div class="col-md-3">
+                <div class="metric-card bg-primary text-white">
+                    <div class="metric-number"><?php echo $user_stats['admin'] ?? 0; ?></div>
+                    <div class="metric-label">Admin</div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="metric-card bg-success text-white">
+                    <div class="metric-number"><?php echo $user_stats['labeler'] ?? 0; ?></div>
+                    <div class="metric-label">Labeler</div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="metric-card bg-warning text-white">
+                    <div class="metric-number"><?php echo $user_stats['reviewer'] ?? 0; ?></div>
+                    <div class="metric-label">Reviewer</div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="metric-card bg-info text-white">
+                    <div class="metric-number"><?php echo $doc_stats['total_documents']; ?></div>
+                    <div class="metric-label">Tổng văn bản</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="row">
+            <!-- Assignment Status Chart -->
+            <div class="col-lg-6">
+                <div class="chart-container">
+                    <h5 class="mb-3">
+                        <i class="fas fa-tasks me-2 text-primary"></i>
+                        Trạng thái assignments
+                    </h5>
+                    <canvas id="assignmentStatusChart" width="400" height="200"></canvas>
+                </div>
+            </div>
+
+            <!-- Document Type Chart -->
+            <div class="col-lg-6">
+                <div class="chart-container">
+                    <h5 class="mb-3">
+                        <i class="fas fa-file-text me-2 text-success"></i>
+                        Loại văn bản
+                    </h5>
+                    <canvas id="documentTypeChart" width="400" height="200"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <div class="row">
+            <!-- Labeler Performance -->
+            <div class="col-lg-8">
+                <div class="stat-card">
+                    <h5 class="mb-3">
+                        <i class="fas fa-user-edit me-2 text-info"></i>
+                        Hiệu suất Labeler
+                    </h5>
+                    <div class="table-responsive">
+                        <table class="table table-hover">
+                            <thead class="table-light">
+                                <tr>
+                                    <th>Tên</th>
+                                    <th>Tổng assignments</th>
+                                    <th>Hoàn thành</th>
+                                    <th>Tỷ lệ (%)</th>
+                                    <th>Thời gian TB (giờ)</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <?php foreach ($labeler_performance as $labeler): ?>
+                                    <tr>
+                                        <td><?php echo htmlspecialchars($labeler['full_name']); ?></td>
+                                        <td><?php echo $labeler['total_assignments']; ?></td>
+                                        <td><?php echo $labeler['completed']; ?></td>
+                                        <td>
+                                            <?php 
+                                            $rate = $labeler['total_assignments'] > 0 ? 
+                                                round(($labeler['completed'] / $labeler['total_assignments']) * 100, 1) : 0;
+                                            echo $rate; 
+                                            ?>%
+                                        </td>
+                                        <td>
+                                            <?php echo $labeler['avg_completion_hours'] ?? 'N/A'; ?>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            </tbody>
+                        </table>
                     </div>
-                    <button type="button" class="btn btn-sm btn-primary" onclick="window.location.reload()">
-                        <i class="fas fa-sync-alt"></i> Làm mới
+                </div>
+            </div>
+
+            <!-- Top Documents -->
+            <div class="col-lg-4">
+                <div class="stat-card">
+                    <h5 class="mb-3">
+                        <i class="fas fa-trophy me-2 text-warning"></i>
+                        Top văn bản
+                    </h5>
+                    <?php if (empty($top_documents)): ?>
+                        <div class="text-center text-muted">
+                            <i class="fas fa-inbox fa-2x mb-2"></i>
+                            <p>Chưa có dữ liệu</p>
+                        </div>
+                    <?php else: ?>
+                        <div class="list-group list-group-flush">
+                            <?php foreach ($top_documents as $doc): ?>
+                                <div class="list-group-item d-flex justify-content-between align-items-center">
+                                    <div>
+                                        <strong><?php echo htmlspecialchars(substr($doc['title'], 0, 30)); ?>...</strong>
+                                    </div>
+                                    <span class="badge bg-primary rounded-pill"><?php echo $doc['assignment_count']; ?></span>
+                                </div>
+                            <?php endforeach; ?>
+                        </div>
+                    <?php endif; ?>
+                </div>
+            </div>
+        </div>
+
+        <!-- Daily Activity Chart -->
+        <div class="row">
+            <div class="col-12">
+                <div class="chart-container">
+                    <h5 class="mb-3">
+                        <i class="fas fa-chart-line me-2 text-danger"></i>
+                        Hoạt động 7 ngày gần đây
+                    </h5>
+                    <canvas id="dailyActivityChart" width="400" height="100"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- Export Section -->
+        <div class="stat-card">
+            <h5 class="mb-3">
+                <i class="fas fa-download me-2 text-secondary"></i>
+                Xuất báo cáo
+            </h5>
+            <div class="row">
+                <div class="col-md-3">
+                    <button class="btn btn-outline-primary w-100" onclick="exportReport('users')">
+                        <i class="fas fa-users me-2"></i>Báo cáo người dùng
+                    </button>
+                </div>
+                <div class="col-md-3">
+                    <button class="btn btn-outline-success w-100" onclick="exportReport('assignments')">
+                        <i class="fas fa-tasks me-2"></i>Báo cáo assignments
+                    </button>
+                </div>
+                <div class="col-md-3">
+                    <button class="btn btn-outline-info w-100" onclick="exportReport('performance')">
+                        <i class="fas fa-chart-bar me-2"></i>Báo cáo hiệu suất
+                    </button>
+                </div>
+                <div class="col-md-3">
+                    <button class="btn btn-outline-warning w-100" onclick="exportReport('summary')">
+                        <i class="fas fa-file-pdf me-2"></i>Tổng hợp
                     </button>
                 </div>
             </div>
-
-            <!-- Alert if no data -->
-            <?php if ($stats['total_users'] == 0 && $stats['total_documents'] == 0 && $stats['total_labelings'] == 0): ?>
-            <div class="alert alert-info" role="alert">
-                <i class="fas fa-info-circle me-2"></i>
-                <strong>Thông báo:</strong> Hệ thống chưa có dữ liệu. Hãy thêm người dùng và upload văn bản để xem báo cáo.
-            </div>
-            <?php endif; ?>
-
-            <!-- Statistics Overview -->
-            <div class="row mb-4">
-                <div class="col-xl-3 col-md-6 mb-4">
-                    <div class="card border-left-primary shadow h-100 py-2">
-                        <div class="card-body">
-                            <div class="row no-gutters align-items-center">
-                                <div class="col mr-2">
-                                    <div class="text-xs font-weight-bold text-primary text-uppercase mb-1">
-                                        Tổng người dùng
-                                    </div>
-                                    <div class="h5 mb-0 font-weight-bold text-gray-800">
-                                        <?php echo number_format($stats['total_users']); ?>
-                                    </div>
-                                    <?php if (!empty($stats['user_roles'])): ?>
-                                    <div class="small text-muted">
-                                        <?php foreach ($stats['user_roles'] as $role => $count): ?>
-                                            <?php echo ucfirst($role); ?>: <?php echo $count; ?> 
-                                        <?php endforeach; ?>
-                                    </div>
-                                    <?php endif; ?>
-                                </div>
-                                <div class="col-auto">
-                                    <i class="fas fa-users fa-2x text-gray-300"></i>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="col-xl-3 col-md-6 mb-4">
-                    <div class="card border-left-success shadow h-100 py-2">
-                        <div class="card-body">
-                            <div class="row no-gutters align-items-center">
-                                <div class="col mr-2">
-                                    <div class="text-xs font-weight-bold text-success text-uppercase mb-1">
-                                        Tổng văn bản
-                                    </div>
-                                    <div class="h5 mb-0 font-weight-bold text-gray-800">
-                                        <?php echo number_format($stats['total_documents']); ?>
-                                    </div>
-                                    <div class="small text-muted">Đã upload vào hệ thống</div>
-                                </div>
-                                <div class="col-auto">
-                                    <i class="fas fa-file-text fa-2x text-gray-300"></i>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="col-xl-3 col-md-6 mb-4">
-                    <div class="card border-left-info shadow h-100 py-2">
-                        <div class="card-body">
-                            <div class="row no-gutters align-items-center">
-                                <div class="col mr-2">
-                                    <div class="text-xs font-weight-bold text-info text-uppercase mb-1">
-                                        Nhóm văn bản
-                                    </div>
-                                    <div class="h5 mb-0 font-weight-bold text-gray-800">
-                                        <?php echo number_format($stats['total_groups']); ?>
-                                    </div>
-                                    <?php if (!empty($stats['group_status'])): ?>
-                                    <div class="small text-muted">
-                                        <?php foreach ($stats['group_status'] as $status => $count): ?>
-                                            <?php echo ucfirst($status); ?>: <?php echo $count; ?> 
-                                        <?php endforeach; ?>
-                                    </div>
-                                    <?php endif; ?>
-                                </div>
-                                <div class="col-auto">
-                                    <i class="fas fa-copy fa-2x text-gray-300"></i>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="col-xl-3 col-md-6 mb-4">
-                    <div class="card border-left-warning shadow h-100 py-2">
-                        <div class="card-body">
-                            <div class="row no-gutters align-items-center">
-                                <div class="col mr-2">
-                                    <div class="text-xs font-weight-bold text-warning text-uppercase mb-1">
-                                        Tổng gán nhãn
-                                    </div>
-                                    <div class="h5 mb-0 font-weight-bold text-gray-800">
-                                        <?php echo number_format($stats['total_labelings']); ?>
-                                    </div>
-                                    <?php if (!empty($stats['labeling_status'])): ?>
-                                    <div class="small text-muted">
-                                        <?php foreach ($stats['labeling_status'] as $status => $count): ?>
-                                            <?php echo ucfirst($status); ?>: <?php echo $count; ?> 
-                                        <?php endforeach; ?>
-                                    </div>
-                                    <?php endif; ?>
-                                </div>
-                                <div class="col-auto">
-                                    <i class="fas fa-tags fa-2x text-gray-300"></i>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Charts Row -->
-            <?php if ($stats['total_labelings'] > 0 || $stats['total_users'] > 0): ?>
-            <div class="row">
-                <?php if (!empty($stats['labeling_status'])): ?>
-                <div class="col-xl-8 col-lg-7">
-                    <div class="card shadow mb-4">
-                        <div class="card-header py-3">
-                            <h6 class="m-0 font-weight-bold text-primary">Trạng thái gán nhãn</h6>
-                        </div>
-                        <div class="card-body">
-                            <canvas id="labelingChart" style="height: 300px;"></canvas>
-                        </div>
-                    </div>
-                </div>
-                <?php endif; ?>
-
-                <?php if (!empty($stats['user_roles'])): ?>
-                <div class="col-xl-4 col-lg-5">
-                    <div class="card shadow mb-4">
-                        <div class="card-header py-3">
-                            <h6 class="m-0 font-weight-bold text-primary">Phân bố người dùng</h6>
-                        </div>
-                        <div class="card-body">
-                            <canvas id="userRoleChart" style="height: 300px;"></canvas>
-                        </div>
-                    </div>
-                </div>
-                <?php endif; ?>
-            </div>
-            <?php endif; ?>
-
-            <!-- Quick Actions -->
-            <div class="row">
-                <div class="col-lg-12">
-                    <div class="card shadow mb-4">
-                        <div class="card-header py-3">
-                            <h6 class="m-0 font-weight-bold text-primary">Thao tác nhanh</h6>
-                        </div>
-                        <div class="card-body">
-                            <div class="row">
-                                <div class="col-md-3">
-                                    <button class="btn btn-primary btn-block" onclick="exportData('users')">
-                                        <i class="fas fa-users me-2"></i>Export Users
-                                    </button>
-                                </div>
-                                <div class="col-md-3">
-                                    <button class="btn btn-success btn-block" onclick="exportData('documents')">
-                                        <i class="fas fa-file-text me-2"></i>Export Documents
-                                    </button>
-                                </div>
-                                <div class="col-md-3">
-                                    <button class="btn btn-info btn-block" onclick="exportData('labelings')">
-                                        <i class="fas fa-tags me-2"></i>Export Labelings
-                                    </button>
-                                </div>
-                                <div class="col-md-3">
-                                    <button class="btn btn-warning btn-block" onclick="exportData('groups')">
-                                        <i class="fas fa-copy me-2"></i>Export Groups
-                                    </button>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Recent Activity -->
-            <div class="row">
-                <div class="col-lg-12">
-                    <div class="card shadow mb-4">
-                        <div class="card-header py-3">
-                            <h6 class="m-0 font-weight-bold text-primary">Hoạt động gần đây</h6>
-                        </div>
-                        <div class="card-body">
-                            <?php
-                            // Get recent activities
-                            $activities = [];
-                            
-                            // Recent documents
-                            $result = $conn->query("
-                                SELECT 'Upload văn bản' as activity, d.title, u.username, d.created_at as time
-                                FROM documents d 
-                                JOIN users u ON d.uploaded_by = u.id 
-                                ORDER BY d.created_at DESC 
-                                LIMIT 5
-                            ");
-                            if ($result) {
-                                while ($row = $result->fetch_assoc()) {
-                                    $activities[] = $row;
-                                }
-                            }
-                            
-                            // Recent completed labelings
-                            $result = $conn->query("
-                                SELECT 'Hoàn thành gán nhãn' as activity, d.title, u.username, l.completed_at as time
-                                FROM labelings l
-                                JOIN users u ON l.labeler_id = u.id
-                                LEFT JOIN documents d ON l.document_id = d.id
-                                WHERE l.status = 'completed' AND l.completed_at IS NOT NULL
-                                ORDER BY l.completed_at DESC 
-                                LIMIT 5
-                            ");
-                            if ($result) {
-                                while ($row = $result->fetch_assoc()) {
-                                    $activities[] = $row;
-                                }
-                            }
-                            
-                            // Sort by time
-                            usort($activities, function($a, $b) {
-                                return strtotime($b['time']) - strtotime($a['time']);
-                            });
-                            ?>
-                            
-                            <?php if (!empty($activities)): ?>
-                            <div class="table-responsive">
-                                <table class="table table-striped">
-                                    <thead>
-                                        <tr>
-                                            <th>Hoạt động</th>
-                                            <th>Tiêu đề</th>
-                                            <th>Người thực hiện</th>
-                                            <th>Thời gian</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody>
-                                        <?php foreach (array_slice($activities, 0, 10) as $activity): ?>
-                                        <tr>
-                                            <td>
-                                                <span class="badge bg-<?php echo strpos($activity['activity'], 'Upload') !== false ? 'primary' : 'success'; ?>">
-                                                    <?php echo $activity['activity']; ?>
-                                                </span>
-                                            </td>
-                                            <td><?php echo htmlspecialchars($activity['title'] ?: 'N/A'); ?></td>
-                                            <td><?php echo htmlspecialchars($activity['username']); ?></td>
-                                            <td><?php echo date('d/m/Y H:i', strtotime($activity['time'])); ?></td>
-                                        </tr>
-                                        <?php endforeach; ?>
-                                    </tbody>
-                                </table>
-                            </div>
-                            <?php else: ?>
-                            <div class="text-center text-muted py-4">
-                                <i class="fas fa-clock fa-3x mb-3"></i>
-                                <p>Chưa có hoạt động nào</p>
-                            </div>
-                            <?php endif; ?>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </main>
+        </div>
     </div>
-</div>
 
-<style>
-.border-left-primary { border-left: 0.25rem solid #4e73df !important; }
-.border-left-success { border-left: 0.25rem solid #1cc88a !important; }
-.border-left-info { border-left: 0.25rem solid #36b9cc !important; }
-.border-left-warning { border-left: 0.25rem solid #f6c23e !important; }
-
-.sidebar {
-    position: fixed;
-    top: 0;
-    bottom: 0;
-    left: 0;
-    z-index: 100;
-    padding: 48px 0 0;
-    box-shadow: inset -1px 0 0 rgba(0, 0, 0, .1);
-}
-
-.sidebar-sticky {
-    position: relative;
-    top: 0;
-    height: calc(100vh - 48px);
-    padding-top: .5rem;
-    overflow-x: hidden;
-    overflow-y: auto;
-}
-
-.nav-link {
-    color: #333;
-    padding: 10px 20px;
-    border-radius: 0;
-    transition: all 0.3s ease;
-}
-
-.nav-link:hover {
-    background: #f8f9fc;
-    color: #5a5c69;
-}
-
-.nav-link.active {
-    background: #4e73df;
-    color: white !important;
-}
-
-.btn-block { width: 100%; }
-</style>
-
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-<script>
-function exportData(type) {
-    window.open(`export.php?type=${type}`, '_blank');
-}
-
-// Charts
-<?php if (!empty($stats['labeling_status'])): ?>
-// Labeling Status Chart
-const ctx1 = document.getElementById('labelingChart');
-if (ctx1) {
-    new Chart(ctx1, {
-        type: 'bar',
-        data: {
-            labels: <?php echo json_encode(array_keys($stats['labeling_status'])); ?>,
-            datasets: [{
-                label: 'Số lượng',
-                data: <?php echo json_encode(array_values($stats['labeling_status'])); ?>,
-                backgroundColor: ['#4e73df', '#1cc88a', '#36b9cc', '#f6c23e', '#e74a3b']
-            }]
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: {
-                legend: {
-                    display: false
-                }
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+    <script>
+        // Assignment Status Chart
+        const assignmentCtx = document.getElementById('assignmentStatusChart').getContext('2d');
+        new Chart(assignmentCtx, {
+            type: 'doughnut',
+            data: {
+                labels: ['Chờ thực hiện', 'Đang thực hiện', 'Hoàn thành', 'Đã review'],
+                datasets: [{
+                    data: [
+                        <?php echo $assignment_stats['pending'] ?? 0; ?>,
+                        <?php echo $assignment_stats['in_progress'] ?? 0; ?>,
+                        <?php echo $assignment_stats['completed'] ?? 0; ?>,
+                        <?php echo $assignment_stats['reviewed'] ?? 0; ?>
+                    ],
+                    backgroundColor: ['#ffc107', '#17a2b8', '#28a745', '#6c757d']
+                }]
             },
-            scales: {
-                y: {
-                    beginAtZero: true
+            options: {
+                responsive: true,
+                plugins: {
+                    legend: {
+                        position: 'bottom'
+                    }
                 }
             }
-        }
-    });
-}
-<?php endif; ?>
+        });
 
-<?php if (!empty($stats['user_roles'])): ?>
-// User Role Chart
-const ctx2 = document.getElementById('userRoleChart');
-if (ctx2) {
-    new Chart(ctx2, {
-        type: 'doughnut',
-        data: {
-            labels: <?php echo json_encode(array_map('ucfirst', array_keys($stats['user_roles']))); ?>,
-            datasets: [{
-                data: <?php echo json_encode(array_values($stats['user_roles'])); ?>,
-                backgroundColor: ['#4e73df', '#1cc88a', '#36b9cc', '#f6c23e']
-            }]
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: {
-                legend: {
-                    position: 'bottom'
+        // Document Type Chart
+        const docCtx = document.getElementById('documentTypeChart').getContext('2d');
+        new Chart(docCtx, {
+            type: 'bar',
+            data: {
+                labels: ['Đơn văn bản', 'Đa văn bản'],
+                datasets: [{
+                    label: 'Số lượng',
+                    data: [
+                        <?php echo $doc_stats['single_docs']; ?>,
+                        <?php echo $doc_stats['multi_docs']; ?>
+                    ],
+                    backgroundColor: ['#007bff', '#28a745']
+                }]
+            },
+            options: {
+                responsive: true,
+                plugins: {
+                    legend: {
+                        display: false
+                    }
+                },
+                scales: {
+                    y: {
+                        beginAtZero: true
+                    }
                 }
             }
-        }
-    });
-}
-<?php endif; ?>
-</script>
+        });
 
-<?php 
-$conn->close();
-include '../includes/footer.php'; 
-?>
+        // Daily Activity Chart
+        const dailyCtx = document.getElementById('dailyActivityChart').getContext('2d');
+        new Chart(dailyCtx, {
+            type: 'line',
+            data: {
+                labels: [
+                    <?php 
+                    foreach ($daily_stats as $stat) {
+                        echo "'" . date('d/m', strtotime($stat['date'])) . "',";
+                    }
+                    ?>
+                ],
+                datasets: [{
+                    label: 'Assignments được tạo',
+                    data: [
+                        <?php 
+                        foreach ($daily_stats as $stat) {
+                            echo $stat['assignments_created'] . ',';
+                        }
+                        ?>
+                    ],
+                    borderColor: '#dc3545',
+                    backgroundColor: 'rgba(220, 53, 69, 0.1)',
+                    tension: 0.4
+                }]
+            },
+            options: {
+                responsive: true,
+                scales: {
+                    y: {
+                        beginAtZero: true
+                    }
+                }
+            }
+        });
+
+        function exportReport(type) {
+            alert('Tính năng xuất báo cáo ' + type + ' sẽ được phát triển trong phiên bản tiếp theo.');
+        }
+    </script>
+</body>
+</html>

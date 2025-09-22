@@ -1,48 +1,47 @@
 <?php
-// Database configuration
 class Database {
-    private $host = 'localhost';
-    private $db_name = 'text_labeling_system';
-    private $username = 'root';
-    private $password = '';
-    private $charset = 'utf8mb4';
-    public $pdo;
+    private $host = "localhost";
+    private $db_name = "text_labeling_system";
+    private $username = "root";
+    private $password = "";
+    private $charset = "utf8mb4";
+    private $conn;
 
     public function getConnection() {
-        $this->pdo = null;
-
+        $this->conn = null;
+        
         try {
             $dsn = "mysql:host=" . $this->host . ";dbname=" . $this->db_name . ";charset=" . $this->charset;
-            
-            $options = array(
-                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            $options = [
+                PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
                 PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-                PDO::ATTR_EMULATE_PREPARES => false,
-                PDO::MYSQL_ATTR_INIT_COMMAND => "SET NAMES utf8mb4"
-            );
-
-            $this->pdo = new PDO($dsn, $this->username, $this->password, $options);
+                PDO::ATTR_EMULATE_PREPARES   => false,
+                PDO::ATTR_TIMEOUT            => 5
+            ];
+            
+            $this->conn = new PDO($dsn, $this->username, $this->password, $options);
             
         } catch(PDOException $exception) {
-            echo "Connection error: " . $exception->getMessage();
-            die();
+            error_log("Database connection error: " . $exception->getMessage());
+            return null;
         }
-
-        return $this->pdo;
+        
+        return $this->conn;
     }
-}
 
-// Create global PDO connection
-try {
-    $database = new Database();
-    $pdo = $database->getConnection();
-    
-    // Test connection
-    if (!$pdo) {
-        throw new Exception("Failed to create PDO connection");
+    public function testConnection() {
+        try {
+            $conn = $this->getConnection();
+            if ($conn) {
+                $stmt = $conn->prepare("SELECT 1");
+                $stmt->execute();
+                return true;
+            }
+            return false;
+        } catch (Exception $e) {
+            error_log("Database test failed: " . $e->getMessage());
+            return false;
+        }
     }
-    
-} catch (Exception $e) {
-    die("Database connection failed: " . $e->getMessage());
 }
 ?>

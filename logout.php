@@ -1,29 +1,33 @@
 <?php
 session_start();
 
-// Simple logout without any class dependencies
+// Log hoạt động logout nếu user đã đăng nhập
 if (isset($_SESSION['user_id'])) {
-    $user_id = $_SESSION['user_id'];
-    $username = $_SESSION['username'] ?? 'Unknown';
-    
-    // Log activity if database is available
     try {
         require_once 'config/database.php';
-        require_once 'includes/functions.php';
+        $database = new Database();
+        $db = $database->getConnection();
         
-        // Log logout activity
-        logActivity($user_id, 'logout', 'user', $user_id, 'User logged out');
-        
+        if ($db) {
+            $query = "INSERT INTO activity_logs (user_id, action, description, ip_address, user_agent) 
+                      VALUES (?, 'user_logout', 'User đăng xuất khỏi hệ thống', ?, ?)";
+            $stmt = $db->prepare($query);
+            $stmt->execute([
+                $_SESSION['user_id'],
+                $_SERVER['REMOTE_ADDR'] ?? 'unknown',
+                $_SERVER['HTTP_USER_AGENT'] ?? 'unknown'
+            ]);
+        }
     } catch (Exception $e) {
-        // If logging fails, continue with logout anyway
+        // Không làm gì nếu log thất bại, vẫn tiếp tục logout
         error_log("Logout logging failed: " . $e->getMessage());
     }
 }
 
-// Clear all session data
+// Xóa tất cả session variables
 $_SESSION = array();
 
-// Destroy the session cookie
+// Nếu có session cookie, xóa nó
 if (ini_get("session.use_cookies")) {
     $params = session_get_cookie_params();
     setcookie(session_name(), '', time() - 42000,
@@ -32,10 +36,10 @@ if (ini_get("session.use_cookies")) {
     );
 }
 
-// Destroy the session
+// Hủy session
 session_destroy();
 
-// Redirect to login page
-header('Location: login.php?message=logged_out');
+// Redirect về trang login với thông báo
+header('Location: login.php?message=logout_success');
 exit();
 ?>
