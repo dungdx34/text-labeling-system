@@ -1,104 +1,53 @@
 <?php
-// Bắt lỗi ngay từ đầu
-error_reporting(E_ALL);
-ini_set('display_errors', 1);
+// labeler/dashboard.php - Fixed Labeler Dashboard
+require_once '../includes/auth.php';
 
-// Kiểm tra session trước khi include auth
-if (session_status() == PHP_SESSION_NONE) {
-    session_start();
-}
+// Require labeler role
+$auth->requireLogin(['labeler']);
 
+$user = $auth->getCurrentUser();
+
+// Get labeling tasks for current user
 try {
-    require_once '../includes/auth.php';
-} catch (Exception $e) {
-    die("Error loading auth: " . $e->getMessage());
-}
-
-// Kiểm tra quyền labeler
-try {
-    requireRole('labeler');
-} catch (Exception $e) {
-    die("Authentication error: " . $e->getMessage());
-}
-
-// Kiểm tra database connection
-$database = null;
-$db = null;
-$error_message = '';
-
-try {
-    require_once '../config/database.php';
-    $database = new Database();
-    $db = $database->getConnection();
+    $query = "SELECT lt.*, dg.title as group_title, dg.description, dg.type, 
+                     dg.group_summary, dg.created_at as assigned_date
+              FROM label_tasks lt
+              JOIN document_groups dg ON lt.group_id = dg.id
+              WHERE lt.labeler_id = :user_id
+              ORDER BY 
+                CASE lt.status 
+                    WHEN 'assigned' THEN 1
+                    WHEN 'in_progress' THEN 2
+                    WHEN 'completed' THEN 3
+                    WHEN 'reviewed' THEN 4
+                    ELSE 5
+                END,
+                lt.assigned_at DESC";
     
-    if (!$db) {
-        throw new Exception("Database connection failed");
-    }
-    
-    // Test query
-    $stmt = $db->prepare("SELECT 1");
+    $stmt = $auth->db->prepare($query);
+    $stmt->bindParam(':user_id', $user['id']);
     $stmt->execute();
+    $tasks = $stmt->fetchAll(PDO::FETCH_ASSOC);
     
-} catch (Exception $e) {
-    $error_message = "Database error: " . $e->getMessage();
-    error_log("Labeler dashboard DB error: " . $e->getMessage());
-}
-
-$current_user = getCurrentUser();
-
-// Chỉ lấy stats nếu database OK
-$total_assignments = 0;
-$completed_assignments = 0;
-$in_progress_assignments = 0;
-$pending_assignments = 0;
-$recent_assignments = [];
-
-if ($db && !$error_message) {
-    try {
-        // Tổng số assignments được giao
-        $query = "SELECT COUNT(*) as total FROM assignments WHERE user_id = ?";
-        $stmt = $db->prepare($query);
-        $stmt->execute([$current_user['id']]);
-        $result = $stmt->fetch(PDO::FETCH_ASSOC);
-        $total_assignments = $result['total'] ?? 0;
-
-        // Assignments hoàn thành
-        $query = "SELECT COUNT(*) as total FROM assignments WHERE user_id = ? AND status = 'completed'";
-        $stmt = $db->prepare($query);
-        $stmt->execute([$current_user['id']]);
-        $result = $stmt->fetch(PDO::FETCH_ASSOC);
-        $completed_assignments = $result['total'] ?? 0;
-
-        // Assignments đang làm
-        $query = "SELECT COUNT(*) as total FROM assignments WHERE user_id = ? AND status = 'in_progress'";
-        $stmt = $db->prepare($query);
-        $stmt->execute([$current_user['id']]);
-        $result = $stmt->fetch(PDO::FETCH_ASSOC);
-        $in_progress_assignments = $result['total'] ?? 0;
-
-        // Assignments chưa bắt đầu
-        $query = "SELECT COUNT(*) as total FROM assignments WHERE user_id = ? AND status = 'pending'";
-        $stmt = $db->prepare($query);
-        $stmt->execute([$current_user['id']]);
-        $result = $stmt->fetch(PDO::FETCH_ASSOC);
-        $pending_assignments = $result['total'] ?? 0;
-
-        // Lấy danh sách assignments gần đây (với LEFT JOIN để tránh lỗi)
-        $query = "SELECT a.*, d.title, d.content, d.ai_summary, d.type, u.full_name as labeler_name
-                  FROM assignments a 
-                  LEFT JOIN documents d ON a.document_id = d.id 
-                  LEFT JOIN users u ON a.user_id = u.id
-                  WHERE a.user_id = ? 
-                  ORDER BY a.created_at DESC 
-                  LIMIT 5";
-        $stmt = $db->prepare($query);
-        $stmt->execute([$current_user['id']]);
-        $recent_assignments = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-    } catch (Exception $e) {
-        $error_message = "Error loading stats: " . $e->getMessage();
-        error_log("Labeler stats error: " . $e->getMessage());
-    }
+    // Get statistics
+    $stats_query = "SELECT 
+                        COUNT(*) as total_tasks,
+                        SUM(CASE WHEN status = 'assigned' THEN 1 ELSE 0 END) as pending_tasks,
+                        SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) as in_progress_tasks,
+                        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_tasks,
+                        SUM(CASE WHEN status = 'reviewed' THEN 1 ELSE 0 END) as reviewed_tasks
+                    FROM label_tasks 
+                    WHERE labeler_id = :user_id";
+    
+    $stats_stmt = $auth->db->prepare($stats_query);
+    $stats_stmt->bindParam(':user_id', $user['id']);
+    $stats_stmt->execute();
+    $stats = $stats_stmt->fetch(PDO::FETCH_ASSOC);
+    
+} catch (PDOException $e) {
+    error_log("Database error: " . $e->getMessage());
+    $tasks = [];
+    $stats = ['total_tasks' => 0, 'pending_tasks' => 0, 'in_progress_tasks' => 0, 'completed_tasks' => 0, 'reviewed_tasks' => 0];
 }
 ?>
 <!DOCTYPE html>
@@ -106,350 +55,375 @@ if ($db && !$error_message) {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Labeler Dashboard - Text Labeling System</title>
+    <title>Dashboard - Người gán nhãn</title>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
     <style>
-        body { 
-            background: #f8f9fa; 
-            font-family: 'Segoe UI', sans-serif; 
+        body {
+            background: #f8f9fa;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
         }
-        .sidebar {
-            background: linear-gradient(135deg, #28a745 0%, #20c997 100%);
-            min-height: 100vh;
-            position: fixed;
-            left: 0;
-            top: 0;
-            width: 250px;
-            padding: 20px 0;
-            z-index: 1000;
+        
+        .navbar {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 1rem 0;
         }
-        .main-content {
-            margin-left: 250px;
-            padding: 20px;
+        
+        .navbar-brand {
+            font-weight: 600;
+            font-size: 1.5rem;
         }
-        .nav-link {
-            color: rgba(255,255,255,0.8);
-            padding: 12px 25px;
-            border-radius: 0;
-            transition: all 0.3s ease;
-        }
-        .nav-link:hover, .nav-link.active {
-            background: rgba(255,255,255,0.1);
-            color: white;
-            transform: translateX(5px);
-        }
-        .stat-card {
-            background: white;
-            border-radius: 15px;
-            padding: 25px;
-            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+        
+        .stats-card {
             border: none;
+            border-radius: 15px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
             transition: transform 0.3s ease;
         }
-        .stat-card:hover {
+        
+        .stats-card:hover {
             transform: translateY(-5px);
         }
-        .stat-icon {
-            width: 60px;
-            height: 60px;
-            border-radius: 50%;
+        
+        .stats-icon {
+            width: 50px;
+            height: 50px;
+            border-radius: 10px;
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 24px;
+            font-size: 1.5rem;
             color: white;
         }
-        .error-box {
-            background: #f8d7da;
-            border: 1px solid #f5c6cb;
-            border-radius: 8px;
-            padding: 20px;
-            margin: 20px 0;
+        
+        .icon-pending { background: linear-gradient(45deg, #ffc107, #ffab00); }
+        .icon-progress { background: linear-gradient(45deg, #17a2b8, #138496); }
+        .icon-completed { background: linear-gradient(45deg, #28a745, #20c997); }
+        .icon-reviewed { background: linear-gradient(45deg, #6f42c1, #e83e8c); }
+        
+        .task-card {
+            border: none;
+            border-radius: 15px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.08);
+            margin-bottom: 20px;
+            transition: all 0.3s ease;
         }
-        .debug-info {
-            background: #e2e3e5;
-            border-radius: 5px;
-            padding: 10px;
-            font-family: monospace;
+        
+        .task-card:hover {
+            box-shadow: 0 5px 20px rgba(0, 0, 0, 0.15);
+            transform: translateY(-2px);
+        }
+        
+        .status-badge {
+            padding: 8px 16px;
+            border-radius: 20px;
             font-size: 12px;
-            margin: 10px 0;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        
+        .status-assigned { background: #fff3cd; color: #856404; border: 1px solid #ffeaa7; }
+        .status-in_progress { background: #d1ecf1; color: #0c5460; border: 1px solid #bee5eb; }
+        .status-completed { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .status-reviewed { background: #e2e3f0; color: #383d41; border: 1px solid #d6d8db; }
+        
+        .btn-action {
+            border-radius: 10px;
+            padding: 8px 20px;
+            font-weight: 600;
+            text-decoration: none;
+            transition: all 0.3s ease;
+        }
+        
+        .btn-start {
+            background: linear-gradient(45deg, #28a745, #20c997);
+            color: white;
+            border: none;
+        }
+        
+        .btn-continue {
+            background: linear-gradient(45deg, #17a2b8, #138496);
+            color: white;
+            border: none;
+        }
+        
+        .btn-view {
+            background: linear-gradient(45deg, #6f42c1, #e83e8c);
+            color: white;
+            border: none;
+        }
+        
+        .btn-action:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+            color: white;
+        }
+        
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: #6c757d;
+        }
+        
+        .empty-state i {
+            font-size: 4rem;
+            margin-bottom: 20px;
+            opacity: 0.5;
+        }
+        
+        .welcome-banner {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-radius: 15px;
+            color: white;
+            padding: 30px;
+            margin-bottom: 30px;
+        }
+        
+        .task-type-badge {
+            font-size: 10px;
+            padding: 4px 8px;
+            border-radius: 12px;
+            background: rgba(255, 255, 255, 0.2);
+            color: white;
+            font-weight: 600;
+            text-transform: uppercase;
         }
     </style>
 </head>
 <body>
-    <!-- Sidebar -->
-    <nav class="sidebar">
-        <div class="text-center text-white mb-4">
-            <i class="fas fa-user-edit fa-2x mb-2"></i>
-            <h5>Labeler Panel</h5>
-            <small>Xin chào, <?php echo htmlspecialchars($current_user['full_name'] ?? 'User'); ?></small>
+    <!-- Navigation -->
+    <nav class="navbar navbar-expand-lg navbar-dark">
+        <div class="container">
+            <a class="navbar-brand" href="#">
+                <i class="fas fa-tags me-2"></i>Text Labeling System
+            </a>
+            <div class="navbar-nav ms-auto">
+                <div class="nav-item dropdown">
+                    <a class="nav-link dropdown-toggle" href="#" role="button" data-bs-toggle="dropdown">
+                        <i class="fas fa-user me-2"></i><?php echo htmlspecialchars($user['full_name']); ?>
+                    </a>
+                    <ul class="dropdown-menu">
+                        <li><a class="dropdown-item" href="profile.php"><i class="fas fa-user-edit me-2"></i>Hồ sơ</a></li>
+                        <li><hr class="dropdown-divider"></li>
+                        <li><a class="dropdown-item" href="../logout.php"><i class="fas fa-sign-out-alt me-2"></i>Đăng xuất</a></li>
+                    </ul>
+                </div>
+            </div>
         </div>
-        
-        <ul class="nav flex-column">
-            <li class="nav-item">
-                <a class="nav-link active" href="dashboard.php">
-                    <i class="fas fa-tachometer-alt me-2"></i>Dashboard
-                </a>
-            </li>
-            <li class="nav-item">
-                <a class="nav-link" href="my_tasks.php">
-                    <i class="fas fa-tasks me-2"></i>Công việc của tôi
-                </a>
-            </li>
-            <li class="nav-item">
-                <a class="nav-link" href="labeling.php">
-                    <i class="fas fa-edit me-2"></i>Gán nhãn
-                </a>
-            </li>
-            <li class="nav-item">
-                <a class="nav-link" href="history.php">
-                    <i class="fas fa-history me-2"></i>Lịch sử
-                </a>
-            </li>
-            <li class="nav-item mt-3">
-                <a class="nav-link" href="../logout.php">
-                    <i class="fas fa-sign-out-alt me-2"></i>Đăng xuất
-                </a>
-            </li>
-        </ul>
     </nav>
 
-    <!-- Main Content -->
-    <div class="main-content">
-        <div class="d-flex justify-content-between align-items-center mb-4">
-            <h2 class="text-dark">Dashboard Labeler</h2>
-            <div class="text-muted">
-                <i class="fas fa-calendar me-1"></i>
-                <?php echo date('d/m/Y H:i'); ?>
+    <div class="container mt-4">
+        <!-- Welcome Banner -->
+        <div class="welcome-banner">
+            <div class="row align-items-center">
+                <div class="col-md-8">
+                    <h2><i class="fas fa-wave-square me-2"></i>Chào mừng trở lại, <?php echo htmlspecialchars($user['full_name']); ?>!</h2>
+                    <p class="mb-0 opacity-75">Hôm nay bạn có <?php echo $stats['pending_tasks']; ?> nhiệm vụ đang chờ xử lý</p>
+                </div>
+                <div class="col-md-4 text-end">
+                    <div class="d-flex justify-content-end align-items-center">
+                        <div class="me-3">
+                            <small class="opacity-75">Tổng tiến độ</small>
+                            <div class="progress" style="height: 8px; width: 150px;">
+                                <?php 
+                                $completion_rate = $stats['total_tasks'] > 0 ? 
+                                    ($stats['completed_tasks'] + $stats['reviewed_tasks']) / $stats['total_tasks'] * 100 : 0;
+                                ?>
+                                <div class="progress-bar bg-warning" style="width: <?php echo $completion_rate; ?>%"></div>
+                            </div>
+                            <small class="opacity-75"><?php echo number_format($completion_rate, 1); ?>%</small>
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
-
-        <!-- Error Display -->
-        <?php if ($error_message): ?>
-            <div class="error-box">
-                <h4><i class="fas fa-exclamation-triangle me-2"></i>Lỗi Database</h4>
-                <p><strong>Chi tiết:</strong> <?php echo htmlspecialchars($error_message); ?></p>
-                
-                <div class="debug-info">
-                    <strong>Debug Information:</strong><br>
-                    Current User ID: <?php echo $current_user['id'] ?? 'undefined'; ?><br>
-                    Current User Role: <?php echo $current_user['role'] ?? 'undefined'; ?><br>
-                    Database Object: <?php echo $database ? 'Created' : 'Failed'; ?><br>
-                    Connection: <?php echo $db ? 'Connected' : 'Failed'; ?><br>
-                    Config File: <?php echo file_exists('../config/database.php') ? 'Exists' : 'Missing'; ?><br>
-                    Session Status: <?php echo session_status() === PHP_SESSION_ACTIVE ? 'Active' : 'Inactive'; ?>
-                </div>
-                
-                <div class="mt-3">
-                    <a href="../check_accounts.php" class="btn btn-warning me-2">
-                        <i class="fas fa-tools me-1"></i>Kiểm tra hệ thống
-                    </a>
-                    <a href="../database_troubleshoot.php" class="btn btn-info me-2">
-                        <i class="fas fa-database me-1"></i>Sửa Database
-                    </a>
-                    <a href="../logout.php" class="btn btn-secondary">
-                        <i class="fas fa-sign-out-alt me-1"></i>Logout & Retry
-                    </a>
-                </div>
-            </div>
-        <?php endif; ?>
 
         <!-- Statistics Cards -->
         <div class="row mb-4">
-            <div class="col-xl-3 col-md-6 mb-4">
-                <div class="stat-card">
-                    <div class="d-flex align-items-center">
-                        <div class="stat-icon" style="background: linear-gradient(135deg, #007bff, #6610f2);">
-                            <i class="fas fa-tasks"></i>
-                        </div>
-                        <div class="ms-3">
-                            <div class="h4 mb-0"><?php echo $total_assignments; ?></div>
-                            <div class="text-muted">Tổng công việc</div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-            
-            <div class="col-xl-3 col-md-6 mb-4">
-                <div class="stat-card">
-                    <div class="d-flex align-items-center">
-                        <div class="stat-icon" style="background: linear-gradient(135deg, #ffc107, #fd7e14);">
+            <div class="col-lg-3 col-md-6 mb-3">
+                <div class="card stats-card h-100">
+                    <div class="card-body d-flex align-items-center">
+                        <div class="stats-icon icon-pending me-3">
                             <i class="fas fa-clock"></i>
                         </div>
-                        <div class="ms-3">
-                            <div class="h4 mb-0"><?php echo $pending_assignments; ?></div>
-                            <div class="text-muted">Chờ thực hiện</div>
+                        <div>
+                            <h3 class="mb-0"><?php echo $stats['pending_tasks']; ?></h3>
+                            <small class="text-muted">Chờ xử lý</small>
                         </div>
                     </div>
                 </div>
             </div>
-            
-            <div class="col-xl-3 col-md-6 mb-4">
-                <div class="stat-card">
-                    <div class="d-flex align-items-center">
-                        <div class="stat-icon" style="background: linear-gradient(135deg, #17a2b8, #138496);">
-                            <i class="fas fa-spinner"></i>
+            <div class="col-lg-3 col-md-6 mb-3">
+                <div class="card stats-card h-100">
+                    <div class="card-body d-flex align-items-center">
+                        <div class="stats-icon icon-progress me-3">
+                            <i class="fas fa-play"></i>
                         </div>
-                        <div class="ms-3">
-                            <div class="h4 mb-0"><?php echo $in_progress_assignments; ?></div>
-                            <div class="text-muted">Đang thực hiện</div>
+                        <div>
+                            <h3 class="mb-0"><?php echo $stats['in_progress_tasks']; ?></h3>
+                            <small class="text-muted">Đang thực hiện</small>
                         </div>
                     </div>
                 </div>
             </div>
-            
-            <div class="col-xl-3 col-md-6 mb-4">
-                <div class="stat-card">
-                    <div class="d-flex align-items-center">
-                        <div class="stat-icon" style="background: linear-gradient(135deg, #28a745, #20c997);">
-                            <i class="fas fa-check-circle"></i>
+            <div class="col-lg-3 col-md-6 mb-3">
+                <div class="card stats-card h-100">
+                    <div class="card-body d-flex align-items-center">
+                        <div class="stats-icon icon-completed me-3">
+                            <i class="fas fa-check"></i>
                         </div>
-                        <div class="ms-3">
-                            <div class="h4 mb-0"><?php echo $completed_assignments; ?></div>
-                            <div class="text-muted">Hoàn thành</div>
+                        <div>
+                            <h3 class="mb-0"><?php echo $stats['completed_tasks']; ?></h3>
+                            <small class="text-muted">Hoàn thành</small>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-lg-3 col-md-6 mb-3">
+                <div class="card stats-card h-100">
+                    <div class="card-body d-flex align-items-center">
+                        <div class="stats-icon icon-reviewed me-3">
+                            <i class="fas fa-star"></i>
+                        </div>
+                        <div>
+                            <h3 class="mb-0"><?php echo $stats['reviewed_tasks']; ?></h3>
+                            <small class="text-muted">Đã review</small>
                         </div>
                     </div>
                 </div>
             </div>
         </div>
 
-        <?php if (!$error_message): ?>
-        <!-- Recent Assignments -->
+        <!-- Task List -->
         <div class="row">
             <div class="col-12">
-                <div class="stat-card">
-                    <h5 class="mb-3">
-                        <i class="fas fa-list me-2 text-info"></i>
-                        Công việc gần đây
-                    </h5>
-                    
-                    <?php if (empty($recent_assignments)): ?>
-                        <div class="text-center text-muted py-5">
-                            <i class="fas fa-inbox fa-3x mb-3"></i>
-                            <h6>Chưa có công việc nào</h6>
-                            <p>Bạn chưa được giao công việc nào. Vui lòng liên hệ admin để được phân công.</p>
-                        </div>
-                    <?php else: ?>
-                        <div class="table-responsive">
-                            <table class="table table-hover">
-                                <thead>
-                                    <tr>
-                                        <th>ID</th>
-                                        <th>Văn bản</th>
-                                        <th>Loại</th>
-                                        <th>Trạng thái</th>
-                                        <th>Ngày tạo</th>
-                                        <th>Thao tác</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    <?php foreach ($recent_assignments as $assignment): ?>
-                                        <tr>
-                                            <td>#<?php echo $assignment['id']; ?></td>
-                                            <td>
-                                                <div class="fw-bold">
-                                                    <?php echo htmlspecialchars(substr($assignment['title'] ?? 'No title', 0, 30)); ?>...
-                                                </div>
-                                                <small class="text-muted">
-                                                    <?php echo htmlspecialchars(substr(strip_tags($assignment['content'] ?? ''), 0, 50)); ?>...
-                                                </small>
-                                            </td>
-                                            <td>
-                                                <span class="badge bg-info">
-                                                    <?php echo ($assignment['type'] ?? 'single') == 'single' ? 'Đơn văn bản' : 'Đa văn bản'; ?>
-                                                </span>
-                                            </td>
-                                            <td>
-                                                <?php
-                                                $status = $assignment['status'] ?? 'pending';
-                                                $status_class = 'status-' . $status;
-                                                $status_text = '';
-                                                switch ($status) {
-                                                    case 'pending':
-                                                        $status_text = 'Chờ thực hiện';
-                                                        $badge_class = 'bg-warning';
-                                                        break;
-                                                    case 'in_progress':
-                                                        $status_text = 'Đang thực hiện';
-                                                        $badge_class = 'bg-info';
-                                                        break;
-                                                    case 'completed':
-                                                        $status_text = 'Hoàn thành';
-                                                        $badge_class = 'bg-success';
-                                                        break;
-                                                    case 'reviewed':
-                                                        $status_text = 'Đã review';
-                                                        $badge_class = 'bg-secondary';
-                                                        break;
-                                                    default:
-                                                        $status_text = 'Không xác định';
-                                                        $badge_class = 'bg-dark';
-                                                }
-                                                ?>
-                                                <span class="badge <?php echo $badge_class; ?>">
-                                                    <?php echo $status_text; ?>
-                                                </span>
-                                            </td>
-                                            <td>
-                                                <small><?php echo date('d/m/Y', strtotime($assignment['created_at'])); ?></small>
-                                            </td>
-                                            <td>
-                                                <?php if ($status == 'pending' || $status == 'in_progress'): ?>
-                                                    <a href="labeling.php?id=<?php echo $assignment['id']; ?>" class="btn btn-sm btn-primary">
-                                                        <i class="fas fa-edit me-1"></i>Gán nhãn
-                                                    </a>
-                                                <?php else: ?>
-                                                    <a href="labeling.php?id=<?php echo $assignment['id']; ?>&view=1" class="btn btn-sm btn-outline-secondary">
-                                                        <i class="fas fa-eye me-1"></i>Xem
-                                                    </a>
-                                                <?php endif; ?>
-                                            </td>
-                                        </tr>
-                                    <?php endforeach; ?>
-                                </tbody>
-                            </table>
-                        </div>
-                    <?php endif; ?>
-                </div>
-            </div>
-        </div>
-        <?php endif; ?>
-
-        <!-- Quick Actions -->
-        <div class="row mt-4">
-            <div class="col-12">
-                <div class="stat-card">
-                    <h5 class="mb-3">
-                        <i class="fas fa-rocket me-2 text-warning"></i>
-                        Thao tác nhanh
-                    </h5>
-                    <div class="row">
-                        <div class="col-md-4 mb-3">
-                            <a href="my_tasks.php" class="btn btn-outline-primary w-100 p-3">
-                                <i class="fas fa-tasks fa-2x mb-2"></i>
-                                <div>Xem công việc của tôi</div>
-                            </a>
-                        </div>
-                        <div class="col-md-4 mb-3">
-                            <a href="labeling.php" class="btn btn-outline-success w-100 p-3">
-                                <i class="fas fa-edit fa-2x mb-2"></i>
-                                <div>Bắt đầu gán nhãn</div>
-                            </a>
-                        </div>
-                        <div class="col-md-4 mb-3">
-                            <a href="history.php" class="btn btn-outline-info w-100 p-3">
-                                <i class="fas fa-history fa-2x mb-2"></i>
-                                <div>Xem lịch sử</div>
-                            </a>
-                        </div>
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h4><i class="fas fa-tasks me-2"></i>Nhiệm vụ của tôi</h4>
+                    <div class="btn-group" role="group">
+                        <input type="radio" class="btn-check" name="statusFilter" id="all" value="all" checked>
+                        <label class="btn btn-outline-primary btn-sm" for="all">Tất cả</label>
+                        
+                        <input type="radio" class="btn-check" name="statusFilter" id="pending" value="assigned">
+                        <label class="btn btn-outline-warning btn-sm" for="pending">Chờ xử lý</label>
+                        
+                        <input type="radio" class="btn-check" name="statusFilter" id="progress" value="in_progress">
+                        <label class="btn btn-outline-info btn-sm" for="progress">Đang làm</label>
+                        
+                        <input type="radio" class="btn-check" name="statusFilter" id="completed" value="completed">
+                        <label class="btn btn-outline-success btn-sm" for="completed">Hoàn thành</label>
                     </div>
                 </div>
+
+                <?php if (empty($tasks)): ?>
+                    <div class="card">
+                        <div class="card-body">
+                            <div class="empty-state">
+                                <i class="fas fa-inbox"></i>
+                                <h5>Chưa có nhiệm vụ nào</h5>
+                                <p class="text-muted">Hiện tại bạn chưa được giao nhiệm vụ gán nhãn nào.<br>Vui lòng liên hệ quản trị viên để được giao việc.</p>
+                            </div>
+                        </div>
+                    </div>
+                <?php else: ?>
+                    <?php foreach ($tasks as $task): ?>
+                        <div class="task-card card" data-status="<?php echo $task['status']; ?>">
+                            <div class="card-body">
+                                <div class="row align-items-center">
+                                    <div class="col-md-8">
+                                        <div class="d-flex align-items-center mb-2">
+                                            <h5 class="mb-0 me-2"><?php echo htmlspecialchars($task['group_title']); ?></h5>
+                                            <span class="task-type-badge">
+                                                <?php echo $task['type'] === 'single' ? 'Đơn văn bản' : 'Đa văn bản'; ?>
+                                            </span>
+                                        </div>
+                                        
+                                        <?php if ($task['description']): ?>
+                                            <p class="text-muted mb-2"><?php echo htmlspecialchars($task['description']); ?></p>
+                                        <?php endif; ?>
+                                        
+                                        <div class="d-flex align-items-center gap-3">
+                                            <span class="status-badge status-<?php echo $task['status']; ?>">
+                                                <?php
+                                                $status_labels = [
+                                                    'assigned' => 'Chờ xử lý',
+                                                    'in_progress' => 'Đang thực hiện',
+                                                    'completed' => 'Hoàn thành',
+                                                    'reviewed' => 'Đã review'
+                                                ];
+                                                echo $status_labels[$task['status']] ?? $task['status'];
+                                                ?>
+                                            </span>
+                                            <small class="text-muted">
+                                                <i class="fas fa-calendar me-1"></i>
+                                                Giao: <?php echo date('d/m/Y', strtotime($task['assigned_date'])); ?>
+                                            </small>
+                                        </div>
+                                    </div>
+                                    
+                                    <div class="col-md-4 text-end">
+                                        <?php if ($task['status'] === 'assigned'): ?>
+                                            <a href="labeling.php?task_id=<?php echo $task['id']; ?>" class="btn btn-start btn-action">
+                                                <i class="fas fa-play me-2"></i>Bắt đầu
+                                            </a>
+                                        <?php elseif ($task['status'] === 'in_progress'): ?>
+                                            <a href="labeling.php?task_id=<?php echo $task['id']; ?>" class="btn btn-continue btn-action">
+                                                <i class="fas fa-edit me-2"></i>Tiếp tục
+                                            </a>
+                                        <?php else: ?>
+                                            <a href="labeling.php?task_id=<?php echo $task['id']; ?>&view=1" class="btn btn-view btn-action">
+                                                <i class="fas fa-eye me-2"></i>Xem
+                                            </a>
+                                        <?php endif; ?>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    <?php endforeach; ?>
+                <?php endif; ?>
             </div>
         </div>
     </div>
 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+    <script>
+        // Filter tasks by status
+        document.querySelectorAll('input[name="statusFilter"]').forEach(radio => {
+            radio.addEventListener('change', function() {
+                const filterValue = this.value;
+                const taskCards = document.querySelectorAll('.task-card');
+                
+                taskCards.forEach(card => {
+                    if (filterValue === 'all' || card.dataset.status === filterValue) {
+                        card.style.display = 'block';
+                    } else {
+                        card.style.display = 'none';
+                    }
+                });
+            });
+        });
+        
+        // Auto-refresh page every 5 minutes to check for new tasks
+        setInterval(function() {
+            // Only refresh if user is still on the page (not switched tabs)
+            if (!document.hidden) {
+                location.reload();
+            }
+        }, 300000); // 5 minutes
+        
+        // Show notification when new tasks are assigned (if implemented with WebSocket/SSE)
+        function showNotification(message) {
+            if (Notification.permission === 'granted') {
+                new Notification('Text Labeling System', {
+                    body: message,
+                    icon: '/favicon.ico'
+                });
+            }
+        }
+        
+        // Request notification permission
+        if ('Notification' in window && Notification.permission === 'default') {
+            Notification.requestPermission();
+        }
+    </script>
 </body>
 </html>

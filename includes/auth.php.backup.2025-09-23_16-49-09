@@ -41,7 +41,7 @@ class Auth {
         if (isset($_SESSION['login_time']) && 
             (time() - $_SESSION['login_time']) > $this->session_timeout) {
             $this->logout();
-            header('Location: login.php?error=session_timeout');
+            header('Location: /login.php?error=session_timeout');
             exit();
         }
     }
@@ -306,13 +306,13 @@ class Auth {
     public function requireLogin($allowed_roles = null) {
         if (!$this->isLoggedIn()) {
             $current_url = $_SERVER['REQUEST_URI'] ?? '/';
-            header('Location: login.php?redirect=' . urlencode($current_url));
+            header('Location: /login.php?redirect=' . urlencode($current_url));
             exit();
         }
         
         if ($allowed_roles !== null) {
             if (!$this->hasAnyRole($allowed_roles)) {
-                header('Location: unauthorized.php');
+                header('Location: /unauthorized.php');
                 exit();
             }
         }
@@ -326,12 +326,12 @@ class Auth {
      */
     public function getRedirectUrl($role) {
         $redirect_urls = [
-            'admin' => 'admin/dashboard.php',
-            'labeler' => 'labeler/dashboard.php',
-            'reviewer' => 'reviewer/dashboard.php'
+            'admin' => '/admin/dashboard.php',
+            'labeler' => '/labeler/dashboard.php',
+            'reviewer' => '/reviewer/dashboard.php'
         ];
         
-        return $redirect_urls[$role] ?? 'index.php';
+        return $redirect_urls[$role] ?? '/index.php';
     }
     
     /**
