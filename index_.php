@@ -1,57 +1,27 @@
 <?php
-session_start();
+// index.php - Complete Fixed Version
 require_once 'config/database.php';
+require_once 'includes/auth.php';
 
-// Check if system is set up by testing database connection
-function isSystemSetup() {
-    try {
-        $database = new Database();
-        $db = $database->getConnection();
-        
-        if (!$db) {
-            return false;
-        }
-        
-        // Check if users table exists and has admin user
-        $query = "SELECT COUNT(*) FROM users WHERE role = 'admin'";
-        $stmt = $db->prepare($query);
-        $stmt->execute();
-        $admin_count = $stmt->fetchColumn();
-        
-        return $admin_count > 0;
-    } catch (Exception $e) {
-        return false;
+// Initialize database connection
+$database = new Database();
+$pdo = $database->getConnection();
+
+// Check if user is logged in
+if (Auth::isLoggedIn()) {
+    $user = Auth::getCurrentUser();
+    
+    // Prevent infinite redirect by checking current path
+    $current_path = $_SERVER['REQUEST_URI'];
+    $script_name = basename($_SERVER['SCRIPT_NAME']);
+    
+    // Only redirect if we're specifically on index.php
+    if ($script_name === 'index.php' || strpos($current_path, '/index.php') !== false) {
+        Auth::redirectToRoleDashboard($user['role']);
     }
+} else {
+    // Redirect to login if not authenticated
+    header('Location: login.php');
+    exit;
 }
-
-// Check if user is already logged in
-if (isset($_SESSION['user_id']) && isset($_SESSION['role'])) {
-    // Redirect based on role
-    switch ($_SESSION['role']) {
-        case 'admin':
-            header('Location: admin/dashboard.php');
-            break;
-        case 'labeler':
-            header('Location: labeler/dashboard.php');
-            break;
-        case 'reviewer':
-            header('Location: reviewer/dashboard.php');
-            break;
-        default:
-            // Invalid role, clear session and redirect to login
-            session_destroy();
-            header('Location: login.php');
-    }
-    exit();
-}
-
-// Check if system needs setup
-if (!isSystemSetup()) {
-    header('Location: setup.php');
-    exit();
-}
-
-// If not logged in and system is set up, redirect to login
-header('Location: login.php');
-exit();
 ?>

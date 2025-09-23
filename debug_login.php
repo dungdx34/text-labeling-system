@@ -1,273 +1,275 @@
 <?php
-/**
- * Debug Login Issues - Text Labeling System
- * Use this script to diagnose login problems step by step
- */
-
-// Enable error reporting
+// Debug Login Issues - Text Labeling System
 error_reporting(E_ALL);
 ini_set('display_errors', 1);
-ini_set('log_errors', 1);
 
-// Start output buffering to prevent header issues
-ob_start();
+echo "<h2>🔍 Debug Login Issues</h2>";
+echo "<style>
+body { font-family: Arial, sans-serif; margin: 20px; }
+.success { color: green; }
+.error { color: red; }
+.warning { color: orange; }
+.info { color: blue; }
+pre { background: #f5f5f5; padding: 10px; border-radius: 5px; }
+</style>";
 
-echo "<h1>🔍 Login Debug Tool</h1>";
-echo "<div style='font-family: monospace; background: #f5f5f5; padding: 20px;'>";
-
-// Test 1: Database Connection
-echo "<h2>1. 🗄️ Database Connection Test</h2>";
+// Step 1: Check database connection
+echo "<h3>1. Kiểm tra kết nối database</h3>";
 try {
-    require_once 'config/database.php';
-    $conn = $database->getConnection();
-    echo "✅ Database connection successful<br>";
-    
-    // Test specific query
-    $stmt = $conn->query("SELECT COUNT(*) as count FROM users WHERE role = 'admin'");
-    $admin_count = $stmt->fetch()['count'];
-    echo "✅ Admin users found: $admin_count<br>";
-    
-} catch (Exception $e) {
-    echo "❌ Database error: " . $e->getMessage() . "<br>";
-    die("Cannot proceed without database connection.");
-}
-
-// Test 2: Auth Class Loading
-echo "<h2>2. 🔐 Authentication Class Test</h2>";
-try {
-    require_once 'includes/auth.php';
-    echo "✅ Auth file loaded successfully<br>";
-    
-    if (class_exists('Auth')) {
-        echo "✅ Auth class exists<br>";
-        $auth = new Auth();
-        echo "✅ Auth object created<br>";
-    } else {
-        echo "❌ Auth class not found<br>";
-    }
-} catch (Exception $e) {
-    echo "❌ Auth loading error: " . $e->getMessage() . "<br>";
-}
-
-// Test 3: Session Test
-echo "<h2>3. 🔄 Session Test</h2>";
-if (session_status() === PHP_SESSION_NONE) {
-    session_start();
-    echo "✅ Session started<br>";
-} else {
-    echo "✅ Session already active<br>";
-}
-
-echo "Session ID: " . session_id() . "<br>";
-echo "Session status: " . session_status() . "<br>";
-
-// Test session write
-$_SESSION['test'] = 'debug_value';
-if (isset($_SESSION['test'])) {
-    echo "✅ Session write/read works<br>";
-    unset($_SESSION['test']);
-} else {
-    echo "❌ Session write/read failed<br>";
-}
-
-// Test 4: Password Verification
-echo "<h2>4. 🔑 Password Test</h2>";
-$test_password = 'password123';
-$stored_hash = '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi';
-
-if (password_verify($test_password, $stored_hash)) {
-    echo "✅ Password verification works correctly<br>";
-} else {
-    echo "❌ Password verification failed<br>";
-}
-
-// Test 5: User Data Test
-echo "<h2>5. 👤 User Data Test</h2>";
-try {
-    $stmt = $conn->prepare("SELECT * FROM users WHERE username = ?");
-    $stmt->execute(['admin']);
-    $admin_user = $stmt->fetch();
-    
-    if ($admin_user) {
-        echo "✅ Admin user found<br>";
-        echo "   - ID: " . $admin_user['id'] . "<br>";
-        echo "   - Username: " . $admin_user['username'] . "<br>";
-        echo "   - Role: " . $admin_user['role'] . "<br>";
-        echo "   - Status: " . $admin_user['status'] . "<br>";
-        echo "   - Password hash length: " . strlen($admin_user['password']) . "<br>";
+    if (file_exists('config/database.php')) {
+        require_once 'config/database.php';
+        $database = new Database();
+        $conn = $database->getConnection();
         
-        // Test password for admin
-        if (password_verify('password123', $admin_user['password'])) {
-            echo "✅ Admin password matches 'password123'<br>";
-        } else {
-            echo "❌ Admin password does NOT match 'password123'<br>";
-            echo "   Stored hash: " . substr($admin_user['password'], 0, 20) . "...<br>";
-        }
-    } else {
-        echo "❌ Admin user not found<br>";
-    }
-} catch (Exception $e) {
-    echo "❌ User query error: " . $e->getMessage() . "<br>";
-}
-
-// Test 6: Manual Login Test
-echo "<h2>6. 🚀 Manual Login Test</h2>";
-
-if (isset($_POST['test_login'])) {
-    $username = $_POST['username'] ?? '';
-    $password = $_POST['password'] ?? '';
-    
-    echo "<h3>Login attempt for: " . htmlspecialchars($username) . "</h3>";
-    
-    try {
-        if (isset($auth)) {
-            $result = $auth->login($username, $password);
+        if ($conn) {
+            echo "<span class='success'>✅ Database connection: OK</span><br>";
             
-            echo "<pre>";
-            print_r($result);
-            echo "</pre>";
+            // Step 2: Check if tables exist
+            echo "<h3>2. Kiểm tra bảng database</h3>";
+            $tables = ['users', 'documents', 'text_styles', 'labelings'];
+            $missing_tables = [];
             
-            if ($result['success']) {
-                echo "✅ Login successful!<br>";
-                echo "Current session data:<br>";
-                echo "<pre>";
-                print_r($_SESSION);
-                echo "</pre>";
+            foreach ($tables as $table) {
+                $stmt = $conn->query("SHOW TABLES LIKE '$table'");
+                if ($stmt->rowCount() > 0) {
+                    echo "<span class='success'>✅ Bảng $table: Tồn tại</span><br>";
+                } else {
+                    echo "<span class='error'>❌ Bảng $table: Không tồn tại</span><br>";
+                    $missing_tables[] = $table;
+                }
+            }
+            
+            if (empty($missing_tables)) {
+                // Step 3: Check users
+                echo "<h3>3. Kiểm tra người dùng</h3>";
+                $stmt = $conn->query("SELECT id, username, role, is_active FROM users");
+                $users = $stmt->fetchAll(PDO::FETCH_ASSOC);
                 
-                // Test redirect URL
-                $redirect_url = $auth->getRedirectUrl($result['role']);
-                echo "Redirect URL would be: <strong>$redirect_url</strong><br>";
+                if (empty($users)) {
+                    echo "<span class='error'>❌ Không có người dùng nào trong database</span><br>";
+                    echo "<button onclick='createUsers()' style='background: green; color: white; padding: 10px; border: none; border-radius: 5px; cursor: pointer;'>Tạo người dùng demo</button>";
+                } else {
+                    echo "<span class='success'>✅ Tìm thấy " . count($users) . " người dùng:</span><br>";
+                    echo "<table border='1' style='border-collapse: collapse; margin: 10px 0;'>";
+                    echo "<tr><th>ID</th><th>Username</th><th>Role</th><th>Active</th><th>Password Test</th></tr>";
+                    
+                    foreach ($users as $user) {
+                        $password_test = password_verify('admin123', $user['id'] == 1 ? '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi' : 'unknown');
+                        echo "<tr>";
+                        echo "<td>{$user['id']}</td>";
+                        echo "<td>{$user['username']}</td>";
+                        echo "<td>{$user['role']}</td>";
+                        echo "<td>" . ($user['is_active'] ? 'Yes' : 'No') . "</td>";
+                        echo "<td>" . ($password_test ? '✅' : '❌') . "</td>";
+                        echo "</tr>";
+                    }
+                    echo "</table>";
+                }
+                
+                // Step 4: Test login
+                echo "<h3>4. Test đăng nhập</h3>";
+                if ($_POST && isset($_POST['test_login'])) {
+                    $test_username = $_POST['username'];
+                    $test_password = $_POST['password'];
+                    
+                    $query = "SELECT id, username, password, role, full_name FROM users WHERE username = :username AND is_active = 1";
+                    $stmt = $conn->prepare($query);
+                    $stmt->bindParam(':username', $test_username);
+                    $stmt->execute();
+                    
+                    if ($stmt->rowCount() > 0) {
+                        $user = $stmt->fetch(PDO::FETCH_ASSOC);
+                        echo "<span class='info'>👤 Tìm thấy user: {$user['username']}</span><br>";
+                        
+                        if (password_verify($test_password, $user['password'])) {
+                            echo "<span class='success'>✅ Mật khẩu đúng! Login sẽ thành công.</span><br>";
+                        } else {
+                            echo "<span class='error'>❌ Mật khẩu sai!</span><br>";
+                            echo "<span class='info'>Stored hash: " . substr($user['password'], 0, 20) . "...</span><br>";
+                        }
+                    } else {
+                        echo "<span class='error'>❌ Không tìm thấy user '$test_username' hoặc user bị vô hiệu hóa</span><br>";
+                    }
+                }
+                
+                echo "<form method='POST'>
+                    <input type='hidden' name='test_login' value='1'>
+                    <label>Username: </label>
+                    <input type='text' name='username' value='admin' required>
+                    <label>Password: </label>
+                    <input type='password' name='password' value='admin123' required>
+                    <button type='submit' style='background: blue; color: white; padding: 5px 10px; border: none; border-radius: 3px;'>Test Login</button>
+                </form>";
                 
             } else {
-                echo "❌ Login failed: " . $result['message'] . "<br>";
+                echo "<span class='error'>❌ Thiếu bảng: " . implode(', ', $missing_tables) . "</span><br>";
+                echo "<button onclick='createTables()' style='background: orange; color: white; padding: 10px; border: none; border-radius: 5px; cursor: pointer;'>Tạo bảng thiếu</button>";
             }
+            
         } else {
-            echo "❌ Auth object not available<br>";
+            echo "<span class='error'>❌ Database connection failed</span><br>";
         }
-    } catch (Exception $e) {
-        echo "❌ Login test error: " . $e->getMessage() . "<br>";
-    }
-}
-
-// Test 7: File Structure Check
-echo "<h2>7. 📁 File Structure Check</h2>";
-$required_files = [
-    'config/database.php' => 'Database config',
-    'includes/auth.php' => 'Authentication system',
-    'login.php' => 'Login page',
-    'index.php' => 'Main index',
-    'logout.php' => 'Logout script',
-    'admin/dashboard.php' => 'Admin dashboard',
-    'labeler/dashboard.php' => 'Labeler dashboard',
-    'reviewer/dashboard.php' => 'Reviewer dashboard'
-];
-
-foreach ($required_files as $file => $desc) {
-    if (file_exists($file)) {
-        $size = filesize($file);
-        echo "✅ $desc: $file ($size bytes)<br>";
     } else {
-        echo "❌ $desc: $file (MISSING)<br>";
+        echo "<span class='error'>❌ File config/database.php không tồn tại</span><br>";
+        echo "<a href='setup.php' style='background: red; color: white; padding: 10px; text-decoration: none; border-radius: 5px;'>Chạy Setup</a>";
     }
+} catch (Exception $e) {
+    echo "<span class='error'>❌ Lỗi: " . $e->getMessage() . "</span><br>";
 }
 
-// Test 8: PHP Configuration
-echo "<h2>8. ⚙️ PHP Configuration</h2>";
-echo "PHP Version: " . PHP_VERSION . "<br>";
-echo "Session save path: " . session_save_path() . "<br>";
-echo "Session cookie lifetime: " . ini_get('session.cookie_lifetime') . "<br>";
-echo "Memory limit: " . ini_get('memory_limit') . "<br>";
-echo "Max execution time: " . ini_get('max_execution_time') . "<br>";
-
-// Check required extensions
-$required_ext = ['pdo', 'pdo_mysql', 'json', 'session'];
-echo "Required extensions:<br>";
-foreach ($required_ext as $ext) {
-    if (extension_loaded($ext)) {
-        echo "✅ $ext<br>";
-    } else {
-        echo "❌ $ext (MISSING)<br>";
-    }
-}
-
-// End debugging output
-echo "</div>";
-
-// Interactive test form
-?>
-<!DOCTYPE html>
-<html lang="vi">
-<head>
-    <meta charset="UTF-8">
-    <title>Debug Login - Text Labeling System</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
-        .test-form { background: white; padding: 20px; border-radius: 10px; margin: 20px 0; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-        .test-form h3 { color: #333; margin-top: 0; }
-        .form-group { margin: 15px 0; }
-        .form-group label { display: block; margin-bottom: 5px; font-weight: bold; }
-        .form-group input { width: 200px; padding: 8px; border: 1px solid #ddd; border-radius: 4px; }
-        .btn { padding: 10px 20px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
-        .btn:hover { background: #0056b3; }
-        .quick-test { background: #e7f3ff; padding: 15px; border-radius: 8px; margin: 10px 0; }
-        .quick-test button { margin: 5px; }
-    </style>
-</head>
-<body>
-
-<div class="test-form">
-    <h3>🧪 Interactive Login Test</h3>
-    <form method="POST">
-        <div class="form-group">
-            <label>Username:</label>
-            <input type="text" name="username" value="admin" required>
-        </div>
-        <div class="form-group">
-            <label>Password:</label>
-            <input type="password" name="password" value="password123" required>
-        </div>
-        <button type="submit" name="test_login" class="btn">Test Login</button>
-    </form>
+// Handle AJAX requests
+if ($_POST && isset($_POST['action'])) {
+    header('Content-Type: application/json');
     
-    <div class="quick-test">
-        <strong>Quick Tests:</strong><br>
-        <button onclick="testUser('admin', 'password123')" class="btn">Test Admin</button>
-        <button onclick="testUser('labeler1', 'password123')" class="btn">Test Labeler1</button>
-        <button onclick="testUser('reviewer1', 'password123')" class="btn">Test Reviewer1</button>
-    </div>
-</div>
+    try {
+        require_once 'config/database.php';
+        $database = new Database();
+        $conn = $database->getConnection();
+        
+        if ($_POST['action'] === 'create_users') {
+            // Create demo users
+            $users = [
+                ['admin', 'admin@example.com', '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'admin', 'Administrator'],
+                ['labeler1', 'labeler1@example.com', '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'labeler', 'Người gán nhãn 1'],
+                ['reviewer1', 'reviewer1@example.com', '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'reviewer', 'Người review 1']
+            ];
+            
+            $query = "INSERT IGNORE INTO users (username, email, password, role, full_name) VALUES (?, ?, ?, ?, ?)";
+            $stmt = $conn->prepare($query);
+            
+            $created = 0;
+            foreach ($users as $user) {
+                if ($stmt->execute($user)) {
+                    $created++;
+                }
+            }
+            
+            echo json_encode(['success' => true, 'message' => "Đã tạo $created người dùng"]);
+            exit;
+        }
+        
+        if ($_POST['action'] === 'create_tables') {
+            // Create missing tables
+            $sql = "
+            CREATE TABLE IF NOT EXISTS users (
+                id INT PRIMARY KEY AUTO_INCREMENT,
+                username VARCHAR(50) UNIQUE NOT NULL,
+                email VARCHAR(100) UNIQUE NOT NULL,
+                password VARCHAR(255) NOT NULL,
+                role ENUM('admin', 'labeler', 'reviewer') NOT NULL,
+                full_name VARCHAR(100) NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                is_active BOOLEAN DEFAULT TRUE
+            );
 
-<div class="test-form">
-    <h3>🔍 Additional Checks</h3>
-    <a href="login.php" target="_blank" style="margin: 5px; padding: 10px; background: #28a745; color: white; text-decoration: none; border-radius: 4px;">Open Login Page</a>
-    <a href="index.php" target="_blank" style="margin: 5px; padding: 10px; background: #17a2b8; color: white; text-decoration: none; border-radius: 4px;">Open Index Page</a>
-    <a href="check_database.php" target="_blank" style="margin: 5px; padding: 10px; background: #ffc107; color: black; text-decoration: none; border-radius: 4px;">Database Check</a>
-</div>
+            CREATE TABLE IF NOT EXISTS documents (
+                id INT PRIMARY KEY AUTO_INCREMENT,
+                title VARCHAR(255) NOT NULL,
+                content TEXT NOT NULL,
+                ai_summary TEXT,
+                uploaded_by INT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                status ENUM('pending', 'in_progress', 'completed', 'reviewed') DEFAULT 'pending',
+                FOREIGN KEY (uploaded_by) REFERENCES users(id)
+            );
 
-<div class="test-form">
-    <h3>📋 Next Steps Based on Results</h3>
-    <ul>
-        <li><strong>If Database Connection Failed:</strong> Check config/database.php settings</li>
-        <li><strong>If Auth Class Failed:</strong> Verify includes/auth.php exists and is readable</li>
-        <li><strong>If Session Failed:</strong> Check session directory permissions</li>
-        <li><strong>If Password Test Failed:</strong> Database might have different password hashes</li>
-        <li><strong>If Manual Login Failed:</strong> Check specific error message above</li>
-        <li><strong>If Files Missing:</strong> Copy missing files from artifacts</li>
-    </ul>
-</div>
+            CREATE TABLE IF NOT EXISTS text_styles (
+                id INT PRIMARY KEY AUTO_INCREMENT,
+                name VARCHAR(100) NOT NULL,
+                description TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS labelings (
+                id INT PRIMARY KEY AUTO_INCREMENT,
+                document_id INT NOT NULL,
+                labeler_id INT NOT NULL,
+                reviewer_id INT,
+                important_sentences TEXT,
+                text_style_id INT,
+                edited_summary TEXT,
+                labeling_notes TEXT,
+                review_notes TEXT,
+                status ENUM('pending', 'completed', 'reviewed', 'rejected') DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                FOREIGN KEY (document_id) REFERENCES documents(id),
+                FOREIGN KEY (labeler_id) REFERENCES users(id),
+                FOREIGN KEY (reviewer_id) REFERENCES users(id),
+                FOREIGN KEY (text_style_id) REFERENCES text_styles(id)
+            );
+
+            INSERT IGNORE INTO text_styles (id, name, description) VALUES
+            (1, 'Tường thuật', 'Văn bản mô tả sự kiện, hiện tượng theo thời gian'),
+            (2, 'Nghị luận', 'Văn bản trình bày quan điểm, lập luận về một vấn đề'),
+            (3, 'Miêu tả', 'Văn bản tả lại hình ảnh, đặc điểm của sự vật, hiện tượng'),
+            (4, 'Biểu cảm', 'Văn bản thể hiện cảm xúc, tâm trạng của tác giả'),
+            (5, 'Thuyết minh', 'Văn bản giải thích, làm rõ về một sự vật, hiện tượng');
+            ";
+            
+            $conn->exec($sql);
+            echo json_encode(['success' => true, 'message' => 'Đã tạo tất cả bảng cần thiết']);
+            exit;
+        }
+        
+    } catch (Exception $e) {
+        echo json_encode(['success' => false, 'message' => $e->getMessage()]);
+        exit;
+    }
+}
+?>
 
 <script>
-function testUser(username, password) {
-    document.querySelector('input[name="username"]').value = username;
-    document.querySelector('input[name="password"]').value = password;
-    document.querySelector('form').submit();
+function createUsers() {
+    if (confirm('Tạo người dùng demo (admin, labeler1, reviewer1)?')) {
+        fetch('debug_login.php', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: 'action=create_users'
+        })
+        .then(response => response.json())
+        .then(data => {
+            alert(data.message);
+            location.reload();
+        })
+        .catch(error => {
+            alert('Lỗi: ' + error);
+        });
+    }
+}
+
+function createTables() {
+    if (confirm('Tạo tất cả bảng cần thiết cho database?')) {
+        fetch('debug_login.php', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: 'action=create_tables'
+        })
+        .then(response => response.json())
+        .then(data => {
+            alert(data.message);
+            location.reload();
+        })
+        .catch(error => {
+            alert('Lỗi: ' + error);
+        });
+    }
 }
 </script>
 
-</body>
-</html>
+<br><br>
+<hr>
+<h3>🔧 Hướng dẫn khắc phục:</h3>
+<ol>
+    <li><strong>Nếu thiếu config:</strong> Chạy <a href="setup.php">setup.php</a></li>
+    <li><strong>Nếu thiếu bảng:</strong> Click nút "Tạo bảng thiếu"</li>
+    <li><strong>Nếu không có user:</strong> Click nút "Tạo người dùng demo"</li>
+    <li><strong>Nếu mật khẩu sai:</strong> Sử dụng test login để kiểm tra</li>
+</ol>
 
-<?php
-// Flush output buffer
-ob_end_flush();
-?>
+<h3>📋 Tài khoản demo:</h3>
+<ul>
+    <li><strong>Admin:</strong> username = <code>admin</code>, password = <code>admin123</code></li>
+    <li><strong>Labeler:</strong> username = <code>labeler1</code>, password = <code>admin123</code></li>
+    <li><strong>Reviewer:</strong> username = <code>reviewer1</code>, password = <code>admin123</code></li>
+</ul>
