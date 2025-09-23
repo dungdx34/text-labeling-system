@@ -1,111 +1,103 @@
 <?php
-// includes/auth.php - Complete Fixed Version
-session_start();
+// Authentication and session management
 
-class Auth {
-    public static function requireLogin($role = null) {
-        if (!isset($_SESSION['user_id'])) {
-            header('Location: ' . self::getBaseUrl() . '/login.php');
-            exit;
-        }
-        
-        if ($role && $_SESSION['role'] !== $role) {
-            self::redirectToRoleDashboard($_SESSION['role']);
-            exit;
-        }
-        
-        return true;
+function checkAuth($required_role = null) {
+    if (!isset($_SESSION['user_id']) || !isset($_SESSION['role'])) {
+        return false;
     }
     
-    public static function login($username, $password) {
-        global $pdo;
-        
-        try {
-            $stmt = $pdo->prepare("SELECT id, username, password, role FROM users WHERE username = ? AND status = 'active'");
-            $stmt->execute([$username]);
-            $user = $stmt->fetch(PDO::FETCH_ASSOC);
-            
-            if ($user && password_verify($password, $user['password'])) {
-                $_SESSION['user_id'] = $user['id'];
-                $_SESSION['username'] = $user['username'];
-                $_SESSION['role'] = $user['role'];
-                
-                return true;
-            }
-            
-            return false;
-        } catch (Exception $e) {
-            error_log("Login error: " . $e->getMessage());
-            return false;
-        }
+    if ($required_role && $_SESSION['role'] !== $required_role) {
+        return false;
     }
     
-    public static function logout() {
-        session_unset();
-        session_destroy();
-        header('Location: ' . self::getBaseUrl() . '/login.php');
-        exit;
+    return true;
+}
+
+function requireAuth($required_role = null) {
+    if (!checkAuth($required_role)) {
+        header('Location: ../login.php');
+        exit();
     }
-    
-    public static function isLoggedIn() {
-        return isset($_SESSION['user_id']);
-    }
-    
-    public static function getCurrentUser() {
-        if (self::isLoggedIn()) {
-            return [
-                'id' => $_SESSION['user_id'],
-                'username' => $_SESSION['username'],
-                'role' => $_SESSION['role']
-            ];
-        }
+}
+
+function requireAdmin() {
+    requireAuth('admin');
+}
+
+function requireLabeler() {
+    requireAuth('labeler');
+}
+
+function requireReviewer() {
+    requireAuth('reviewer');
+}
+
+function getUserInfo() {
+    if (!checkAuth()) {
         return null;
     }
     
-    public static function redirectToRoleDashboard($role) {
-        $baseUrl = self::getBaseUrl();
+    return [
+        'id' => $_SESSION['user_id'],
+        'username' => $_SESSION['username'],
+        'email' => $_SESSION['email'],
+        'full_name' => $_SESSION['full_name'],
+        'role' => $_SESSION['role']
+    ];
+}
+
+function logActivity($db, $user_id, $action, $entity_type = null, $entity_id = null, $details = null) {
+    try {
+        $query = "INSERT INTO activity_logs (user_id, action, entity_type, entity_id, details, ip_address, user_agent) 
+                 VALUES (:user_id, :action, :entity_type, :entity_id, :details, :ip_address, :user_agent)";
+        $stmt = $db->prepare($query);
         
-        switch ($role) {
-            case 'admin':
-                header('Location: ' . $baseUrl . '/admin/dashboard.php');
-                break;
-            case 'labeler':
-                header('Location: ' . $baseUrl . '/labeler/dashboard.php');
-                break;
-            case 'reviewer':
-                header('Location: ' . $baseUrl . '/reviewer/dashboard.php');
-                break;
-            default:
-                header('Location: ' . $baseUrl . '/login.php');
-        }
-        exit;
+        $stmt->bindParam(':user_id', $user_id);
+        $stmt->bindParam(':action', $action);
+        $stmt->bindParam(':entity_type', $entity_type);
+        $stmt->bindParam(':entity_id', $entity_id);
+        $stmt->bindParam(':details', json_encode($details));
+        $stmt->bindParam(':ip_address', $_SERVER['REMOTE_ADDR']);
+        $stmt->bindParam(':user_agent', $_SERVER['HTTP_USER_AGENT']);
+        
+        $stmt->execute();
+    } catch (Exception $e) {
+        error_log("Failed to log activity: " . $e->getMessage());
     }
-    
-    public static function getBaseUrl() {
-        $protocol = isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? 'https' : 'http';
-        $host = $_SERVER['HTTP_HOST'];
-        $path = dirname($_SERVER['SCRIPT_NAME']);
-        
-        // Remove trailing slashes and normalize path
-        $path = rtrim($path, '/');
-        if ($path === '') {
-            $path = '';
-        }
-        
-        return $protocol . '://' . $host . $path;
+}
+
+function redirectByRole($role) {
+    switch ($role) {
+        case 'admin':
+            header('Location: admin/dashboard.php');
+            break;
+        case 'labeler':
+            header('Location: labeler/dashboard.php');
+            break;
+        case 'reviewer':
+            header('Location: reviewer/dashboard.php');
+            break;
+        default:
+            header('Location: login.php');
     }
-    
-    public static function checkPermission($required_role) {
-        if (!self::isLoggedIn()) {
-            return false;
-        }
-        
-        $user_role = $_SESSION['role'];
-        $role_hierarchy = ['admin' => 3, 'reviewer' => 2, 'labeler' => 1];
-        
-        return isset($role_hierarchy[$user_role]) && 
-               isset($role_hierarchy[$required_role]) && 
-               $role_hierarchy[$user_role] >= $role_hierarchy[$required_role];
+    exit();
+}
+
+function sanitizeInput($data) {
+    $data = trim($data);
+    $data = stripslashes($data);
+    $data = htmlspecialchars($data);
+    return $data;
+}
+
+function generateCSRFToken() {
+    if (!isset($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
     }
+    return $_SESSION['csrf_token'];
+}
+
+function validateCSRFToken($token) {
+    return isset($_SESSION['csrf_token']) && hash_equals($_SESSION['csrf_token'], $token);
 }
 ?>

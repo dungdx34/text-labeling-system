@@ -1,50 +1,260 @@
 <?php
-// admin/upload.php - Fixed Traditional Upload
+session_start();
 require_once '../config/database.php';
 require_once '../includes/auth.php';
 
-Auth::requireLogin('admin');
+// Check if user is logged in and is admin
+if (!isset($_SESSION['user_id']) || $_SESSION['role'] !== 'admin') {
+    header('Location: ../login.php');
+    exit();
+}
 
 $database = new Database();
-$pdo = $database->getConnection();
+$db = $database->getConnection();
 
 $message = '';
 $error = '';
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['upload_document'])) {
-    $title = trim($_POST['title']);
-    $content = trim($_POST['content']);
-    $summary = trim($_POST['summary']);
+// COPY EXACT LOGIC FROM WORKING VERSION
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['jsonl_file'])) {
+    $file = $_FILES['jsonl_file'];
     
-    if (empty($title) || empty($content) || empty($summary)) {
-        $error = 'Vui lòng điền đầy đủ thông tin';
-    } else {
-        try {
-            $pdo->beginTransaction();
+    if ($file['error'] === UPLOAD_ERR_OK && $file['size'] > 0) {
+        $content = file_get_contents($file['tmp_name']);
+        $lines = explode("\n", trim($content));
+        
+        $success_count = 0;
+        $error_count = 0;
+        $errors = [];
+        
+        foreach ($lines as $line_num => $line) {
+            $line = trim($line);
+            if (empty($line)) continue;
             
-            // Insert document
-            $stmt = $pdo->prepare("INSERT INTO documents (title, content, type, created_by, created_at) VALUES (?, ?, 'single', ?, NOW())");
-            $stmt->execute([$title, $content, 1]); // created_by = 1 (admin)
-            $document_id = $pdo->lastInsertId();
+            $data = json_decode($line, true);
+            if (json_last_error() !== JSON_ERROR_NONE) {
+                $error_count++;
+                $errors[] = "Dòng " . ($line_num + 1) . ": JSON không hợp lệ";
+                continue;
+            }
             
-            // Insert AI summary
-            $stmt = $pdo->prepare("INSERT INTO ai_summaries (document_id, summary, created_at) VALUES (?, ?, NOW())");
-            $stmt->execute([$document_id, $summary]);
+            if (!isset($data['type'])) {
+                $error_count++;
+                $errors[] = "Dòng " . ($line_num + 1) . ": Thiếu trường 'type'";
+                continue;
+            }
             
-            $pdo->commit();
-            $message = 'Upload văn bản thành công!';
-            
-            // Clear form
-            $title = $content = $summary = '';
-            
-        } catch (Exception $e) {
-            $pdo->rollback();
-            $error = 'Lỗi upload: ' . $e->getMessage();
+            try {
+                if ($data['type'] === 'single') {
+                    if (!isset($data['title']) || !isset($data['content']) || !isset($data['ai_summary'])) {
+                        throw new Exception("Thiếu trường bắt buộc: title, content, ai_summary");
+                    }
+                    
+                    $query = "INSERT INTO documents (title, content, ai_summary, type, created_by, created_at) 
+                             VALUES (?, ?, ?, 'single', ?, NOW())";
+                    $stmt = $db->prepare($query);
+                    $result = $stmt->execute([
+                        $data['title'],
+                        $data['content'],
+                        $data['ai_summary'],
+                        $_SESSION['user_id']
+                    ]);
+                    
+                    if ($result) {
+                        $success_count++;
+                    } else {
+                        throw new Exception("Database insert failed");
+                    }
+                    
+                } elseif ($data['type'] === 'multi') {
+                    if (!isset($data['group_title']) || !isset($data['group_summary']) || !isset($data['documents'])) {
+                        throw new Exception("Thiếu trường bắt buộc: group_title, group_summary, documents");
+                    }
+                    
+                    // Start transaction
+                    $db->beginTransaction();
+                    
+                    // Insert group
+                    $query = "INSERT INTO document_groups (title, description, ai_summary, created_by, created_at) 
+                             VALUES (?, ?, ?, ?, NOW())";
+                    $stmt = $db->prepare($query);
+                    $result = $stmt->execute([
+                        $data['group_title'],
+                        $data['group_description'] ?? '',
+                        $data['group_summary'],
+                        $_SESSION['user_id']
+                    ]);
+                    
+                    if (!$result) {
+                        throw new Exception("Failed to insert document group");
+                    }
+                    
+                    $group_id = $db->lastInsertId();
+                    
+                    // Insert documents
+                    foreach ($data['documents'] as $doc_index => $document) {
+                        if (!isset($document['title']) || !isset($document['content'])) {
+                            throw new Exception("Document " . ($doc_index + 1) . ": Missing title or content");
+                        }
+                        
+                        $query = "INSERT INTO documents (title, content, type, group_id, created_by, created_at) 
+                                 VALUES (?, ?, 'multi', ?, ?, NOW())";
+                        $stmt = $db->prepare($query);
+                        $result = $stmt->execute([
+                            $document['title'],
+                            $document['content'],
+                            $group_id,
+                            $_SESSION['user_id']
+                        ]);
+                        
+                        if (!$result) {
+                            throw new Exception("Failed to insert document " . ($doc_index + 1));
+                        }
+                    }
+                    
+                    $db->commit();
+                    $success_count++;
+                    
+                } else {
+                    throw new Exception("Invalid type: " . $data['type']);
+                }
+                
+            } catch (Exception $e) {
+                if ($db->inTransaction()) {
+                    $db->rollBack();
+                }
+                $error_count++;
+                $errors[] = "Dòng " . ($line_num + 1) . ": " . $e->getMessage();
+            }
         }
+        
+        if ($success_count > 0) {
+            $message = "Upload thành công! Đã xử lý $success_count item(s)";
+            
+            // Log activity
+            logActivity($db, $_SESSION['user_id'], 'upload_jsonl', 'document', null, [
+                'success_count' => $success_count,
+                'error_count' => $error_count
+            ]);
+        }
+        if ($error_count > 0) {
+            $error = "Có $error_count lỗi xảy ra";
+            if (!empty($errors)) {
+                $error .= ":<br>" . implode('<br>', array_slice($errors, 0, 3));
+                if (count($errors) > 3) {
+                    $error .= "<br>... và " . (count($errors) - 3) . " lỗi khác";
+                }
+            }
+        }
+        
+    } else {
+        $error = "File upload failed. Error code: " . $file['error'] . ", Size: " . $file['size'];
     }
 }
 
-$current_user = Auth::getCurrentUser();
+// Handle manual document upload
+if ($_POST && isset($_POST['action']) && $_POST['action'] === 'upload_documents') {
+    $upload_type = $_POST['upload_type'];
+    
+    try {
+        if ($upload_type === 'single') {
+            $title = trim($_POST['single_title']);
+            $content = trim($_POST['single_content']);
+            $summary = trim($_POST['single_summary']);
+            
+            // Handle file upload if provided
+            if (isset($_FILES['single_file']) && $_FILES['single_file']['error'] === UPLOAD_ERR_OK) {
+                $content = file_get_contents($_FILES['single_file']['tmp_name']);
+            }
+            
+            if (empty($title) || empty($content) || empty($summary)) {
+                throw new Exception("Vui lòng điền đầy đủ thông tin");
+            }
+            
+            $query = "INSERT INTO documents (title, content, ai_summary, type, created_by, created_at) 
+                     VALUES (?, ?, ?, 'single', ?, NOW())";
+            $stmt = $db->prepare($query);
+            
+            if ($stmt->execute([$title, $content, $summary, $_SESSION['user_id']])) {
+                $message = "Upload văn bản đơn thành công!";
+                logActivity($db, $_SESSION['user_id'], 'upload_single_document', 'document', $db->lastInsertId());
+            } else {
+                throw new Exception("Không thể lưu văn bản");
+            }
+            
+        } else if ($upload_type === 'multi') {
+            $group_title = trim($_POST['group_title']);
+            $group_description = trim($_POST['group_description']);
+            $group_summary = trim($_POST['group_summary']);
+            $doc_titles = $_POST['doc_title'];
+            $doc_contents = $_POST['doc_content'];
+            
+            if (empty($group_title) || empty($group_summary)) {
+                throw new Exception("Vui lòng điền đầy đủ thông tin nhóm");
+            }
+            
+            // Start transaction
+            $db->beginTransaction();
+            
+            // Insert document group
+            $query = "INSERT INTO document_groups (title, description, ai_summary, created_by, created_at) 
+                     VALUES (?, ?, ?, ?, NOW())";
+            $stmt = $db->prepare($query);
+            
+            if (!$stmt->execute([$group_title, $group_description, $group_summary, $_SESSION['user_id']])) {
+                throw new Exception("Không thể tạo nhóm văn bản");
+            }
+            
+            $group_id = $db->lastInsertId();
+            $doc_count = 0;
+            
+            // Insert individual documents
+            for ($i = 0; $i < count($doc_titles); $i++) {
+                if (!empty($doc_titles[$i]) && !empty($doc_contents[$i])) {
+                    // Handle file upload for this document
+                    $content = trim($doc_contents[$i]);
+                    if (isset($_FILES['doc_file']['tmp_name'][$i]) && $_FILES['doc_file']['error'][$i] === UPLOAD_ERR_OK) {
+                        $content = file_get_contents($_FILES['doc_file']['tmp_name'][$i]);
+                    }
+                    
+                    $query = "INSERT INTO documents (title, content, type, group_id, created_by, created_at) 
+                             VALUES (?, ?, 'multi', ?, ?, NOW())";
+                    $stmt = $db->prepare($query);
+                    
+                    if ($stmt->execute([trim($doc_titles[$i]), $content, $group_id, $_SESSION['user_id']])) {
+                        $doc_count++;
+                    }
+                }
+            }
+            
+            if ($doc_count > 0) {
+                $db->commit();
+                $message = "Upload nhóm văn bản thành công! Đã thêm $doc_count văn bản";
+                logActivity($db, $_SESSION['user_id'], 'upload_multi_documents', 'document_group', $group_id);
+            } else {
+                $db->rollBack();
+                throw new Exception("Không có văn bản nào được thêm");
+            }
+        }
+    } catch (Exception $e) {
+        if ($db->inTransaction()) {
+            $db->rollBack();
+        }
+        $error = "Upload thất bại: " . $e->getMessage();
+    }
+}
+
+// Get statistics
+$query = "SELECT 
+    (SELECT COUNT(*) FROM documents WHERE type = 'single') as single_docs,
+    (SELECT COUNT(*) FROM document_groups) as multi_groups,
+    (SELECT COUNT(*) FROM documents WHERE type = 'multi') as multi_docs,
+    (SELECT COUNT(*) FROM labeling_tasks WHERE status = 'pending') as pending_tasks,
+    (SELECT COUNT(*) FROM labeling_tasks WHERE status = 'completed') as completed_tasks";
+$stmt = $db->prepare($query);
+$stmt->execute();
+$stats = $stmt->fetch(PDO::FETCH_ASSOC);
+
 ?>
 <!DOCTYPE html>
 <html lang="vi">
@@ -52,343 +262,383 @@ $current_user = Auth::getCurrentUser();
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Upload Văn bản - Text Labeling System</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
     <style>
-        .gradient-bg {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        body { 
+            font-family: 'Segoe UI', sans-serif; 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+            min-height: 100vh; 
         }
-        .form-section {
-            background: #f8f9fa;
+        .sidebar {
+            background: linear-gradient(180deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            color: white;
+        }
+        .sidebar .nav-link {
+            color: rgba(255,255,255,0.8);
+            transition: all 0.3s ease;
+            padding: 12px 20px;
+            margin: 5px 0;
+        }
+        .sidebar .nav-link:hover, .sidebar .nav-link.active {
+            color: white;
+            background: rgba(255,255,255,0.1);
+            border-radius: 10px;
+        }
+        .main-content { 
+            background: white; 
+            border-radius: 20px; 
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1); 
+            margin: 20px; 
+            padding: 40px; 
+        }
+        .stats-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
             border-radius: 15px;
             padding: 20px;
+            text-align: center;
             margin-bottom: 20px;
         }
-        .preview-box {
-            background: #fff;
-            border: 1px solid #dee2e6;
-            border-radius: 8px;
-            padding: 15px;
-            max-height: 200px;
-            overflow-y: auto;
+        .jsonl-upload {
+            background: #f8f9fa;
+            border: 3px dashed #28a745;
+            border-radius: 15px;
+            padding: 30px;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .jsonl-upload:hover {
+            background: #e9f7ef;
+            border-color: #1e7e34;
+        }
+        .upload-type-card {
+            border: 2px solid #e9ecef;
+            border-radius: 15px;
+            padding: 30px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            height: 200px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+        .upload-type-card:hover {
+            border-color: #0d6efd;
+            background: #f8f9ff;
+            transform: translateY(-5px);
+        }
+        .upload-type-card.selected {
+            border-color: #0d6efd;
+            background: #e3f2fd;
+            box-shadow: 0 8px 25px rgba(13, 110, 253, 0.2);
+        }
+        .step-indicator {
+            display: flex;
+            justify-content: center;
+            margin: 30px 0;
+        }
+        .step {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            background: #e9ecef;
+            color: #6c757d;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 10px;
+            font-weight: bold;
+            transition: all 0.3s ease;
+        }
+        .step.active {
+            background: #0d6efd;
+            color: white;
+        }
+        .step.completed {
+            background: #28a745;
+            color: white;
+        }
+        .document-item {
+            background: #f8f9fa;
+            border: 2px dashed #dee2e6;
+            border-radius: 12px;
+            padding: 20px;
+            margin: 15px 0;
+            transition: all 0.3s ease;
+        }
+        .document-item:hover {
+            border-color: #0d6efd;
+            background: #e3f2fd;
+        }
+        .document-item.filled {
+            border-style: solid;
+            border-color: #28a745;
+            background: #d4edda;
         }
     </style>
 </head>
-<body class="bg-light">
-    <!-- Navigation -->
-    <nav class="navbar navbar-expand-lg navbar-dark gradient-bg">
-        <div class="container">
-            <a class="navbar-brand" href="dashboard.php">
-                <i class="fas fa-tags me-2"></i>Text Labeling System
-            </a>
-            <div class="navbar-nav ms-auto">
-                <a class="nav-link" href="dashboard.php">
-                    <i class="fas fa-tachometer-alt me-1"></i>Dashboard
-                </a>
-                <a class="nav-link" href="users.php">
-                    <i class="fas fa-users me-1"></i>Users
-                </a>
-                <a class="nav-link" href="upload_jsonl.php">
-                    <i class="fas fa-file-code me-1"></i>Upload JSONL
-                </a>
-                <a class="nav-link" href="../logout.php">
-                    <i class="fas fa-sign-out-alt me-1"></i>Đăng xuất
-                </a>
-            </div>
-        </div>
-    </nav>
-
-    <div class="container mt-4">
-        <!-- Header -->
-        <div class="row mb-4">
-            <div class="col-12">
-                <div class="d-flex justify-content-between align-items-center">
-                    <div>
-                        <h2 class="text-primary">
-                            <i class="fas fa-upload me-2"></i>Upload Văn bản
-                        </h2>
-                        <p class="text-muted">Tạo văn bản đơn lẻ với tóm tắt AI</p>
-                    </div>
-                    <a href="upload_jsonl.php" class="btn btn-outline-primary">
-                        <i class="fas fa-file-code me-2"></i>Upload JSONL
-                    </a>
+<body>
+    <div class="container-fluid">
+        <div class="row">
+            <!-- Sidebar -->
+            <div class="col-md-2 sidebar p-0">
+                <div class="p-4">
+                    <h4 class="text-center mb-4">
+                        <i class="fas fa-tags me-2"></i>
+                        Admin Panel
+                    </h4>
+                    <nav class="nav flex-column">
+                        <a href="dashboard.php" class="nav-link">
+                            <i class="fas fa-tachometer-alt me-2"></i>Dashboard
+                        </a>
+                        <a href="users.php" class="nav-link">
+                            <i class="fas fa-users me-2"></i>Quản lý Users
+                        </a>
+                        <a href="upload.php" class="nav-link active">
+                            <i class="fas fa-upload me-2"></i>Upload Dữ liệu
+                        </a>
+                        <a href="documents.php" class="nav-link">
+                            <i class="fas fa-file-text me-2"></i>Quản lý Văn bản
+                        </a>
+                        <a href="tasks.php" class="nav-link">
+                            <i class="fas fa-tasks me-2"></i>Quản lý Tasks
+                        </a>
+                        <a href="reports.php" class="nav-link">
+                            <i class="fas fa-chart-bar me-2"></i>Báo cáo
+                        </a>
+                        <hr class="my-3" style="border-color: rgba(255,255,255,0.3);">
+                        <a href="../logout.php" class="nav-link text-warning">
+                            <i class="fas fa-sign-out-alt me-2"></i>Đăng xuất
+                        </a>
+                    </nav>
                 </div>
             </div>
-        </div>
-
-        <!-- Alert Messages -->
-        <?php if ($message): ?>
-            <div class="alert alert-success alert-dismissible fade show">
-                <i class="fas fa-check-circle me-2"></i><?php echo htmlspecialchars($message); ?>
-                <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
-            </div>
-        <?php endif; ?>
-
-        <?php if ($error): ?>
-            <div class="alert alert-danger alert-dismissible fade show">
-                <i class="fas fa-exclamation-circle me-2"></i><?php echo htmlspecialchars($error); ?>
-                <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
-            </div>
-        <?php endif; ?>
-
-        <div class="row">
-            <!-- Upload Form -->
-            <div class="col-lg-8">
-                <div class="card">
-                    <div class="card-header bg-primary text-white">
-                        <h5 class="mb-0">
-                            <i class="fas fa-edit me-2"></i>Thông tin văn bản
-                        </h5>
+            
+            <!-- Main Content -->
+            <div class="col-md-10">
+                <div class="main-content">
+                    <!-- Header -->
+                    <div class="d-flex justify-content-between align-items-center mb-4">
+                        <div>
+                            <h2 class="text-primary">
+                                <i class="fas fa-upload me-2"></i>Upload Văn bản để Gán nhãn
+                            </h2>
+                            <p class="text-muted mb-0">Upload dữ liệu từ file JSONL hoặc nhập thủ công</p>
+                        </div>
+                        <a href="documents.php" class="btn btn-outline-primary">
+                            <i class="fas fa-eye me-2"></i>Xem Văn bản
+                        </a>
                     </div>
-                    <div class="card-body">
-                        <form method="POST">
-                            <div class="form-section">
-                                <h6 class="text-primary mb-3">
-                                    <i class="fas fa-file-text me-2"></i>Văn bản gốc
-                                </h6>
-                                
-                                <div class="mb-3">
-                                    <label class="form-label fw-bold">Tiêu đề văn bản *</label>
-                                    <input type="text" class="form-control" name="title" required 
-                                           placeholder="Nhập tiêu đề văn bản..."
-                                           value="<?php echo isset($title) ? htmlspecialchars($title) : ''; ?>">
-                                </div>
-                                
-                                <div class="mb-3">
-                                    <label class="form-label fw-bold">Nội dung văn bản *</label>
-                                    <textarea class="form-control" name="content" rows="10" required 
-                                              placeholder="Nhập nội dung đầy đủ của văn bản..."><?php echo isset($content) ? htmlspecialchars($content) : ''; ?></textarea>
-                                    <div class="form-text">
-                                        <span id="content-stats">0 ký tự, 0 từ</span>
-                                    </div>
-                                </div>
+
+                    <!-- Messages -->
+                    <?php if ($message): ?>
+                        <div class="alert alert-success alert-dismissible fade show" role="alert">
+                            <i class="fas fa-check-circle me-2"></i><?php echo $message; ?>
+                            <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                        </div>
+                    <?php endif; ?>
+                    
+                    <?php if ($error): ?>
+                        <div class="alert alert-danger alert-dismissible fade show" role="alert">
+                            <i class="fas fa-exclamation-triangle me-2"></i><?php echo $error; ?>
+                            <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                        </div>
+                    <?php endif; ?>
+
+                    <!-- Statistics -->
+                    <div class="row mb-4">
+                        <div class="col-md-3">
+                            <div class="stats-card">
+                                <h4><?php echo $stats['single_docs']; ?></h4>
+                                <small>Văn bản đơn</small>
                             </div>
-                            
-                            <div class="form-section">
-                                <h6 class="text-success mb-3">
-                                    <i class="fas fa-robot me-2"></i>Tóm tắt AI
-                                </h6>
-                                
-                                <div class="mb-3">
-                                    <label class="form-label fw-bold">Bản tóm tắt *</label>
-                                    <textarea class="form-control" name="summary" rows="6" required 
-                                              placeholder="Nhập bản tóm tắt AI cho văn bản này..."><?php echo isset($summary) ? htmlspecialchars($summary) : ''; ?></textarea>
-                                    <div class="form-text">
-                                        <span id="summary-stats">0 ký tự, 0 từ</span>
-                                    </div>
-                                </div>
+                        </div>
+                        <div class="col-md-3">
+                            <div class="stats-card">
+                                <h4><?php echo $stats['multi_groups']; ?></h4>
+                                <small>Nhóm đa văn bản</small>
                             </div>
-                            
-                            <div class="d-grid gap-2 d-md-flex justify-content-md-end">
-                                <button type="reset" class="btn btn-outline-secondary">
-                                    <i class="fas fa-undo me-2"></i>Xóa form
-                                </button>
-                                <button type="submit" name="upload_document" class="btn btn-primary">
-                                    <i class="fas fa-save me-2"></i>Lưu văn bản
-                                </button>
+                        </div>
+                        <div class="col-md-3">
+                            <div class="stats-card">
+                                <h4><?php echo $stats['pending_tasks']; ?></h4>
+                                <small>Task chờ gán nhãn</small>
                             </div>
+                        </div>
+                        <div class="col-md-3">
+                            <div class="stats-card">
+                                <h4><?php echo $stats['completed_tasks']; ?></h4>
+                                <small>Task hoàn thành</small>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- JSONL Upload Section -->
+                    <div class="jsonl-upload">
+                        <form method="POST" enctype="multipart/form-data">
+                            <h4 class="mb-3 text-success">
+                                <i class="fas fa-file-import me-2"></i>Upload từ file JSONL
+                            </h4>
+                            <p class="text-muted mb-3">
+                                Tải lên file JSONL chứa dữ liệu văn bản và bản tóm tắt AI.<br>
+                                <small>Tham khảo: samples/sample.jsonl</small>
+                            </p>
+                            <div class="mb-3">
+                                <input type="file" class="form-control" name="jsonl_file" accept=".jsonl,.json,.txt" required>
+                            </div>
+                            <button type="submit" class="btn btn-success btn-lg">
+                                <i class="fas fa-upload me-2"></i>Upload JSONL File
+                            </button>
                         </form>
                     </div>
-                </div>
-            </div>
-            
-            <!-- Instructions -->
-            <div class="col-lg-4">
-                <div class="card">
-                    <div class="card-header bg-info text-white">
-                        <h6 class="mb-0">
-                            <i class="fas fa-info-circle me-2"></i>Hướng dẫn
-                        </h6>
+
+                    <!-- Divider -->
+                    <div class="text-center mb-4">
+                        <hr class="w-25 d-inline-block">
+                        <span class="px-3 text-muted">HOẶC</span>
+                        <hr class="w-25 d-inline-block">
                     </div>
-                    <div class="card-body">
-                        <div class="mb-3">
-                            <h6 class="text-primary">📝 Cách thức hoạt động:</h6>
-                            <ul class="small">
-                                <li>Nhập tiêu đề mô tả nội dung văn bản</li>
-                                <li>Copy/paste nội dung văn bản đầy đủ</li>
-                                <li>Thêm bản tóm tắt AI tương ứng</li>
-                                <li>Hệ thống sẽ tự động tính toán thống kê</li>
-                            </ul>
-                        </div>
+
+                    <!-- Manual Upload Section -->
+                    <div class="manual-upload">
+                        <h4 class="mb-4 text-center">
+                            <i class="fas fa-edit me-2"></i>Nhập thủ công
+                        </h4>
                         
-                        <div class="mb-3">
-                            <h6 class="text-success">✅ Tips:</h6>
-                            <ul class="small">
-                                <li>Tiêu đề nên ngắn gọn và mô tả chính xác</li>
-                                <li>Nội dung nên được format đẹp</li>
-                                <li>Tóm tắt AI nên chính xác và đầy đủ</li>
-                                <li>Sử dụng Upload JSONL cho nhiều văn bản</li>
-                            </ul>
+                        <!-- Step Indicator -->
+                        <div class="step-indicator">
+                            <div class="step active" id="step-1">1</div>
+                            <div class="step" id="step-2">2</div>
+                            <div class="step" id="step-3">3</div>
                         </div>
-                        
-                        <div class="alert alert-warning">
-                            <small>
-                                <i class="fas fa-lightbulb me-1"></i>
-                                <strong>Gợi ý:</strong> Để upload hàng loạt văn bản, 
-                                sử dụng tính năng <a href="upload_jsonl.php">Upload JSONL</a>
-                            </small>
-                        </div>
-                    </div>
-                </div>
-                
-                <!-- Quick Stats -->
-                <div class="card mt-3">
-                    <div class="card-header bg-secondary text-white">
-                        <h6 class="mb-0">
-                            <i class="fas fa-chart-bar me-2"></i>Thống kê nhanh
-                        </h6>
-                    </div>
-                    <div class="card-body">
-                        <?php
-                        try {
-                            $total_docs = $pdo->query("SELECT COUNT(*) FROM documents")->fetchColumn();
-                            $single_docs = $pdo->query("SELECT COUNT(*) FROM documents WHERE type = 'single'")->fetchColumn();
-                            $summaries = $pdo->query("SELECT COUNT(*) FROM ai_summaries")->fetchColumn();
-                        } catch (Exception $e) {
-                            $total_docs = $single_docs = $summaries = 0;
-                        }
-                        ?>
-                        
-                        <div class="row text-center">
-                            <div class="col-4">
-                                <div class="h5 text-primary"><?php echo $total_docs; ?></div>
-                                <small class="text-muted">Tổng</small>
+
+                        <!-- Step 1: Choose Upload Type -->
+                        <div class="upload-step" id="upload-step-1">
+                            <h4 class="text-center mb-4">Bước 1: Chọn loại văn bản cần upload</h4>
+                            
+                            <div class="row">
+                                <div class="col-md-6">
+                                    <div class="upload-type-card" data-type="single" onclick="selectUploadType('single')">
+                                        <i class="fas fa-file-text fa-3x text-primary mb-3"></i>
+                                        <h5>Văn bản đơn</h5>
+                                        <p class="text-muted mb-0">Upload một văn bản và bản tóm tắt AI tương ứng</p>
+                                    </div>
+                                </div>
+                                <div class="col-md-6">
+                                    <div class="upload-type-card" data-type="multi" onclick="selectUploadType('multi')">
+                                        <i class="fas fa-copy fa-3x text-success mb-3"></i>
+                                        <h5>Đa văn bản</h5>
+                                        <p class="text-muted mb-0">Upload nhiều văn bản cùng với bản tóm tắt AI chung</p>
+                                    </div>
+                                </div>
                             </div>
-                            <div class="col-4">
-                                <div class="h5 text-success"><?php echo $single_docs; ?></div>
-                                <small class="text-muted">Đơn</small>
-                            </div>
-                            <div class="col-4">
-                                <div class="h5 text-info"><?php echo $summaries; ?></div>
-                                <small class="text-muted">Tóm tắt</small>
+
+                            <div class="text-center mt-4">
+                                <button class="btn btn-primary" id="next-to-step-2" style="display: none;" onclick="goToStep(2)">
+                                    Tiếp theo <i class="fas fa-arrow-right ms-2"></i>
+                                </button>
                             </div>
                         </div>
-                    </div>
-                </div>
-                
-                <!-- Preview -->
-                <div class="card mt-3" id="preview-card" style="display: none;">
-                    <div class="card-header bg-light">
-                        <h6 class="mb-0">
-                            <i class="fas fa-eye me-2"></i>Xem trước
-                        </h6>
-                    </div>
-                    <div class="card-body">
-                        <div class="mb-2">
-                            <strong>Tiêu đề:</strong>
-                            <div id="preview-title" class="preview-box small"></div>
-                        </div>
-                        <div class="mb-2">
-                            <strong>Nội dung:</strong>
-                            <div id="preview-content" class="preview-box small"></div>
-                        </div>
-                        <div class="mb-2">
-                            <strong>Tóm tắt:</strong>
-                            <div id="preview-summary" class="preview-box small"></div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
 
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
-    <script>
-        // Text statistics
-        function updateStats(textareaId, statsId) {
-            const textarea = document.querySelector(`[name="${textareaId}"]`);
-            const stats = document.getElementById(statsId);
-            
-            if (textarea && stats) {
-                const text = textarea.value;
-                const charCount = text.length;
-                const wordCount = text.trim() === '' ? 0 : text.trim().split(/\s+/).length;
-                
-                stats.textContent = `${charCount.toLocaleString()} ký tự, ${wordCount.toLocaleString()} từ`;
-            }
-        }
+                        <!-- Step 2: Upload Documents -->
+                        <div class="upload-step" id="upload-step-2" style="display: none;">
+                            <h4 class="text-center mb-4">Bước 2: Nhập văn bản</h4>
+                            
+                            <form id="manual-upload-form" method="POST" enctype="multipart/form-data">
+                                <input type="hidden" id="upload-type" name="upload_type" value="">
+                                <input type="hidden" name="action" value="upload_documents">
+                                
+                                <!-- Single Document Upload -->
+                                <div id="single-upload" style="display: none;">
+                                    <div class="row">
+                                        <div class="col-md-6">
+                                            <div class="card">
+                                                <div class="card-header bg-primary text-white">
+                                                    <h6 class="mb-0"><i class="fas fa-file-text me-2"></i>Văn bản</h6>
+                                                </div>
+                                                <div class="card-body">
+                                                    <div class="mb-3">
+                                                        <label class="form-label">Tiêu đề</label>
+                                                        <input type="text" class="form-control" name="single_title" placeholder="Nhập tiêu đề văn bản..." required>
+                                                    </div>
+                                                    <div class="mb-3">
+                                                        <label class="form-label">Nội dung</label>
+                                                        <textarea class="form-control" name="single_content" rows="8" placeholder="Nhập nội dung văn bản..." required></textarea>
+                                                    </div>
+                                                    <div class="mb-3">
+                                                        <label class="form-label">Hoặc upload file</label>
+                                                        <input type="file" class="form-control" name="single_file" accept=".txt,.docx">
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div class="col-md-6">
+                                            <div class="card">
+                                                <div class="card-header bg-success text-white">
+                                                    <h6 class="mb-0"><i class="fas fa-robot me-2"></i>Bản tóm tắt AI</h6>
+                                                </div>
+                                                <div class="card-body">
+                                                    <textarea class="form-control" name="single_summary" rows="12" placeholder="Nhập bản tóm tắt AI cho văn bản..." required></textarea>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
 
-        // Preview functionality
-        function updatePreview() {
-            const title = document.querySelector('[name="title"]').value;
-            const content = document.querySelector('[name="content"]').value;
-            const summary = document.querySelector('[name="summary"]').value;
-            
-            if (title || content || summary) {
-                document.getElementById('preview-card').style.display = 'block';
-                
-                document.getElementById('preview-title').textContent = title || '(Chưa có tiêu đề)';
-                document.getElementById('preview-content').textContent = content ? content.substring(0, 200) + '...' : '(Chưa có nội dung)';
-                document.getElementById('preview-summary').textContent = summary ? summary.substring(0, 150) + '...' : '(Chưa có tóm tắt)';
-            } else {
-                document.getElementById('preview-card').style.display = 'none';
-            }
-        }
-
-        // Event listeners
-        document.addEventListener('DOMContentLoaded', function() {
-            const contentTextarea = document.querySelector('[name="content"]');
-            const summaryTextarea = document.querySelector('[name="summary"]');
-            const titleInput = document.querySelector('[name="title"]');
-
-            // Update stats on input
-            contentTextarea.addEventListener('input', function() {
-                updateStats('content', 'content-stats');
-                updatePreview();
-            });
-            
-            summaryTextarea.addEventListener('input', function() {
-                updateStats('summary', 'summary-stats');
-                updatePreview();
-            });
-
-            titleInput.addEventListener('input', updatePreview);
-
-            // Initial stats update
-            updateStats('content', 'content-stats');
-            updateStats('summary', 'summary-stats');
-            updatePreview();
-        });
-
-        // Form validation
-        document.querySelector('form').addEventListener('submit', function(e) {
-            const title = document.querySelector('[name="title"]').value.trim();
-            const content = document.querySelector('[name="content"]').value.trim();
-            const summary = document.querySelector('[name="summary"]').value.trim();
-            
-            if (!title || !content || !summary) {
-                e.preventDefault();
-                alert('Vui lòng điền đầy đủ thông tin!');
-                return;
-            }
-            
-            if (content.length < 50) {
-                e.preventDefault();
-                alert('Nội dung văn bản quá ngắn (tối thiểu 50 ký tự)');
-                return;
-            }
-            
-            if (summary.length < 20) {
-                e.preventDefault();
-                alert('Tóm tắt quá ngắn (tối thiểu 20 ký tự)');
-                return;
-            }
-
-            // Show loading state
-            const submitBtn = e.target.querySelector('button[type="submit"]');
-            const originalText = submitBtn.innerHTML;
-            submitBtn.innerHTML = '<i class="fas fa-spinner fa-spin me-2"></i>Đang lưu...';
-            submitBtn.disabled = true;
-        });
-
-        // Reset form
-        document.querySelector('button[type="reset"]').addEventListener('click', function() {
-            setTimeout(function() {
-                updateStats('content', 'content-stats');
-                updateStats('summary', 'summary-stats');
-                updatePreview();
-            }, 10);
-        });
-    </script>
-</body>
-</html>
+                                <!-- Multi Document Upload -->
+                                <div id="multi-upload" style="display: none;">
+                                    <div class="row">
+                                        <div class="col-md-8">
+                                            <div class="card">
+                                                <div class="card-header bg-info text-white d-flex justify-content-between align-items-center">
+                                                    <h6 class="mb-0"><i class="fas fa-copy me-2"></i>Danh sách văn bản</h6>
+                                                    <button type="button" class="btn btn-light btn-sm" onclick="addDocument()">
+                                                        <i class="fas fa-plus me-1"></i>Thêm văn bản
+                                                    </button>
+                                                </div>
+                                                <div class="card-body">
+                                                    <div class="mb-3">
+                                                        <label class="form-label">Tiêu đề nhóm văn bản</label>
+                                                        <input type="text" class="form-control" name="group_title" placeholder="Nhập tiêu đề cho nhóm văn bản..." required>
+                                                    </div>
+                                                    <div class="mb-3">
+                                                        <label class="form-label">Mô tả nhóm</label>
+                                                        <textarea class="form-control" name="group_description" rows="2" placeholder="Mô tả ngắn về nhóm văn bản này..."></textarea>
+                                                    </div>
+                                                    
+                                                    <div id="documents-container">
+                                                        <!-- Document 1 -->
+                                                        <div class="document-item" data-doc-index="1">
+                                                            <div class="d-flex justify-content-between align-items-center mb-3">
+                                                                <h6 class="mb-0"><i class="fas fa-file-text me-2"></i>Văn bản #1</h6>
+                                                                <button type="button" class="btn btn-sm btn-outline-danger" onclick="removeDocument(1)" style="display: none;">
+                                                                    <i class="fas fa-trash"></i>
+                                                                </button>
+                                                            </div>
+                                                            
+                                                            <div class="row">
+                                                                <div class="col-md-6">
+                                                                    <div class="mb-3">
+                                                                        <label class="form-label">Tiêu đề</label>
+                                                                        <input type="text" class="form-control" name="doc_title[]" placeholder="Tiêu đề văn bản..." required>
+                                                                    </div>
+                                                                    <div class="mb-3">
+                                                                        <label class="form-label">Upload file</label>
+                                                                        <input type="file" class="form-control" name="doc_file[]" accept=".txt,.docx">
+                                                                    </div>
+                                                                </div>
+                                                                <div class="col-md-6">
+                                                                    <div class="mb-3">
+                                                                        <label class="form-label">Nội dung</label>
+                                                                        <textarea class="form-control" name="doc_content[]" rows="6" placeholder="Hoặc nhập nội dung trực tiếp..." required></textarea>
+                                                                    </div>
+                                                                </div>
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>

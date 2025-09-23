@@ -1,45 +1,32 @@
 <?php
 session_start();
 
-// Log hoạt động logout nếu user đã đăng nhập
+// Log logout activity if user is logged in
 if (isset($_SESSION['user_id'])) {
     try {
         require_once 'config/database.php';
+        require_once 'includes/auth.php';
+        
         $database = new Database();
         $db = $database->getConnection();
         
         if ($db) {
-            $query = "INSERT INTO activity_logs (user_id, action, description, ip_address, user_agent) 
-                      VALUES (?, 'user_logout', 'User đăng xuất khỏi hệ thống', ?, ?)";
-            $stmt = $db->prepare($query);
-            $stmt->execute([
-                $_SESSION['user_id'],
-                $_SERVER['REMOTE_ADDR'] ?? 'unknown',
-                $_SERVER['HTTP_USER_AGENT'] ?? 'unknown'
-            ]);
+            logActivity($db, $_SESSION['user_id'], 'logout', 'user', $_SESSION['user_id']);
         }
     } catch (Exception $e) {
-        // Không làm gì nếu log thất bại, vẫn tiếp tục logout
-        error_log("Logout logging failed: " . $e->getMessage());
+        // Ignore logging errors during logout
     }
 }
 
-// Xóa tất cả session variables
-$_SESSION = array();
-
-// Nếu có session cookie, xóa nó
-if (ini_get("session.use_cookies")) {
-    $params = session_get_cookie_params();
-    setcookie(session_name(), '', time() - 42000,
-        $params["path"], $params["domain"],
-        $params["secure"], $params["httponly"]
-    );
-}
-
-// Hủy session
+// Clear all session data
+session_unset();
 session_destroy();
 
-// Redirect về trang login với thông báo
-header('Location: login.php?message=logout_success');
+// Start new session for flash message
+session_start();
+$_SESSION['logout_message'] = 'Bạn đã đăng xuất thành công!';
+
+// Redirect to login page
+header('Location: login.php');
 exit();
 ?>

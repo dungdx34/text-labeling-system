@@ -1,45 +1,45 @@
 <?php
 class Database {
-    private $host = "localhost";
-    private $db_name = "text_labeling_system";
-    private $username = "root";
-    private $password = "";
-    private $charset = "utf8mb4";
+    private $host = 'localhost';
+    private $db_name = 'text_labeling_system';
+    private $username = 'root';
+    private $password = '';
     private $conn;
 
     public function getConnection() {
         $this->conn = null;
         
         try {
-            $dsn = "mysql:host=" . $this->host . ";dbname=" . $this->db_name . ";charset=" . $this->charset;
-            $options = [
-                PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
-                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-                PDO::ATTR_EMULATE_PREPARES   => false,
-                PDO::ATTR_TIMEOUT            => 5
-            ];
-            
-            $this->conn = new PDO($dsn, $this->username, $this->password, $options);
-            
+            $this->conn = new PDO("mysql:host=" . $this->host . ";dbname=" . $this->db_name, 
+                                $this->username, $this->password);
+            $this->conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+            $this->conn->exec("set names utf8mb4");
         } catch(PDOException $exception) {
-            error_log("Database connection error: " . $exception->getMessage());
-            return null;
+            echo "Connection error: " . $exception->getMessage();
         }
         
         return $this->conn;
     }
-
-    public function testConnection() {
+    
+    public function createDatabase() {
         try {
-            $conn = $this->getConnection();
-            if ($conn) {
-                $stmt = $conn->prepare("SELECT 1");
-                $stmt->execute();
-                return true;
-            }
-            return false;
-        } catch (Exception $e) {
-            error_log("Database test failed: " . $e->getMessage());
+            // Connect without database name first
+            $temp_conn = new PDO("mysql:host=" . $this->host, $this->username, $this->password);
+            $temp_conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+            
+            // Create database if not exists
+            $temp_conn->exec("CREATE DATABASE IF NOT EXISTS " . $this->db_name . " CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+            echo "Database created successfully<br>";
+            
+            // Now connect to the database
+            $this->conn = new PDO("mysql:host=" . $this->host . ";dbname=" . $this->db_name, 
+                                $this->username, $this->password);
+            $this->conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+            $this->conn->exec("set names utf8mb4");
+            
+            return $this->conn;
+        } catch(PDOException $exception) {
+            echo "Database creation error: " . $exception->getMessage();
             return false;
         }
     }

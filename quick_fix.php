@@ -1,190 +1,151 @@
 <?php
-// Quick Fix Script - Sửa lỗi nhanh cho Text Labeling System
-echo "<h1>🔧 Quick Fix Tool</h1>";
-echo "<style>body{font-family:Arial;padding:20px;} .ok{color:green;} .error{color:red;} .fix{background:#f0f8ff;padding:10px;margin:10px 0;border-left:4px solid #007bff;}</style>";
+require_once 'config/database.php';
 
-// 1. Tạo thư mục cần thiết
-$dirs = ['config', 'css', 'js', 'admin', 'labeler', 'reviewer', 'includes'];
-echo "<h3>📁 Tạo thư mục:</h3>";
-foreach ($dirs as $dir) {
-    if (!is_dir($dir)) {
-        if (mkdir($dir, 0755, true)) {
-            echo "<span class='ok'>✅ Tạo thư mục: $dir</span><br>";
-        } else {
-            echo "<span class='error'>❌ Không thể tạo: $dir</span><br>";
-        }
-    } else {
-        echo "<span class='ok'>✅ Thư mục đã tồn tại: $dir</span><br>";
-    }
-}
+$database = new Database();
+$db = $database->getConnection();
 
-// 2. Tạo file database.php nếu chưa có
-echo "<h3>🗄️ Tạo file cấu hình database:</h3>";
-if (!file_exists('config/database.php')) {
-    $db_content = '<?php
-class Database {
-    private $host = "localhost";
-    private $db_name = "text_labeling_system";
-    private $username = "root";
-    private $password = "";
-    private $conn;
-    
-    public function getConnection() {
-        $this->conn = null;
-        try {
-            $this->conn = new PDO("mysql:host=" . $this->host . ";dbname=" . $this->db_name . ";charset=utf8mb4", 
-                                $this->username, $this->password);
-            $this->conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-        } catch(PDOException $exception) {
-            echo "Connection error: " . $exception->getMessage();
-        }
-        return $this->conn;
-    }
-}
-?>';
-    
-    if (file_put_contents('config/database.php', $db_content)) {
-        echo "<span class='ok'>✅ Tạo config/database.php thành công</span><br>";
-    } else {
-        echo "<span class='error'>❌ Không thể tạo config/database.php</span><br>";
-    }
-} else {
-    echo "<span class='ok'>✅ config/database.php đã tồn tại</span><br>";
-}
+echo "<h2>Quick Database Fix</h2>";
+echo "<pre>";
 
-// 3. Tạo database và tables
-echo "<h3>🗄️ Tạo database và tables:</h3>";
 try {
-    $pdo = new PDO("mysql:host=localhost;charset=utf8mb4", "root", "");
-    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    echo "Fixing database for upload functionality...\n\n";
     
-    // Tạo database
-    $pdo->exec("CREATE DATABASE IF NOT EXISTS text_labeling_system CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
-    echo "<span class='ok'>✅ Database 'text_labeling_system' đã tạo</span><br>";
+    // 1. Fix documents table
+    echo "1. Fixing documents table...\n";
     
-    $pdo->exec("USE text_labeling_system");
+    // Get current structure
+    $stmt = $db->prepare("DESCRIBE documents");
+    $stmt->execute();
+    $columns = array_column($stmt->fetchAll(PDO::FETCH_ASSOC), 'Field');
+    echo "Current columns: " . implode(', ', $columns) . "\n";
     
-    // Tạo tables
-    $tables_sql = "
-    CREATE TABLE IF NOT EXISTS users (
-        id INT PRIMARY KEY AUTO_INCREMENT,
-        username VARCHAR(50) UNIQUE NOT NULL,
-        email VARCHAR(100) UNIQUE NOT NULL,
-        password VARCHAR(255) NOT NULL,
-        role ENUM('admin', 'labeler', 'reviewer') NOT NULL,
-        full_name VARCHAR(100) NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        is_active BOOLEAN DEFAULT TRUE
-    );
-
-    CREATE TABLE IF NOT EXISTS documents (
+    // Drop all foreign keys first
+    $stmt = $db->prepare("SELECT CONSTRAINT_NAME FROM information_schema.TABLE_CONSTRAINTS 
+                         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'documents' 
+                         AND CONSTRAINT_TYPE = 'FOREIGN KEY'");
+    $stmt->execute();
+    $fks = $stmt->fetchAll(PDO::FETCH_COLUMN);
+    
+    foreach ($fks as $fk) {
+        try {
+            $db->exec("ALTER TABLE documents DROP FOREIGN KEY $fk");
+            echo "Dropped FK: $fk\n";
+        } catch (Exception $e) {
+            // Ignore if already dropped
+        }
+    }
+    
+    // Rename uploaded_by to created_by if needed
+    if (in_array('uploaded_by', $columns) && !in_array('created_by', $columns)) {
+        $db->exec("ALTER TABLE documents CHANGE uploaded_by created_by INT NOT NULL DEFAULT 1");
+        echo "✓ Renamed uploaded_by to created_by\n";
+    } elseif (!in_array('created_by', $columns)) {
+        $db->exec("ALTER TABLE documents ADD COLUMN created_by INT NOT NULL DEFAULT 1");
+        echo "✓ Added created_by column\n";
+    }
+    
+    // Add other required columns
+    if (!in_array('ai_summary', $columns)) {
+        $db->exec("ALTER TABLE documents ADD COLUMN ai_summary TEXT NULL");
+        echo "✓ Added ai_summary column\n";
+    }
+    
+    if (!in_array('type', $columns)) {
+        $db->exec("ALTER TABLE documents ADD COLUMN type ENUM('single', 'multi') NOT NULL DEFAULT 'single'");
+        echo "✓ Added type column\n";
+    }
+    
+    if (!in_array('group_id', $columns)) {
+        $db->exec("ALTER TABLE documents ADD COLUMN group_id INT NULL");
+        echo "✓ Added group_id column\n";
+    }
+    
+    // 2. Create document_groups table
+    echo "\n2. Creating document_groups table...\n";
+    $sql = "CREATE TABLE IF NOT EXISTS document_groups (
         id INT PRIMARY KEY AUTO_INCREMENT,
         title VARCHAR(255) NOT NULL,
-        content TEXT NOT NULL,
-        ai_summary TEXT,
-        uploaded_by INT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        status ENUM('pending', 'in_progress', 'completed', 'reviewed') DEFAULT 'pending',
-        FOREIGN KEY (uploaded_by) REFERENCES users(id)
-    );
-
-    CREATE TABLE IF NOT EXISTS text_styles (
-        id INT PRIMARY KEY AUTO_INCREMENT,
-        name VARCHAR(100) NOT NULL,
-        description TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS labelings (
-        id INT PRIMARY KEY AUTO_INCREMENT,
-        document_id INT NOT NULL,
-        labeler_id INT NOT NULL,
-        reviewer_id INT,
-        important_sentences TEXT,
-        text_style_id INT,
-        edited_summary TEXT,
-        labeling_notes TEXT,
-        review_notes TEXT,
-        status ENUM('pending', 'completed', 'reviewed', 'rejected') DEFAULT 'pending',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        FOREIGN KEY (document_id) REFERENCES documents(id),
-        FOREIGN KEY (labeler_id) REFERENCES users(id),
-        FOREIGN KEY (reviewer_id) REFERENCES users(id),
-        FOREIGN KEY (text_style_id) REFERENCES text_styles(id)
-    );
-
-    INSERT IGNORE INTO text_styles (id, name, description) VALUES
-    (1, 'Tường thuật', 'Văn bản mô tả sự kiện, hiện tượng theo thời gian'),
-    (2, 'Nghị luận', 'Văn bản trình bày quan điểm, lập luận về một vấn đề'),
-    (3, 'Miêu tả', 'Văn bản tả lại hình ảnh, đặc điểm của sự vật, hiện tượng'),
-    (4, 'Biểu cảm', 'Văn bản thể hiện cảm xúc, tâm trạng của tác giả'),
-    (5, 'Thuyết minh', 'Văn bản giải thích, làm rõ về một sự vật, hiện tượng');
-
-    INSERT IGNORE INTO users (id, username, email, password, role, full_name) VALUES
-    (1, 'admin', 'admin@example.com', '$2y$10\$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'admin', 'Administrator'),
-    (2, 'labeler1', 'labeler1@example.com', '$2y$10\$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'labeler', 'Người gán nhãn 1'),
-    (3, 'reviewer1', 'reviewer1@example.com', '$2y$10\$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'reviewer', 'Người review 1');
-    ";
+        description TEXT,
+        ai_summary TEXT NOT NULL,
+        created_by INT NOT NULL DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )";
+    $db->exec($sql);
+    echo "✓ document_groups table ready\n";
     
-    $pdo->exec($tables_sql);
-    echo "<span class='ok'>✅ Tất cả tables đã được tạo thành công</span><br>";
-    echo "<span class='ok'>✅ Dữ liệu mẫu đã được thêm</span><br>";
+    // 3. Ensure admin user exists
+    echo "\n3. Checking admin user...\n";
+    $stmt = $db->prepare("SELECT id FROM users WHERE role = 'admin' LIMIT 1");
+    $stmt->execute();
+    $admin = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    if (!$admin) {
+        $password = password_hash('admin123', PASSWORD_DEFAULT);
+        $stmt = $db->prepare("INSERT INTO users (username, password, email, full_name, role) 
+                             VALUES ('admin', ?, 'admin@test.com', 'Admin User', 'admin')");
+        $stmt->execute([$password]);
+        $admin_id = $db->lastInsertId();
+        echo "✓ Created admin user (ID: $admin_id)\n";
+    } else {
+        $admin_id = $admin['id'];
+        echo "✓ Admin user exists (ID: $admin_id)\n";
+    }
+    
+    // 4. Update any invalid created_by values
+    $stmt = $db->prepare("UPDATE documents SET created_by = ? WHERE created_by IS NULL OR created_by = 0 OR created_by NOT IN (SELECT id FROM users)");
+    $stmt->execute([$admin_id]);
+    echo "✓ Updated created_by references\n";
+    
+    // 5. Test upload functionality
+    echo "\n4. Testing upload functionality...\n";
+    
+    // Test single document insert
+    $stmt = $db->prepare("INSERT INTO documents (title, content, ai_summary, type, created_by) 
+                         VALUES ('Test Single', 'Test content', 'Test summary', 'single', ?)");
+    $stmt->execute([$admin_id]);
+    $doc_id = $db->lastInsertId();
+    echo "✓ Single document insert works (ID: $doc_id)\n";
+    
+    // Test group insert
+    $stmt = $db->prepare("INSERT INTO document_groups (title, ai_summary, created_by) 
+                         VALUES ('Test Group', 'Test group summary', ?)");
+    $stmt->execute([$admin_id]);
+    $group_id = $db->lastInsertId();
+    echo "✓ Document group insert works (ID: $group_id)\n";
+    
+    // Test multi document insert
+    $stmt = $db->prepare("INSERT INTO documents (title, content, type, group_id, created_by) 
+                         VALUES ('Test Multi', 'Test multi content', 'multi', ?, ?)");
+    $stmt->execute([$group_id, $admin_id]);
+    $multi_doc_id = $db->lastInsertId();
+    echo "✓ Multi document insert works (ID: $multi_doc_id)\n";
+    
+    // Clean up test data
+    $db->prepare("DELETE FROM documents WHERE id IN (?, ?)")->execute([$doc_id, $multi_doc_id]);
+    $db->prepare("DELETE FROM document_groups WHERE id = ?")->execute([$group_id]);
+    echo "✓ Test data cleaned up\n";
+    
+    echo "\n" . str_repeat("=", 50) . "\n";
+    echo "✅ QUICK FIX COMPLETED SUCCESSFULLY!\n";
+    echo str_repeat("=", 50) . "\n\n";
+    
+    echo "Your database is now ready for:\n";
+    echo "✓ JSONL file uploads\n";
+    echo "✓ Single document processing\n"; 
+    echo "✓ Multi-document processing\n";
+    echo "✓ Document groups\n\n";
+    
+    echo "You can now try uploading your JSONL file!\n";
     
 } catch (Exception $e) {
-    echo "<span class='error'>❌ Lỗi database: " . $e->getMessage() . "</span><br>";
+    echo "\n❌ ERROR: " . $e->getMessage() . "\n";
+    echo "File: " . $e->getFile() . " (Line: " . $e->getLine() . ")\n";
 }
 
-// 4. Tạo file CSS cơ bản
-echo "<h3>🎨 Tạo file CSS:</h3>";
-if (!file_exists('css/style.css')) {
-    $css_content = ':root { --primary-color: #0d6efd; }
-body { font-family: "Segoe UI", sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
-.sidebar { background: linear-gradient(180deg, var(--primary-color) 0%, #0a58ca 100%); }
-.main-content { background: white; border-radius: 20px; padding: 40px; margin: 20px; }
-.stats-card { background: white; border-radius: 12px; padding: 25px; box-shadow: 0 4px 15px rgba(0,0,0,0.08); }
-.stats-number { font-size: 2.5rem; font-weight: bold; color: var(--primary-color); }';
-    
-    if (file_put_contents('css/style.css', $css_content)) {
-        echo "<span class='ok'>✅ Tạo css/style.css thành công</span><br>";
-    }
-} else {
-    echo "<span class='ok'>✅ css/style.css đã tồn tại</span><br>";
-}
+echo "</pre>";
 
-// 5. Tạo file JS cơ bản  
-echo "<h3>💻 Tạo file JavaScript:</h3>";
-if (!file_exists('js/script.js')) {
-    $js_content = '// Text Labeling System JavaScript
-console.log("Text Labeling System loaded");
-function showToast(message, type = "info") {
-    console.log(type + ": " + message);
-}';
-    
-    if (file_put_contents('js/script.js', $js_content)) {
-        echo "<span class='ok'>✅ Tạo js/script.js thành công</span><br>";
-    }
-} else {
-    echo "<span class='ok'>✅ js/script.js đã tồn tại</span><br>";
-}
-
-echo "<div class='fix'>";
-echo "<h3>🎉 HOÀN TẤT!</h3>";
-echo "<p><strong>Hệ thống đã được sửa chữa. Bây giờ bạn có thể:</strong></p>";
-echo "<ol>";
-echo "<li>Truy cập <a href='login.php'><strong>login.php</strong></a> để đăng nhập</li>";
-echo "<li>Sử dụng tài khoản: <strong>admin / admin123</strong></li>";
-echo "<li>Truy cập <a href='admin/dashboard.php'><strong>admin/dashboard.php</strong></a></li>";
-echo "</ol>";
-echo "<p><strong>Các tài khoản demo:</strong></p>";
-echo "<ul>";
-echo "<li>Admin: admin / admin123</li>";
-echo "<li>Labeler: labeler1 / admin123</li>";
-echo "<li>Reviewer: reviewer1 / admin123</li>";
-echo "</ul>";
-echo "</div>";
-
-echo "<div style='text-align:center;margin-top:30px;'>";
-echo "<a href='login.php' style='background:#007bff;color:white;padding:15px 30px;text-decoration:none;border-radius:8px;font-weight:bold;'>🚀 ĐĂNG NHẬP NGAY</a>";
-echo "</div>";
+echo '<div style="margin: 20px;">';
+echo '<a href="admin/simple_upload_test.php" style="background: #28a745; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; margin-right: 10px;">Test Upload</a>';
+echo '<a href="admin/upload.php" style="background: #007bff; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">Go to Upload</a>';
+echo '</div>';
 ?>
