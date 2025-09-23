@@ -1,388 +1,103 @@
 <?php
-/**
- * FIXED Authentication System for Text Labeling System
- * Fixed the "Invalid parameter number" error in SQL queries
- */
+// Authentication and session management
 
-// Start session if not already started
-if (session_status() === PHP_SESSION_NONE) {
-    ini_set('session.cookie_httponly', 1);
-    ini_set('session.use_only_cookies', 1);
-    ini_set('session.cookie_secure', isset($_SERVER['HTTPS']));
-    session_start();
+function checkAuth($required_role = null) {
+    if (!isset($_SESSION['user_id']) || !isset($_SESSION['role'])) {
+        return false;
+    }
     
-    // Regenerate session ID periodically for security
-    if (!isset($_SESSION['last_regeneration'])) {
-        $_SESSION['last_regeneration'] = time();
-    } elseif (time() - $_SESSION['last_regeneration'] > 300) { // 5 minutes
-        session_regenerate_id(true);
-        $_SESSION['last_regeneration'] = time();
+    if ($required_role && $_SESSION['role'] !== $required_role) {
+        return false;
+    }
+    
+    return true;
+}
+
+function requireAuth($required_role = null) {
+    if (!checkAuth($required_role)) {
+        header('Location: ../login.php');
+        exit();
     }
 }
 
-require_once __DIR__ . '/../config/database.php';
+function requireAdmin() {
+    requireAuth('admin');
+}
 
-class Auth {
-    private $db;
-    private $max_login_attempts = 5;
-    private $lockout_time = 900; // 15 minutes
-    private $session_timeout = 3600; // 1 hour
-    
-    public function __construct() {
-        global $database;
-        $this->db = $database->getConnection();
-        $this->checkSessionTimeout();
+function requireLabeler() {
+    requireAuth('labeler');
+}
+
+function requireReviewer() {
+    requireAuth('reviewer');
+}
+
+function getUserInfo() {
+    if (!checkAuth()) {
+        return null;
     }
     
-    /**
-     * Check if session has timed out
-     */
-    private function checkSessionTimeout() {
-        if (isset($_SESSION['login_time']) && 
-            (time() - $_SESSION['login_time']) > $this->session_timeout) {
-            $this->logout();
-            header('Location: login.php?error=session_timeout');
-            exit();
-        }
-    }
-    
-    /**
-     * Login user with enhanced security - FIXED VERSION
-     */
-    public function login($username, $password, $remember_me = false) {
-        try {
-            $username = trim($username);
-            
-            // Check if user is locked out - FIXED QUERY
-            if ($this->isLockedOut($username)) {
-                $this->logSecurityEvent('login_attempt_blocked', $username);
-                return [
-                    'success' => false, 
-                    'message' => 'Tài khoản đã bị khóa tạm thời. Vui lòng thử lại sau 15 phút.',
-                    'locked' => true
-                ];
-            }
-            
-            // Get user from database - FIXED QUERY
-            $query = "SELECT id, username, email, password, full_name, role, status, login_attempts 
-                     FROM users 
-                     WHERE (username = ? OR email = ?) AND status = 'active'";
-            $stmt = $this->db->prepare($query);
-            $stmt->execute([$username, $username]); // FIXED: Pass username twice for both placeholders
-            
-            $user = $stmt->fetch(PDO::FETCH_ASSOC);
-            
-            if (!$user) {
-                $this->incrementLoginAttempts($username);
-                return [
-                    'success' => false, 
-                    'message' => 'Tên đăng nhập hoặc mật khẩu không đúng.'
-                ];
-            }
-            
-            // Verify password
-            if (!password_verify($password, $user['password'])) {
-                $this->incrementLoginAttempts($username, $user['id']);
-                return [
-                    'success' => false, 
-                    'message' => 'Tên đăng nhập hoặc mật khẩu không đúng.'
-                ];
-            }
-            
-            // Reset login attempts on successful login
-            $this->resetLoginAttempts($user['id']);
-            $this->updateLastLogin($user['id']);
-            
-            // Set session variables
-            $_SESSION['user_id'] = $user['id'];
-            $_SESSION['username'] = $user['username'];
-            $_SESSION['full_name'] = $user['full_name'];
-            $_SESSION['email'] = $user['email'];
-            $_SESSION['role'] = $user['role'];
-            $_SESSION['login_time'] = time();
-            $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
-            $_SESSION['ip_address'] = $this->getClientIP();
-            
-            return [
-                'success' => true, 
-                'message' => 'Đăng nhập thành công!',
-                'role' => $user['role'],
-                'user' => [
-                    'id' => $user['id'],
-                    'username' => $user['username'],
-                    'full_name' => $user['full_name'],
-                    'role' => $user['role']
-                ]
-            ];
-            
-        } catch (Exception $e) {
-            error_log("Login error: " . $e->getMessage());
-            return [
-                'success' => false, 
-                'message' => 'Database error: ' . $e->getMessage() // Show actual error in debug
-            ];
-        }
-    }
-    
-    /**
-     * Check if user is locked out - FIXED VERSION
-     */
-    private function isLockedOut($username) {
-        try {
-            $query = "SELECT login_attempts, locked_until 
-                     FROM users 
-                     WHERE username = ? OR email = ?";
-            $stmt = $this->db->prepare($query);
-            $stmt->execute([$username, $username]); // FIXED: Pass username twice
-            
-            $user = $stmt->fetch(PDO::FETCH_ASSOC);
-            if (!$user) return false;
-            
-            // Check if currently locked
-            if ($user['locked_until'] && strtotime($user['locked_until']) > time()) {
-                return true;
-            }
-            
-            // Reset lock if time has passed
-            if ($user['locked_until'] && strtotime($user['locked_until']) <= time()) {
-                $this->resetLoginAttempts(null, $username);
-            }
-            
-            return false;
-            
-        } catch (Exception $e) {
-            error_log("Lock check error: " . $e->getMessage());
-            return false;
-        }
-    }
-    
-    /**
-     * Increment login attempts - FIXED VERSION
-     */
-    private function incrementLoginAttempts($username, $user_id = null) {
-        try {
-            $query = "UPDATE users 
-                     SET login_attempts = login_attempts + 1,
-                         locked_until = CASE 
-                             WHEN login_attempts + 1 >= ? 
-                             THEN DATE_ADD(NOW(), INTERVAL ? SECOND)
-                             ELSE locked_until 
-                         END
-                     WHERE username = ? OR email = ?";
-            $stmt = $this->db->prepare($query);
-            $stmt->execute([$this->max_login_attempts, $this->lockout_time, $username, $username]);
-        } catch (Exception $e) {
-            error_log("Login attempts increment error: " . $e->getMessage());
-        }
-    }
-    
-    /**
-     * Reset login attempts - FIXED VERSION
-     */
-    private function resetLoginAttempts($user_id = null, $username = null) {
-        try {
-            if ($user_id) {
-                $query = "UPDATE users SET login_attempts = 0, locked_until = NULL WHERE id = ?";
-                $stmt = $this->db->prepare($query);
-                $stmt->execute([$user_id]);
-            } else {
-                $query = "UPDATE users SET login_attempts = 0, locked_until = NULL WHERE username = ? OR email = ?";
-                $stmt = $this->db->prepare($query);
-                $stmt->execute([$username, $username]);
-            }
-        } catch (Exception $e) {
-            error_log("Reset login attempts error: " . $e->getMessage());
-        }
-    }
-    
-    /**
-     * Update last login time
-     */
-    private function updateLastLogin($user_id) {
-        try {
-            $query = "UPDATE users SET last_login = NOW() WHERE id = ?";
-            $stmt = $this->db->prepare($query);
-            $stmt->execute([$user_id]);
-        } catch (Exception $e) {
-            error_log("Update last login error: " . $e->getMessage());
-        }
-    }
-    
-    /**
-     * Get client IP address
-     */
-    private function getClientIP() {
-        if (!empty($_SERVER['HTTP_CLIENT_IP'])) {
-            return $_SERVER['HTTP_CLIENT_IP'];
-        } elseif (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
-            return $_SERVER['HTTP_X_FORWARDED_FOR'];
-        } else {
-            return $_SERVER['REMOTE_ADDR'] ?? 'unknown';
-        }
-    }
-    
-    /**
-     * Log security events
-     */
-    private function logSecurityEvent($action, $username = '', $user_id = null) {
-        try {
-            $ip = $this->getClientIP();
-            $user_agent = $_SERVER['HTTP_USER_AGENT'] ?? '';
-            error_log("Security Event: $action - User: $username - IP: $ip");
-        } catch (Exception $e) {
-            error_log("Security logging error: " . $e->getMessage());
-        }
-    }
-    
-    /**
-     * Check if user is logged in
-     */
-    public function isLoggedIn() {
-        return isset($_SESSION['user_id']) && isset($_SESSION['role']);
-    }
-    
-    /**
-     * Check if user has specific role
-     */
-    public function hasRole($role) {
-        return $this->isLoggedIn() && $_SESSION['role'] === $role;
-    }
-    
-    /**
-     * Check if user has any of the specified roles
-     */
-    public function hasAnyRole($roles) {
-        if (!$this->isLoggedIn()) return false;
-        return in_array($_SESSION['role'], (array)$roles);
-    }
-    
-    /**
-     * Get current user info
-     */
-    public function getCurrentUser() {
-        if (!$this->isLoggedIn()) return null;
+    return [
+        'id' => $_SESSION['user_id'],
+        'username' => $_SESSION['username'],
+        'email' => $_SESSION['email'],
+        'full_name' => $_SESSION['full_name'],
+        'role' => $_SESSION['role']
+    ];
+}
+
+function logActivity($db, $user_id, $action, $entity_type = null, $entity_id = null, $details = null) {
+    try {
+        $query = "INSERT INTO activity_logs (user_id, action, entity_type, entity_id, details, ip_address, user_agent) 
+                 VALUES (:user_id, :action, :entity_type, :entity_id, :details, :ip_address, :user_agent)";
+        $stmt = $db->prepare($query);
         
-        try {
-            $query = "SELECT id, username, email, full_name, role, status, created_at, last_login 
-                     FROM users WHERE id = ?";
-            $stmt = $this->db->prepare($query);
-            $stmt->execute([$_SESSION['user_id']]);
-            
-            return $stmt->fetch(PDO::FETCH_ASSOC);
-        } catch (Exception $e) {
-            error_log("Get current user error: " . $e->getMessage());
-            return null;
-        }
-    }
-    
-    /**
-     * Logout user
-     */
-    public function logout() {
-        // Clear session variables
-        $_SESSION = array();
+        $stmt->bindParam(':user_id', $user_id);
+        $stmt->bindParam(':action', $action);
+        $stmt->bindParam(':entity_type', $entity_type);
+        $stmt->bindParam(':entity_id', $entity_id);
+        $stmt->bindParam(':details', json_encode($details));
+        $stmt->bindParam(':ip_address', $_SERVER['REMOTE_ADDR']);
+        $stmt->bindParam(':user_agent', $_SERVER['HTTP_USER_AGENT']);
         
-        // Destroy the session cookie
-        if (ini_get("session.use_cookies")) {
-            $params = session_get_cookie_params();
-            setcookie(session_name(), '', time() - 42000,
-                $params["path"], $params["domain"],
-                $params["secure"], $params["httponly"]
-            );
-        }
-        
-        // Clear remember me cookie if exists
-        if (isset($_COOKIE['remember_token'])) {
-            setcookie('remember_token', '', time() - 3600, '/');
-        }
-        
-        // Destroy the session
-        session_destroy();
-    }
-    
-    /**
-     * Require login with optional role check
-     */
-    public function requireLogin($allowed_roles = null) {
-        if (!$this->isLoggedIn()) {
-            $current_url = $_SERVER['REQUEST_URI'] ?? '/';
-            header('Location: login.php?redirect=' . urlencode($current_url));
-            exit();
-        }
-        
-        if ($allowed_roles !== null) {
-            if (!$this->hasAnyRole($allowed_roles)) {
-                header('Location: unauthorized.php');
-                exit();
-            }
-        }
-        
-        // Update session activity
-        $_SESSION['last_activity'] = time();
-    }
-    
-    /**
-     * Get redirect URL after login based on role
-     */
-    public function getRedirectUrl($role) {
-        $redirect_urls = [
-            'admin' => 'admin/dashboard.php',
-            'labeler' => 'labeler/dashboard.php',
-            'reviewer' => 'reviewer/dashboard.php'
-        ];
-        
-        return $redirect_urls[$role] ?? 'index.php';
-    }
-    
-    /**
-     * Generate CSRF token
-     */
-    public function generateCSRFToken() {
-        if (!isset($_SESSION['csrf_token'])) {
-            $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
-        }
-        return $_SESSION['csrf_token'];
-    }
-    
-    /**
-     * Verify CSRF token
-     */
-    public function verifyCSRFToken($token) {
-        return isset($_SESSION['csrf_token']) && hash_equals($_SESSION['csrf_token'], $token);
+        $stmt->execute();
+    } catch (Exception $e) {
+        error_log("Failed to log activity: " . $e->getMessage());
     }
 }
 
-// Initialize global auth instance
-$auth = new Auth();
-
-// Helper functions for backward compatibility
-function isLoggedIn() {
-    global $auth;
-    return $auth->isLoggedIn();
+function redirectByRole($role) {
+    switch ($role) {
+        case 'admin':
+            header('Location: admin/dashboard.php');
+            break;
+        case 'labeler':
+            header('Location: labeler/dashboard.php');
+            break;
+        case 'reviewer':
+            header('Location: reviewer/dashboard.php');
+            break;
+        default:
+            header('Location: login.php');
+    }
+    exit();
 }
 
-function hasRole($role) {
-    global $auth;
-    return $auth->hasRole($role);
-}
-
-function requireLogin($allowed_roles = null) {
-    global $auth;
-    return $auth->requireLogin($allowed_roles);
-}
-
-function getCurrentUser() {
-    global $auth;
-    return $auth->getCurrentUser();
+function sanitizeInput($data) {
+    $data = trim($data);
+    $data = stripslashes($data);
+    $data = htmlspecialchars($data);
+    return $data;
 }
 
 function generateCSRFToken() {
-    global $auth;
-    return $auth->generateCSRFToken();
+    if (!isset($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION['csrf_token'];
 }
 
-function verifyCSRFToken($token) {
-    global $auth;
-    return $auth->verifyCSRFToken($token);
+function validateCSRFToken($token) {
+    return isset($_SESSION['csrf_token']) && hash_equals($_SESSION['csrf_token'], $token);
 }
 ?>
