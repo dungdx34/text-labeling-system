@@ -1,12 +1,20 @@
 <?php
-// Start session and error handling
+// Set proper UTF-8 headers and encoding FIRST - before any output
+header('Content-Type: text/html; charset=UTF-8');
+ini_set('default_charset', 'UTF-8');
+mb_internal_encoding('UTF-8');
+mb_http_output('UTF-8');
+
+// Enable error reporting for debugging
 error_reporting(E_ALL);
 ini_set('display_errors', 1);
 
+// Start session first
 if (session_status() == PHP_SESSION_NONE) {
     session_start();
 }
 
+// Database connection with UTF-8 encoding
 require_once '../config/database.php';
 
 // Simple auth check - no external functions needed
@@ -17,7 +25,17 @@ if (!isset($_SESSION['user_id']) || $_SESSION['role'] !== 'labeler') {
 
 $database = new Database();
 $db = $database->getConnection();
+
+// Ensure UTF-8 connection
+$db->exec("SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci");
+$db->exec("SET CHARACTER SET utf8mb4");
+
 $current_user_id = $_SESSION['user_id'];
+$error_message = '';
+$success_message = '';
+$assignment = null;
+$documents = [];
+$view_only = isset($_GET['view']) && $_GET['view'] == '1';
 
 // Get current user info
 try {
@@ -33,11 +51,32 @@ try {
     die("Database error: " . $e->getMessage());
 }
 
-$error_message = '';
-$success_message = '';
-$assignment = null;
-$documents = [];
-$view_only = isset($_GET['view']) && $_GET['view'] == '1';
+// Create necessary tables if they don't exist
+try {
+    $check_table = $db->query("SHOW TABLES LIKE 'labeling_results'");
+    if ($check_table->rowCount() == 0) {
+        $create_results_table = "CREATE TABLE IF NOT EXISTS labeling_results (
+            id int(11) NOT NULL AUTO_INCREMENT,
+            assignment_id int(11) NOT NULL,
+            document_id int(11) NOT NULL,
+            selected_sentences longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci,
+            writing_style varchar(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+            edited_summary longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci,
+            step1_completed tinyint(1) DEFAULT 0,
+            step2_completed tinyint(1) DEFAULT 0,
+            step3_completed tinyint(1) DEFAULT 0,
+            auto_saved_at timestamp NULL DEFAULT NULL,
+            completed_at timestamp NULL DEFAULT NULL,
+            created_at timestamp DEFAULT CURRENT_TIMESTAMP,
+            updated_at timestamp DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            UNIQUE KEY unique_assignment_document (assignment_id, document_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci";
+        $db->exec($create_results_table);
+    }
+} catch (Exception $e) {
+    // Continue if table creation fails
+}
 
 // Get assignment ID
 $assignment_id = $_GET['id'] ?? null;
@@ -63,29 +102,8 @@ if (!$assignment_id) {
 // Get assignment info
 if ($assignment_id) {
     try {
-        $query = "SELECT a.*, 
-                         CASE 
-                             WHEN a.document_id IS NOT NULL AND a.document_id > 0 THEN d.title 
-                             WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN dg.group_name 
-                             ELSE 'Untitled'
-                         END as title,
-                         CASE 
-                             WHEN a.document_id IS NOT NULL AND a.document_id > 0 THEN d.ai_summary 
-                             WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN dg.description 
-                             ELSE ''
-                         END as ai_summary,
-                         CASE 
-                             WHEN a.document_id IS NOT NULL AND a.document_id > 0 THEN 'single' 
-                             WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN 'multi' 
-                             ELSE 'single'
-                         END as assignment_type,
-                         admin.full_name as assigned_by_name
-                  FROM assignments a 
-                  LEFT JOIN documents d ON a.document_id = d.id
-                  LEFT JOIN document_groups dg ON a.group_id = dg.id
-                  LEFT JOIN users admin ON a.assigned_by = admin.id
-                  WHERE a.id = ? AND a.user_id = ?";
-                  
+        // Simple query first to test
+        $query = "SELECT a.* FROM assignments a WHERE a.id = ? AND a.user_id = ?";
         $stmt = $db->prepare($query);
         $stmt->execute([$assignment_id, $current_user_id]);
         $assignment = $stmt->fetch(PDO::FETCH_ASSOC);
@@ -93,29 +111,56 @@ if ($assignment_id) {
         if (!$assignment) {
             $error_message = 'Không tìm thấy công việc hoặc bạn không có quyền truy cập.';
         } else {
-            // Get related documents
-            $assignment['type'] = $assignment['assignment_type']; // For backward compatibility
-            
-            if ($assignment['assignment_type'] == 'single' && $assignment['document_id']) {
+            // Determine assignment type based on available fields
+            if (isset($assignment['document_id']) && $assignment['document_id'] > 0) {
+                $assignment['type'] = 'single';
+                $assignment['assignment_type'] = 'single';
+                
+                // Get single document
                 $query = "SELECT * FROM documents WHERE id = ?";
                 $stmt = $db->prepare($query);
                 $stmt->execute([$assignment['document_id']]);
                 $doc = $stmt->fetch(PDO::FETCH_ASSOC);
                 if ($doc) {
                     $documents = [$doc];
+                    $assignment['title'] = $doc['title'];
                 }
-            } elseif ($assignment['assignment_type'] == 'multi' && $assignment['group_id']) {
-                // Get documents in group via document_group_items table
-                $query = "SELECT d.* FROM documents d 
-                          JOIN document_group_items dgi ON d.id = dgi.document_id 
-                          WHERE dgi.group_id = ? 
-                          ORDER BY dgi.sort_order";
-                $stmt = $db->prepare($query);
-                $stmt->execute([$assignment['group_id']]);
-                $documents = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            } elseif (isset($assignment['group_id']) && $assignment['group_id'] > 0) {
+                $assignment['type'] = 'multi';
+                $assignment['assignment_type'] = 'multi';
+                
+                // Get group info if table exists
+                try {
+                    $query = "SELECT * FROM document_groups WHERE id = ?";
+                    $stmt = $db->prepare($query);
+                    $stmt->execute([$assignment['group_id']]);
+                    $group = $stmt->fetch(PDO::FETCH_ASSOC);
+                    if ($group) {
+                        $assignment['title'] = $group['group_name'];
+                    }
+                } catch (Exception $e) {
+                    $assignment['title'] = 'Multi-Document Group';
+                }
+                
+                // Get documents in group
+                try {
+                    $query = "SELECT d.* FROM documents d 
+                              JOIN document_group_items dgi ON d.id = dgi.document_id 
+                              WHERE dgi.group_id = ? 
+                              ORDER BY dgi.sort_order";
+                    $stmt = $db->prepare($query);
+                    $stmt->execute([$assignment['group_id']]);
+                    $documents = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                } catch (Exception $e) {
+                    $documents = [];
+                }
             }
             
-            // Get existing labeling results if table exists
+            // Default values if not set
+            $assignment['title'] = $assignment['title'] ?? 'Chưa có tiêu đề';
+            $assignment['type'] = $assignment['type'] ?? 'single';
+            
+            // Get existing labeling results
             $results_map = [];
             try {
                 $query = "SELECT * FROM labeling_results WHERE assignment_id = ?";
@@ -123,35 +168,11 @@ if ($assignment_id) {
                 $stmt->execute([$assignment_id]);
                 $existing_results = $stmt->fetchAll(PDO::FETCH_ASSOC);
                 
-                // Create results map by document_id
                 foreach ($existing_results as $result) {
                     $results_map[$result['document_id']] = $result;
                 }
             } catch (Exception $e) {
-                // Table doesn't exist, create it
-                try {
-                    $create_table = "CREATE TABLE IF NOT EXISTS labeling_results (
-                        id int(11) NOT NULL AUTO_INCREMENT,
-                        assignment_id int(11) NOT NULL,
-                        document_id int(11) NOT NULL,
-                        selected_sentences longtext,
-                        writing_style varchar(50) DEFAULT NULL,
-                        edited_summary longtext,
-                        step1_completed tinyint(1) DEFAULT 0,
-                        step2_completed tinyint(1) DEFAULT 0,
-                        step3_completed tinyint(1) DEFAULT 0,
-                        auto_saved_at timestamp NULL DEFAULT NULL,
-                        completed_at timestamp NULL DEFAULT NULL,
-                        created_at timestamp DEFAULT CURRENT_TIMESTAMP,
-                        PRIMARY KEY (id),
-                        UNIQUE KEY unique_assignment_document (assignment_id, document_id)
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
-                    $db->exec($create_table);
-                    $results_map = [];
-                } catch (Exception $e2) {
-                    // If we can't create table, use empty results
-                    $results_map = [];
-                }
+                $results_map = [];
             }
         }
     } catch (Exception $e) {
@@ -173,89 +194,89 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && !$view_only) {
             $step2_completed = isset($_POST['step2_completed']) ? 1 : 0;
             $step3_completed = isset($_POST['step3_completed']) ? 1 : 0;
             
+            // Check if result exists
+            $query = "SELECT id FROM labeling_results WHERE assignment_id = ? AND document_id = ?";
+            $stmt = $db->prepare($query);
+            $stmt->execute([$assignment_id, $document_id]);
+            $existing = $stmt->fetch();
+            
+            // Check if updated_at column exists in labeling_results table
+            $has_updated_at = false;
             try {
-                // Check if result exists
-                $query = "SELECT id FROM labeling_results WHERE assignment_id = ? AND document_id = ?";
-                $stmt = $db->prepare($query);
-                $stmt->execute([$assignment_id, $document_id]);
-                $existing = $stmt->fetch();
-                
-                if ($existing) {
-                    // Update
+                $columns_check = $db->query("SHOW COLUMNS FROM labeling_results LIKE 'updated_at'");
+                $has_updated_at = $columns_check->rowCount() > 0;
+            } catch (Exception $e) {
+                $has_updated_at = false;
+            }
+            
+            if ($existing) {
+                // Update
+                if ($has_updated_at) {
+                    $query = "UPDATE labeling_results SET 
+                              selected_sentences = ?, writing_style = ?, edited_summary = ?,
+                              step1_completed = ?, step2_completed = ?, step3_completed = ?,
+                              auto_saved_at = CURRENT_TIMESTAMP,
+                              completed_at = CASE WHEN ? = 1 AND ? = 1 AND ? = 1 THEN CURRENT_TIMESTAMP ELSE completed_at END,
+                              updated_at = CURRENT_TIMESTAMP
+                              WHERE assignment_id = ? AND document_id = ?";
+                } else {
                     $query = "UPDATE labeling_results SET 
                               selected_sentences = ?, writing_style = ?, edited_summary = ?,
                               step1_completed = ?, step2_completed = ?, step3_completed = ?,
                               auto_saved_at = CURRENT_TIMESTAMP,
                               completed_at = CASE WHEN ? = 1 AND ? = 1 AND ? = 1 THEN CURRENT_TIMESTAMP ELSE completed_at END
                               WHERE assignment_id = ? AND document_id = ?";
-                    $stmt = $db->prepare($query);
-                    $stmt->execute([
-                        $selected_sentences, $writing_style, $edited_summary,
-                        $step1_completed, $step2_completed, $step3_completed,
-                        $step1_completed, $step2_completed, $step3_completed,
-                        $assignment_id, $document_id
-                    ]);
-                } else {
-                    // Insert
-                    $query = "INSERT INTO labeling_results 
-                              (assignment_id, document_id, selected_sentences, writing_style, edited_summary,
-                               step1_completed, step2_completed, step3_completed, auto_saved_at,
-                               completed_at)
-                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 
-                                      CASE WHEN ? = 1 AND ? = 1 AND ? = 1 THEN CURRENT_TIMESTAMP ELSE NULL END)";
-                    $stmt = $db->prepare($query);
-                    $stmt->execute([
-                        $assignment_id, $document_id, $selected_sentences, $writing_style, $edited_summary,
-                        $step1_completed, $step2_completed, $step3_completed,
-                        $step1_completed, $step2_completed, $step3_completed
-                    ]);
                 }
-            } catch (Exception $e) {
-                // If table doesn't exist, create it and try again
-                if (strpos($e->getMessage(), "doesn't exist") !== false) {
-                    $create_table = "CREATE TABLE IF NOT EXISTS labeling_results (
-                        id int(11) NOT NULL AUTO_INCREMENT,
-                        assignment_id int(11) NOT NULL,
-                        document_id int(11) NOT NULL,
-                        selected_sentences longtext,
-                        writing_style varchar(50) DEFAULT NULL,
-                        edited_summary longtext,
-                        step1_completed tinyint(1) DEFAULT 0,
-                        step2_completed tinyint(1) DEFAULT 0,
-                        step3_completed tinyint(1) DEFAULT 0,
-                        auto_saved_at timestamp NULL DEFAULT NULL,
-                        completed_at timestamp NULL DEFAULT NULL,
-                        created_at timestamp DEFAULT CURRENT_TIMESTAMP,
-                        PRIMARY KEY (id),
-                        UNIQUE KEY unique_assignment_document (assignment_id, document_id)
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
-                    $db->exec($create_table);
-                    
-                    // Try insert again
-                    $query = "INSERT INTO labeling_results 
-                              (assignment_id, document_id, selected_sentences, writing_style, edited_summary,
-                               step1_completed, step2_completed, step3_completed, auto_saved_at,
-                               completed_at)
-                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 
-                                      CASE WHEN ? = 1 AND ? = 1 AND ? = 1 THEN CURRENT_TIMESTAMP ELSE NULL END)";
-                    $stmt = $db->prepare($query);
-                    $stmt->execute([
-                        $assignment_id, $document_id, $selected_sentences, $writing_style, $edited_summary,
-                        $step1_completed, $step2_completed, $step3_completed,
-                        $step1_completed, $step2_completed, $step3_completed
-                    ]);
-                } else {
-                    throw $e;
-                }
+                $stmt = $db->prepare($query);
+                $stmt->execute([
+                    $selected_sentences, $writing_style, $edited_summary,
+                    $step1_completed, $step2_completed, $step3_completed,
+                    $step1_completed, $step2_completed, $step3_completed,
+                    $assignment_id, $document_id
+                ]);
+            } else {
+                // Insert
+                $query = "INSERT INTO labeling_results 
+                          (assignment_id, document_id, selected_sentences, writing_style, edited_summary,
+                           step1_completed, step2_completed, step3_completed, auto_saved_at,
+                           completed_at)
+                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 
+                                  CASE WHEN ? = 1 AND ? = 1 AND ? = 1 THEN CURRENT_TIMESTAMP ELSE NULL END)";
+                $stmt = $db->prepare($query);
+                $stmt->execute([
+                    $assignment_id, $document_id, $selected_sentences, $writing_style, $edited_summary,
+                    $step1_completed, $step2_completed, $step3_completed,
+                    $step1_completed, $step2_completed, $step3_completed
+                ]);
             }
             
-            // Update assignment status if all steps completed
-            if ($step1_completed && $step2_completed && $step3_completed) {
-                $query = "UPDATE assignments SET status = 'completed' WHERE id = ?";
+            // Update assignment status - check if updated_at column exists
+            try {
+                $columns_check = $db->query("SHOW COLUMNS FROM assignments LIKE 'updated_at'");
+                $has_updated_at = $columns_check->rowCount() > 0;
+                
+                if ($step1_completed && $step2_completed && $step3_completed) {
+                    if ($has_updated_at) {
+                        $query = "UPDATE assignments SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE id = ?";
+                    } else {
+                        $query = "UPDATE assignments SET status = 'completed' WHERE id = ?";
+                    }
+                } else {
+                    if ($has_updated_at) {
+                        $query = "UPDATE assignments SET status = 'in_progress', updated_at = CURRENT_TIMESTAMP WHERE id = ?";
+                    } else {
+                        $query = "UPDATE assignments SET status = 'in_progress' WHERE id = ?";
+                    }
+                }
                 $stmt = $db->prepare($query);
                 $stmt->execute([$assignment_id]);
-            } else {
-                $query = "UPDATE assignments SET status = 'in_progress' WHERE id = ?";
+            } catch (Exception $e) {
+                // If update fails, try without updated_at
+                if ($step1_completed && $step2_completed && $step3_completed) {
+                    $query = "UPDATE assignments SET status = 'completed' WHERE id = ?";
+                } else {
+                    $query = "UPDATE assignments SET status = 'in_progress' WHERE id = ?";
+                }
                 $stmt = $db->prepare($query);
                 $stmt->execute([$assignment_id]);
             }
@@ -281,8 +302,8 @@ if (isset($_GET['saved'])) {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Gán nhãn - Text Labeling System</title>
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/css/bootstrap.min.css" rel="stylesheet">
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <style>
         body { 
             background: #f8f9fa; 
@@ -318,6 +339,7 @@ if (isset($_GET['saved'])) {
             border-radius: 15px;
             box-shadow: 0 5px 15px rgba(0,0,0,0.1);
             overflow: hidden;
+            margin-bottom: 20px;
         }
         .step-header {
             background: linear-gradient(135deg, #007bff 0%, #6610f2 100%);
@@ -329,12 +351,14 @@ if (isset($_GET['saved'])) {
             padding: 30px;
         }
         .sentence {
-            padding: 10px;
-            margin: 5px 0;
-            border-radius: 8px;
+            padding: 8px 12px;
+            margin: 3px 0;
+            border-radius: 6px;
             cursor: pointer;
-            transition: all 0.3s ease;
+            transition: all 0.2s ease;
             border: 2px solid transparent;
+            font-size: 14px;
+            line-height: 1.5;
         }
         .sentence:hover {
             background: #f8f9fa;
@@ -352,6 +376,8 @@ if (isset($_GET['saved'])) {
             padding: 15px 20px;
             cursor: pointer;
             transition: all 0.3s ease;
+            display: inline-block;
+            margin-right: 5px;
         }
         .document-tab.active {
             background: #007bff;
@@ -389,7 +415,8 @@ if (isset($_GET['saved'])) {
             text-align: center;
             cursor: pointer;
             transition: all 0.3s ease;
-            margin: 10px;
+            margin: 5px;
+            height: 100%;
         }
         .writing-style-option:hover {
             border-color: #007bff;
@@ -404,19 +431,28 @@ if (isset($_GET['saved'])) {
             position: fixed;
             top: 20px;
             right: 20px;
-            padding: 10px 15px;
+            padding: 8px 15px;
             background: #28a745;
             color: white;
             border-radius: 20px;
             display: none;
             z-index: 1100;
+            font-size: 14px;
+        }
+        .content-area {
+            border: 1px solid #dee2e6;
+            border-radius: 8px;
+            padding: 15px;
+            background: #fafafa;
+            max-height: 400px;
+            overflow-y: auto;
         }
     </style>
 </head>
 <body>
     <!-- Auto-save indicator -->
     <div id="autoSaveIndicator" class="auto-save-indicator">
-        <i class="fas fa-check me-2"></i>Đã lưu tự động
+        <i class="fas fa-check me-1"></i>Đã lưu
     </div>
 
     <!-- Sidebar -->
@@ -424,7 +460,7 @@ if (isset($_GET['saved'])) {
         <div class="text-center text-white mb-4">
             <i class="fas fa-user-edit fa-2x mb-2"></i>
             <h5>Labeler Panel</h5>
-            <small>Xin chào, <?php echo htmlspecialchars($current_user['full_name']); ?></small>
+            <small>Xin chào, <?php echo htmlspecialchars($current_user['full_name'], ENT_QUOTES, 'UTF-8'); ?></small>
         </div>
         
         <ul class="nav flex-column">
@@ -460,19 +496,21 @@ if (isset($_GET['saved'])) {
     <div class="main-content">
         <?php if ($error_message): ?>
             <div class="alert alert-danger">
-                <i class="fas fa-exclamation-circle me-2"></i><?php echo $error_message; ?>
-                <div class="mt-2">
+                <i class="fas fa-exclamation-circle me-2"></i><?php echo htmlspecialchars($error_message, ENT_QUOTES, 'UTF-8'); ?>
+                <div class="mt-3">
                     <a href="my_tasks.php" class="btn btn-outline-primary">← Quay lại danh sách công việc</a>
+                    <a href="dashboard.php" class="btn btn-outline-secondary">← Dashboard</a>
                 </div>
             </div>
-        <?php elseif ($assignment): ?>
+        <?php elseif ($assignment && !empty($documents)): ?>
             
             <div class="d-flex justify-content-between align-items-center mb-4">
                 <div>
-                    <h2 class="text-dark">Gán nhãn: <?php echo htmlspecialchars($assignment['title']); ?></h2>
+                    <h2 class="text-dark">Gán nhãn: <?php echo htmlspecialchars($assignment['title'], ENT_QUOTES, 'UTF-8'); ?></h2>
                     <small class="text-muted">
                         Assignment #<?php echo $assignment['id']; ?> • 
-                        <?php echo $assignment['type'] == 'single' ? 'Đơn văn bản' : 'Đa văn bản'; ?>
+                        <?php echo $assignment['type'] == 'single' ? 'Đơn văn bản' : 'Đa văn bản'; ?> • 
+                        <?php echo count($documents); ?> văn bản
                         <?php if ($view_only): ?>
                             • <span class="badge bg-secondary">Chế độ xem</span>
                         <?php endif; ?>
@@ -480,11 +518,11 @@ if (isset($_GET['saved'])) {
                 </div>
                 <div>
                     <a href="my_tasks.php" class="btn btn-outline-secondary me-2">
-                        <i class="fas fa-arrow-left me-2"></i>Quay lại
+                        <i class="fas fa-arrow-left me-1"></i>Quay lại
                     </a>
                     <?php if (!$view_only): ?>
-                        <button type="button" class="btn btn-success" onclick="saveAll()">
-                            <i class="fas fa-save me-2"></i>Lưu tất cả
+                        <button type="button" class="btn btn-success" onclick="saveCurrentDocument()">
+                            <i class="fas fa-save me-1"></i>Lưu
                         </button>
                     <?php endif; ?>
                 </div>
@@ -492,21 +530,23 @@ if (isset($_GET['saved'])) {
 
             <?php if ($success_message): ?>
                 <div class="alert alert-success alert-dismissible fade show">
-                    <i class="fas fa-check-circle me-2"></i><?php echo $success_message; ?>
+                    <i class="fas fa-check-circle me-2"></i><?php echo htmlspecialchars($success_message, ENT_QUOTES, 'UTF-8'); ?>
                     <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
                 </div>
             <?php endif; ?>
 
             <!-- Document Tabs (for multi-document) -->
             <?php if (count($documents) > 1): ?>
-                <div class="d-flex mb-3">
+                <div class="mb-3">
                     <?php foreach ($documents as $index => $doc): ?>
                         <div class="document-tab <?php echo $index == 0 ? 'active' : ''; ?>" 
                              onclick="switchDocument(<?php echo $index; ?>)" 
                              id="tab-<?php echo $index; ?>">
-                            <i class="fas fa-file-text me-2"></i>
-                            <?php echo htmlspecialchars(substr($doc['title'], 0, 20)); ?>
-                            <?php if (strlen($doc['title']) > 20): ?>...<?php endif; ?>
+                            <i class="fas fa-file-text me-1"></i>
+                            <?php 
+                            $title = htmlspecialchars($doc['title'], ENT_QUOTES, 'UTF-8');
+                            echo mb_strlen($title, 'UTF-8') > 20 ? mb_substr($title, 0, 20, 'UTF-8') . '...' : $title;
+                            ?>
                         </div>
                     <?php endforeach; ?>
                 </div>
@@ -514,22 +554,23 @@ if (isset($_GET['saved'])) {
 
             <!-- Labeling Interface -->
             <?php foreach ($documents as $doc_index => $document): ?>
+                <?php $result = $results_map[$document['id']] ?? null; ?>
                 <div class="document-container <?php echo $doc_index == 0 ? '' : 'd-none'; ?>" id="document-<?php echo $doc_index; ?>">
+                    
+                    <!-- Progress Indicator -->
+                    <div class="progress-indicator">
+                        <?php 
+                        $step1 = $result['step1_completed'] ?? false;
+                        $step2 = $result['step2_completed'] ?? false;
+                        $step3 = $result['step3_completed'] ?? false;
+                        ?>
+                        <div class="progress-step <?php echo $step1 ? 'completed' : 'active'; ?>">1</div>
+                        <div class="progress-step <?php echo $step2 ? 'completed' : ($step1 ? 'active' : ''); ?>">2</div>
+                        <div class="progress-step <?php echo $step3 ? 'completed' : ($step2 ? 'active' : ''); ?>">3</div>
+                    </div>
+
                     <div class="labeling-container">
                         
-                        <!-- Progress Indicator -->
-                        <div class="progress-indicator">
-                            <?php 
-                            $result = $results_map[$document['id']] ?? null;
-                            $step1 = $result['step1_completed'] ?? false;
-                            $step2 = $result['step2_completed'] ?? false;
-                            $step3 = $result['step3_completed'] ?? false;
-                            ?>
-                            <div class="progress-step <?php echo $step1 ? 'completed' : 'active'; ?>">1</div>
-                            <div class="progress-step <?php echo $step2 ? 'completed' : ($step1 ? 'active' : ''); ?>">2</div>
-                            <div class="progress-step <?php echo $step3 ? 'completed' : ($step2 ? 'active' : ''); ?>">3</div>
-                        </div>
-
                         <!-- Step 1: Select Important Sentences -->
                         <div class="step-section" id="step1-<?php echo $doc_index; ?>">
                             <div class="step-header">
@@ -539,16 +580,21 @@ if (isset($_GET['saved'])) {
                             <div class="step-content">
                                 <div class="row">
                                     <div class="col-md-8">
-                                        <h6>Nội dung văn bản:</h6>
-                                        <div class="border rounded p-3" style="max-height: 400px; overflow-y: auto;">
+                                        <h6 class="mb-3">Nội dung văn bản:</h6>
+                                        <div class="content-area">
                                             <div id="sentences-<?php echo $doc_index; ?>">
                                                 <?php 
-                                                $sentences = preg_split('/(?<=[.!?])\s+/', $document['content']);
+                                                $content = $document['content'] ?? '';
+                                                $sentences = preg_split('/(?<=[.!?])\s+/u', $content);
                                                 foreach ($sentences as $i => $sentence):
-                                                    if (trim($sentence)):
+                                                    $sentence = trim($sentence);
+                                                    if (!empty($sentence)):
                                                 ?>
-                                                    <div class="sentence" data-doc="<?php echo $doc_index; ?>" data-sentence="<?php echo $i; ?>" onclick="toggleSentence(this)">
-                                                        <?php echo htmlspecialchars(trim($sentence)); ?>
+                                                    <div class="sentence" 
+                                                         data-doc="<?php echo $doc_index; ?>" 
+                                                         data-sentence="<?php echo $i; ?>" 
+                                                         onclick="toggleSentence(this)">
+                                                        <?php echo htmlspecialchars($sentence, ENT_QUOTES, 'UTF-8'); ?>
                                                     </div>
                                                 <?php 
                                                     endif;
@@ -558,20 +604,23 @@ if (isset($_GET['saved'])) {
                                         </div>
                                     </div>
                                     <div class="col-md-4">
-                                        <h6>Câu đã chọn:</h6>
-                                        <div class="border rounded p-3" style="max-height: 400px; overflow-y: auto;">
+                                        <h6 class="mb-3">Câu đã chọn:</h6>
+                                        <div class="content-area">
                                             <div id="selected-sentences-<?php echo $doc_index; ?>" class="text-muted">
                                                 Chưa có câu nào được chọn
                                             </div>
                                         </div>
-                                        <button type="button" class="btn btn-outline-danger btn-sm mt-2" onclick="clearSelections(<?php echo $doc_index; ?>)">
-                                            <i class="fas fa-eraser me-1"></i>Xóa tất cả
-                                        </button>
+                                        <div class="mt-3">
+                                            <button type="button" class="btn btn-outline-danger btn-sm me-2" onclick="clearSelections(<?php echo $doc_index; ?>)">
+                                                <i class="fas fa-eraser me-1"></i>Xóa tất cả
+                                            </button>
+                                            <span class="badge bg-info" id="selected-count-<?php echo $doc_index; ?>">0 câu đã chọn</span>
+                                        </div>
                                     </div>
                                 </div>
-                                <div class="text-end mt-3">
+                                <div class="text-end mt-4">
                                     <button type="button" class="btn btn-primary" onclick="completeStep(1, <?php echo $doc_index; ?>)">
-                                        Hoàn thành bước 1 <i class="fas fa-arrow-right ms-2"></i>
+                                        Hoàn thành bước 1 <i class="fas fa-arrow-right ms-1"></i>
                                     </button>
                                 </div>
                             </div>
@@ -587,39 +636,39 @@ if (isset($_GET['saved'])) {
                                 <div class="row">
                                     <div class="col-md-3">
                                         <div class="writing-style-option" data-style="formal" onclick="selectStyle('formal', <?php echo $doc_index; ?>)">
-                                            <i class="fas fa-university fa-2x mb-2"></i>
+                                            <i class="fas fa-university fa-2x mb-2 d-block"></i>
                                             <h6>Trang trọng</h6>
-                                            <small>Phù hợp cho báo cáo, tài liệu chính thức</small>
+                                            <small>Báo cáo, tài liệu chính thức</small>
                                         </div>
                                     </div>
                                     <div class="col-md-3">
                                         <div class="writing-style-option" data-style="casual" onclick="selectStyle('casual', <?php echo $doc_index; ?>)">
-                                            <i class="fas fa-comments fa-2x mb-2"></i>
+                                            <i class="fas fa-comments fa-2x mb-2 d-block"></i>
                                             <h6>Thân thiện</h6>
-                                            <small>Phù hợp cho blog, bài viết cá nhân</small>
+                                            <small>Blog, bài viết cá nhân</small>
                                         </div>
                                     </div>
                                     <div class="col-md-3">
                                         <div class="writing-style-option" data-style="technical" onclick="selectStyle('technical', <?php echo $doc_index; ?>)">
-                                            <i class="fas fa-cogs fa-2x mb-2"></i>
+                                            <i class="fas fa-cogs fa-2x mb-2 d-block"></i>
                                             <h6>Kỹ thuật</h6>
-                                            <small>Phù hợp cho tài liệu chuyên môn</small>
+                                            <small>Tài liệu chuyên môn</small>
                                         </div>
                                     </div>
                                     <div class="col-md-3">
                                         <div class="writing-style-option" data-style="news" onclick="selectStyle('news', <?php echo $doc_index; ?>)">
-                                            <i class="fas fa-newspaper fa-2x mb-2"></i>
+                                            <i class="fas fa-newspaper fa-2x mb-2 d-block"></i>
                                             <h6>Tin tức</h6>
-                                            <small>Phù hợp cho báo chí, thông tin</small>
+                                            <small>Báo chí, thông tin</small>
                                         </div>
                                     </div>
                                 </div>
-                                <div class="text-end mt-3">
-                                    <button type="button" class="btn btn-outline-secondary me-2" onclick="showStep(1, <?php echo $doc_index; ?>)">
-                                        <i class="fas fa-arrow-left me-2"></i>Quay lại
+                                <div class="d-flex justify-content-between mt-4">
+                                    <button type="button" class="btn btn-outline-secondary" onclick="showStep(1, <?php echo $doc_index; ?>)">
+                                        <i class="fas fa-arrow-left me-1"></i>Quay lại
                                     </button>
                                     <button type="button" class="btn btn-primary" onclick="completeStep(2, <?php echo $doc_index; ?>)" disabled id="step2-complete-<?php echo $doc_index; ?>">
-                                        Hoàn thành bước 2 <i class="fas fa-arrow-right ms-2"></i>
+                                        Hoàn thành bước 2 <i class="fas fa-arrow-right ms-1"></i>
                                     </button>
                                 </div>
                             </div>
@@ -634,25 +683,28 @@ if (isset($_GET['saved'])) {
                             <div class="step-content">
                                 <div class="row">
                                     <div class="col-md-6">
-                                        <h6>Bản tóm tắt AI gốc:</h6>
-                                        <div class="border rounded p-3 bg-light" style="max-height: 300px; overflow-y: auto;">
-                                            <?php echo htmlspecialchars($document['ai_summary'] ?? 'Không có tóm tắt AI'); ?>
+                                        <h6 class="mb-3">Bản tóm tắt AI gốc:</h6>
+                                        <div class="content-area">
+                                            <?php echo nl2br(htmlspecialchars($document['ai_summary'] ?? 'Không có tóm tắt AI', ENT_QUOTES, 'UTF-8')); ?>
                                         </div>
                                     </div>
                                     <div class="col-md-6">
-                                        <h6>Bản tóm tắt đã chỉnh sửa:</h6>
-                                        <textarea class="form-control" id="edited-summary-<?php echo $doc_index; ?>" rows="12" 
+                                        <h6 class="mb-3">Bản tóm tắt đã chỉnh sửa:</h6>
+                                        <textarea class="form-control" 
+                                                  id="edited-summary-<?php echo $doc_index; ?>" 
+                                                  rows="15" 
                                                   placeholder="Chỉnh sửa bản tóm tắt dựa trên các câu quan trọng đã chọn..."
-                                                  <?php echo $view_only ? 'readonly' : ''; ?>><?php echo htmlspecialchars($result['edited_summary'] ?? $document['ai_summary'] ?? ''); ?></textarea>
+                                                  <?php echo $view_only ? 'readonly' : ''; ?>
+                                                  style="resize: vertical;"><?php echo htmlspecialchars($result['edited_summary'] ?? $document['ai_summary'] ?? '', ENT_QUOTES, 'UTF-8'); ?></textarea>
                                     </div>
                                 </div>
-                                <div class="text-end mt-3">
-                                    <button type="button" class="btn btn-outline-secondary me-2" onclick="showStep(2, <?php echo $doc_index; ?>)">
-                                        <i class="fas fa-arrow-left me-2"></i>Quay lại
+                                <div class="d-flex justify-content-between mt-4">
+                                    <button type="button" class="btn btn-outline-secondary" onclick="showStep(2, <?php echo $doc_index; ?>)">
+                                        <i class="fas fa-arrow-left me-1"></i>Quay lại
                                     </button>
                                     <?php if (!$view_only): ?>
                                         <button type="button" class="btn btn-success" onclick="completeStep(3, <?php echo $doc_index; ?>)">
-                                            <i class="fas fa-check me-2"></i>Hoàn thành gán nhãn
+                                            <i class="fas fa-check me-1"></i>Hoàn thành gán nhãn
                                         </button>
                                     <?php endif; ?>
                                 </div>
@@ -663,62 +715,80 @@ if (isset($_GET['saved'])) {
                 </div>
             <?php endforeach; ?>
 
+        <?php else: ?>
+            <div class="alert alert-info">
+                <i class="fas fa-info-circle me-2"></i>Không có công việc nào để gán nhãn.
+                <div class="mt-3">
+                    <a href="my_tasks.php" class="btn btn-primary">Xem danh sách công việc</a>
+                    <a href="dashboard.php" class="btn btn-outline-primary">Dashboard</a>
+                </div>
+            </div>
         <?php endif; ?>
     </div>
 
     <!-- Hidden forms for saving -->
-    <?php foreach ($documents as $doc_index => $document): ?>
-        <form id="save-form-<?php echo $doc_index; ?>" method="POST" style="display: none;">
-            <input type="hidden" name="action" value="save_labeling">
-            <input type="hidden" name="document_id" value="<?php echo $document['id']; ?>">
-            <input type="hidden" name="selected_sentences" id="form-selected-sentences-<?php echo $doc_index; ?>">
-            <input type="hidden" name="writing_style" id="form-writing-style-<?php echo $doc_index; ?>">
-            <input type="hidden" name="edited_summary" id="form-edited-summary-<?php echo $doc_index; ?>">
-            <input type="hidden" name="step1_completed" id="form-step1-<?php echo $doc_index; ?>">
-            <input type="hidden" name="step2_completed" id="form-step2-<?php echo $doc_index; ?>">
-            <input type="hidden" name="step3_completed" id="form-step3-<?php echo $doc_index; ?>">
-        </form>
-    <?php endforeach; ?>
+    <?php if (!empty($documents)): ?>
+        <?php foreach ($documents as $doc_index => $document): ?>
+            <form id="save-form-<?php echo $doc_index; ?>" method="POST" style="display: none;">
+                <input type="hidden" name="action" value="save_labeling">
+                <input type="hidden" name="document_id" value="<?php echo $document['id']; ?>">
+                <input type="hidden" name="selected_sentences" id="form-selected-sentences-<?php echo $doc_index; ?>">
+                <input type="hidden" name="writing_style" id="form-writing-style-<?php echo $doc_index; ?>">
+                <input type="hidden" name="edited_summary" id="form-edited-summary-<?php echo $doc_index; ?>">
+                <input type="hidden" name="step1_completed" id="form-step1-<?php echo $doc_index; ?>">
+                <input type="hidden" name="step2_completed" id="form-step2-<?php echo $doc_index; ?>">
+                <input type="hidden" name="step3_completed" id="form-step3-<?php echo $doc_index; ?>">
+            </form>
+        <?php endforeach; ?>
+    <?php endif; ?>
 
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
+        // Global variables
         let currentDocument = 0;
         let selectedSentences = {};
         let writingStyles = {};
         let completedSteps = {};
 
         // Initialize data from PHP
-        <?php foreach ($documents as $doc_index => $document): ?>
-            selectedSentences[<?php echo $doc_index; ?>] = <?php 
-                $result = $results_map[$document['id']] ?? null;
-                echo $result['selected_sentences'] ?? '[]'; 
-            ?>;
-            writingStyles[<?php echo $doc_index; ?>] = '<?php echo $result['writing_style'] ?? ''; ?>';
-            completedSteps[<?php echo $doc_index; ?>] = {
-                step1: <?php echo $result['step1_completed'] ? 'true' : 'false'; ?>,
-                step2: <?php echo $result['step2_completed'] ? 'true' : 'false'; ?>,
-                step3: <?php echo $result['step3_completed'] ? 'true' : 'false'; ?>
-            };
-        <?php endforeach; ?>
+        function initializeData() {
+            <?php if (!empty($documents)): ?>
+                <?php foreach ($documents as $doc_index => $document): ?>
+                    selectedSentences[<?php echo $doc_index; ?>] = <?php 
+                        $result = $results_map[$document['id']] ?? null;
+                        echo $result['selected_sentences'] ?? '[]'; 
+                    ?>;
+                    writingStyles[<?php echo $doc_index; ?>] = '<?php echo $result['writing_style'] ?? ''; ?>';
+                    completedSteps[<?php echo $doc_index; ?>] = {
+                        step1: <?php echo ($result['step1_completed'] ?? false) ? 'true' : 'false'; ?>,
+                        step2: <?php echo ($result['step2_completed'] ?? false) ? 'true' : 'false'; ?>,
+                        step3: <?php echo ($result['step3_completed'] ?? false) ? 'true' : 'false'; ?>
+                    };
+                <?php endforeach; ?>
+            <?php endif; ?>
+        }
 
         // Initialize interface
         document.addEventListener('DOMContentLoaded', function() {
-            <?php foreach ($documents as $doc_index => $document): ?>
-                loadSavedData(<?php echo $doc_index; ?>);
-            <?php endforeach; ?>
+            console.log('DOM loaded, initializing...');
+            initializeData();
             
-            // Show appropriate step
-            <?php foreach ($documents as $doc_index => $document): ?>
-                if (completedSteps[<?php echo $doc_index; ?>].step3) {
-                    showStep(3, <?php echo $doc_index; ?>);
-                } else if (completedSteps[<?php echo $doc_index; ?>].step2) {
-                    showStep(3, <?php echo $doc_index; ?>);
-                } else if (completedSteps[<?php echo $doc_index; ?>].step1) {
-                    showStep(2, <?php echo $doc_index; ?>);
-                } else {
-                    showStep(1, <?php echo $doc_index; ?>);
-                }
-            <?php endforeach; ?>
+            <?php if (!empty($documents)): ?>
+                <?php foreach ($documents as $doc_index => $document): ?>
+                    loadSavedData(<?php echo $doc_index; ?>);
+                    
+                    // Show appropriate step
+                    if (completedSteps[<?php echo $doc_index; ?>].step3) {
+                        showStep(3, <?php echo $doc_index; ?>);
+                    } else if (completedSteps[<?php echo $doc_index; ?>].step2) {
+                        showStep(3, <?php echo $doc_index; ?>);
+                    } else if (completedSteps[<?php echo $doc_index; ?>].step1) {
+                        showStep(2, <?php echo $doc_index; ?>);
+                    } else {
+                        showStep(1, <?php echo $doc_index; ?>);
+                    }
+                <?php endforeach; ?>
+            <?php endif; ?>
         });
 
         function switchDocument(docIndex) {
@@ -727,8 +797,11 @@ if (isset($_GET['saved'])) {
             document.querySelectorAll('.document-tab').forEach(el => el.classList.remove('active'));
             
             // Show selected document
-            document.getElementById('document-' + docIndex).classList.remove('d-none');
-            document.getElementById('tab-' + docIndex).classList.add('active');
+            const targetDoc = document.getElementById('document-' + docIndex);
+            const targetTab = document.getElementById('tab-' + docIndex);
+            
+            if (targetDoc) targetDoc.classList.remove('d-none');
+            if (targetTab) targetTab.classList.add('active');
             
             currentDocument = docIndex;
         }
@@ -750,23 +823,34 @@ if (isset($_GET['saved'])) {
             }
             
             updateSelectedDisplay(docIndex);
-            autoSave(docIndex);
+            updateSelectedCount(docIndex);
+            showAutoSaveIndicator();
         }
 
         function updateSelectedDisplay(docIndex) {
             const container = document.getElementById('selected-sentences-' + docIndex);
             const sentences = document.querySelectorAll(`#sentences-${docIndex} .sentence`);
             
+            if (!container) return;
+            
             if (selectedSentences[docIndex] && selectedSentences[docIndex].length > 0) {
                 let html = '';
                 selectedSentences[docIndex].forEach(index => {
                     if (sentences[index]) {
-                        html += '<div class="mb-2 p-2 bg-light rounded">' + sentences[index].textContent + '</div>';
+                        html += '<div class="mb-2 p-2 bg-light rounded small">' + sentences[index].textContent.trim() + '</div>';
                     }
                 });
                 container.innerHTML = html;
             } else {
                 container.innerHTML = '<div class="text-muted">Chưa có câu nào được chọn</div>';
+            }
+        }
+
+        function updateSelectedCount(docIndex) {
+            const countElement = document.getElementById('selected-count-' + docIndex);
+            if (countElement) {
+                const count = selectedSentences[docIndex] ? selectedSentences[docIndex].length : 0;
+                countElement.textContent = count + ' câu đã chọn';
             }
         }
 
@@ -776,7 +860,8 @@ if (isset($_GET['saved'])) {
                 el.classList.remove('selected');
             });
             updateSelectedDisplay(docIndex);
-            autoSave(docIndex);
+            updateSelectedCount(docIndex);
+            showAutoSaveIndicator();
         }
 
         function selectStyle(style, docIndex) {
@@ -786,22 +871,35 @@ if (isset($_GET['saved'])) {
             document.querySelectorAll(`#step2-${docIndex} .writing-style-option`).forEach(el => {
                 el.classList.remove('selected');
             });
-            document.querySelector(`#step2-${docIndex} .writing-style-option[data-style="${style}"]`).classList.add('selected');
+            
+            const selectedOption = document.querySelector(`#step2-${docIndex} .writing-style-option[data-style="${style}"]`);
+            if (selectedOption) {
+                selectedOption.classList.add('selected');
+            }
             
             // Enable next button
-            document.getElementById('step2-complete-' + docIndex).disabled = false;
+            const nextButton = document.getElementById('step2-complete-' + docIndex);
+            if (nextButton) {
+                nextButton.disabled = false;
+            }
             
-            autoSave(docIndex);
+            showAutoSaveIndicator();
         }
 
         function showStep(step, docIndex) {
             // Hide all steps
             for (let i = 1; i <= 3; i++) {
-                document.getElementById(`step${i}-${docIndex}`).classList.add('d-none');
+                const stepElement = document.getElementById(`step${i}-${docIndex}`);
+                if (stepElement) {
+                    stepElement.classList.add('d-none');
+                }
             }
             
             // Show selected step
-            document.getElementById(`step${step}-${docIndex}`).classList.remove('d-none');
+            const targetStep = document.getElementById(`step${step}-${docIndex}`);
+            if (targetStep) {
+                targetStep.classList.remove('d-none');
+            }
         }
 
         function completeStep(step, docIndex) {
@@ -812,6 +910,7 @@ if (isset($_GET['saved'])) {
                 }
                 completedSteps[docIndex].step1 = true;
                 showStep(2, docIndex);
+                
             } else if (step === 2) {
                 if (!writingStyles[docIndex]) {
                     alert('Vui lòng chọn phong cách văn bản!');
@@ -819,35 +918,62 @@ if (isset($_GET['saved'])) {
                 }
                 completedSteps[docIndex].step2 = true;
                 showStep(3, docIndex);
+                
             } else if (step === 3) {
-                const summary = document.getElementById('edited-summary-' + docIndex).value.trim();
+                const summaryElement = document.getElementById('edited-summary-' + docIndex);
+                const summary = summaryElement ? summaryElement.value.trim() : '';
+                
                 if (!summary) {
                     alert('Vui lòng nhập bản tóm tắt!');
                     return;
                 }
                 completedSteps[docIndex].step3 = true;
                 saveDocument(docIndex);
+                return;
             }
             
-            autoSave(docIndex);
+            // Update progress indicator
+            updateProgressIndicator(docIndex);
         }
 
-        function autoSave(docIndex) {
-            // Update form data
-            updateFormData(docIndex);
+        function updateProgressIndicator(docIndex) {
+            const steps = document.querySelectorAll(`#document-${docIndex} .progress-step`);
             
-            // Show auto-save indicator
+            steps.forEach((step, index) => {
+                const stepNumber = index + 1;
+                step.classList.remove('active', 'completed');
+                
+                if (completedSteps[docIndex][`step${stepNumber}`]) {
+                    step.classList.add('completed');
+                } else {
+                    // Find the next active step
+                    if (stepNumber === 1 && !completedSteps[docIndex].step1) {
+                        step.classList.add('active');
+                    } else if (stepNumber === 2 && completedSteps[docIndex].step1 && !completedSteps[docIndex].step2) {
+                        step.classList.add('active');
+                    } else if (stepNumber === 3 && completedSteps[docIndex].step2 && !completedSteps[docIndex].step3) {
+                        step.classList.add('active');
+                    }
+                }
+            });
+        }
+
+        function showAutoSaveIndicator() {
             const indicator = document.getElementById('autoSaveIndicator');
-            indicator.style.display = 'block';
-            setTimeout(() => {
-                indicator.style.display = 'none';
-            }, 2000);
+            if (indicator) {
+                indicator.style.display = 'block';
+                setTimeout(() => {
+                    indicator.style.display = 'none';
+                }, 1500);
+            }
         }
 
         function updateFormData(docIndex) {
+            const summaryElement = document.getElementById('edited-summary-' + docIndex);
+            
             document.getElementById('form-selected-sentences-' + docIndex).value = JSON.stringify(selectedSentences[docIndex] || []);
             document.getElementById('form-writing-style-' + docIndex).value = writingStyles[docIndex] || '';
-            document.getElementById('form-edited-summary-' + docIndex).value = document.getElementById('edited-summary-' + docIndex).value;
+            document.getElementById('form-edited-summary-' + docIndex).value = summaryElement ? summaryElement.value : '';
             document.getElementById('form-step1-' + docIndex).value = completedSteps[docIndex].step1 ? '1' : '';
             document.getElementById('form-step2-' + docIndex).value = completedSteps[docIndex].step2 ? '1' : '';
             document.getElementById('form-step3-' + docIndex).value = completedSteps[docIndex].step3 ? '1' : '';
@@ -855,12 +981,14 @@ if (isset($_GET['saved'])) {
 
         function saveDocument(docIndex) {
             updateFormData(docIndex);
-            document.getElementById('save-form-' + docIndex).submit();
+            const form = document.getElementById('save-form-' + docIndex);
+            if (form) {
+                form.submit();
+            }
         }
 
-        function saveAll() {
-            updateFormData(currentDocument);
-            document.getElementById('save-form-' + currentDocument).submit();
+        function saveCurrentDocument() {
+            saveDocument(currentDocument);
         }
 
         function loadSavedData(docIndex) {
@@ -873,6 +1001,7 @@ if (isset($_GET['saved'])) {
                     }
                 });
                 updateSelectedDisplay(docIndex);
+                updateSelectedCount(docIndex);
             }
             
             // Load writing style
@@ -880,10 +1009,23 @@ if (isset($_GET['saved'])) {
                 const styleElement = document.querySelector(`#step2-${docIndex} .writing-style-option[data-style="${writingStyles[docIndex]}"]`);
                 if (styleElement) {
                     styleElement.classList.add('selected');
-                    document.getElementById('step2-complete-' + docIndex).disabled = false;
+                    const nextButton = document.getElementById('step2-complete-' + docIndex);
+                    if (nextButton) {
+                        nextButton.disabled = false;
+                    }
                 }
             }
+            
+            // Update progress indicator
+            updateProgressIndicator(docIndex);
         }
+
+        // Auto-save functionality
+        document.addEventListener('input', function(e) {
+            if (e.target.id && e.target.id.startsWith('edited-summary-')) {
+                showAutoSaveIndicator();
+            }
+        });
     </script>
 </body>
 </html>
