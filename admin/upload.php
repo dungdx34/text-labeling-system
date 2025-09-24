@@ -15,7 +15,7 @@ $db = $database->getConnection();
 $message = '';
 $error = '';
 
-// COPY EXACT LOGIC FROM WORKING VERSION
+// FIXED LOGIC FOR MULTI-DOCUMENT WITH NESTED FORMAT
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['jsonl_file'])) {
     $file = $_FILES['jsonl_file'];
     
@@ -46,19 +46,50 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['jsonl_file'])) {
             
             try {
                 if ($data['type'] === 'single') {
-                    if (!isset($data['title']) || !isset($data['content']) || !isset($data['ai_summary'])) {
-                        throw new Exception("Thiếu trường bắt buộc: title, content, ai_summary");
+                    if (!isset($data['title']) || !isset($data['content'])) {
+                        throw new Exception("Thiếu trường bắt buộc: title, content");
                     }
                     
-                    $query = "INSERT INTO documents (title, content, ai_summary, type, created_by, created_at) 
-                             VALUES (?, ?, ?, 'single', ?, NOW())";
+                    // Kiểm tra các cột tồn tại trong database
+                    $columns_query = $db->query("SHOW COLUMNS FROM documents");
+                    $existing_columns = [];
+                    while ($col = $columns_query->fetch(PDO::FETCH_ASSOC)) {
+                        $existing_columns[] = $col['Field'];
+                    }
+                    
+                    // Build dynamic INSERT query
+                    $insert_columns = ['title', 'content'];
+                    $insert_values = [$data['title'], $data['content']];
+                    $placeholders = '?, ?';
+                    
+                    // Add ai_summary if column exists
+                    if (in_array('ai_summary', $existing_columns)) {
+                        $insert_columns[] = 'ai_summary';
+                        $insert_values[] = $data['ai_summary'] ?? $data['summary'] ?? '';
+                        $placeholders .= ', ?';
+                    }
+                    
+                    // Add type if column exists
+                    if (in_array('type', $existing_columns)) {
+                        $insert_columns[] = 'type';
+                        $insert_values[] = 'single';
+                        $placeholders .= ', ?';
+                    }
+                    
+                    // Add created_by if column exists (use uploaded_by or created_by)
+                    if (in_array('created_by', $existing_columns)) {
+                        $insert_columns[] = 'created_by';
+                        $insert_values[] = $_SESSION['user_id'];
+                        $placeholders .= ', ?';
+                    } elseif (in_array('uploaded_by', $existing_columns)) {
+                        $insert_columns[] = 'uploaded_by';
+                        $insert_values[] = $_SESSION['user_id'];
+                        $placeholders .= ', ?';
+                    }
+                    
+                    $query = "INSERT INTO documents (" . implode(', ', $insert_columns) . ", created_at) VALUES (" . $placeholders . ", NOW())";
                     $stmt = $db->prepare($query);
-                    $result = $stmt->execute([
-                        $data['title'],
-                        $data['content'],
-                        $data['ai_summary'],
-                        $_SESSION['user_id']
-                    ]);
+                    $result = $stmt->execute($insert_values);
                     
                     if ($result) {
                         $success_count++;
@@ -67,23 +98,87 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['jsonl_file'])) {
                     }
                     
                 } elseif ($data['type'] === 'multi') {
-                    if (!isset($data['group_title']) || !isset($data['group_summary']) || !isset($data['documents'])) {
-                        throw new Exception("Thiếu trường bắt buộc: group_title, group_summary, documents");
+					$columns_query = $db->query("SHOW COLUMNS FROM documents");
+					$existing_columns = [];
+					while ($col = $columns_query->fetch(PDO::FETCH_ASSOC)) {
+						$existing_columns[] = $col['Field'];
+					}
+                    // FIXED: Handle nested documents format
+                    if (!isset($data['group_title']) && !isset($data['group_name'])) {
+                        throw new Exception("Thiếu trường bắt buộc: group_title hoặc group_name");
+                    }
+                    
+                    if (!isset($data['documents']) || !is_array($data['documents'])) {
+                        throw new Exception("Thiếu trường bắt buộc: documents (phải là array)");
                     }
                     
                     // Start transaction
                     $db->beginTransaction();
                     
-                    // Insert group
-                    $query = "INSERT INTO document_groups (title, description, ai_summary, created_by, created_at) 
-                             VALUES (?, ?, ?, ?, NOW())";
+                    // Create document_groups table if not exists
+                    $check_table = $db->query("SHOW TABLES LIKE 'document_groups'");
+                    if ($check_table->rowCount() == 0) {
+                        $create_table = "CREATE TABLE IF NOT EXISTS document_groups (
+                            id int(11) NOT NULL AUTO_INCREMENT,
+                            group_name varchar(255) NOT NULL,
+                            title varchar(255) NOT NULL,
+                            description text,
+                            ai_summary text,
+                            combined_ai_summary text,
+                            created_by int(11) DEFAULT 1,
+                            created_at timestamp DEFAULT CURRENT_TIMESTAMP,
+                            updated_at timestamp DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                            status enum('pending','assigned','completed','reviewed') DEFAULT 'pending',
+                            PRIMARY KEY (id)
+                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+                        $db->exec($create_table);
+                    }
+                    
+                    // Extract group info
+                    $group_title = $data['group_title'] ?? $data['group_name'] ?? 'Multi-Document Group';
+                    $group_description = $data['group_description'] ?? $data['description'] ?? '';
+                    $group_summary = $data['group_summary'] ?? $data['ai_summary'] ?? '';
+                    
+                    // Insert group - check which columns exist
+                    $group_columns_query = $db->query("SHOW COLUMNS FROM document_groups");
+                    $group_existing_columns = [];
+                    while ($col = $group_columns_query->fetch(PDO::FETCH_ASSOC)) {
+                        $group_existing_columns[] = $col['Field'];
+                    }
+                    
+                    // Build INSERT query for group
+                    $group_insert_columns = ['group_name', 'created_by'];
+                    $group_insert_values = [$group_title, $_SESSION['user_id']];
+                    $group_placeholders = '?, ?';
+                    
+                    // Add title if column exists
+                    if (in_array('title', $group_existing_columns)) {
+                        $group_insert_columns[] = 'title';
+                        $group_insert_values[] = $group_title;
+                        $group_placeholders .= ', ?';
+                    }
+                    
+                    // Add description if column exists
+                    if (in_array('description', $group_existing_columns)) {
+                        $group_insert_columns[] = 'description';
+                        $group_insert_values[] = $group_description;
+                        $group_placeholders .= ', ?';
+                    }
+                    
+                    // Add ai_summary or combined_ai_summary if column exists
+                    if (in_array('ai_summary', $group_existing_columns)) {
+                        $group_insert_columns[] = 'ai_summary';
+                        $group_insert_values[] = $group_summary;
+                        $group_placeholders .= ', ?';
+                    } elseif (in_array('combined_ai_summary', $group_existing_columns)) {
+                        $group_insert_columns[] = 'combined_ai_summary';
+                        $group_insert_values[] = $group_summary;
+                        $group_placeholders .= ', ?';
+                    }
+                    
+                    $query = "INSERT INTO document_groups (" . implode(', ', $group_insert_columns) . ", created_at) VALUES (" . $group_placeholders . ", NOW())";
                     $stmt = $db->prepare($query);
-                    $result = $stmt->execute([
-                        $data['group_title'],
-                        $data['group_description'] ?? '',
-                        $data['group_summary'],
-                        $_SESSION['user_id']
-                    ]);
+                    $result = $stmt->execute($group_insert_values);
                     
                     if (!$result) {
                         throw new Exception("Failed to insert document group");
@@ -91,26 +186,83 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['jsonl_file'])) {
                     
                     $group_id = $db->lastInsertId();
                     
-                    // Insert documents
+                    // Insert individual documents from the documents array
                     foreach ($data['documents'] as $doc_index => $document) {
-                        if (!isset($document['title']) || !isset($document['content'])) {
-                            throw new Exception("Document " . ($doc_index + 1) . ": Missing title or content");
-                        }
-                        
-                        $query = "INSERT INTO documents (title, content, type, group_id, created_by, created_at) 
-                                 VALUES (?, ?, 'multi', ?, ?, NOW())";
-                        $stmt = $db->prepare($query);
-                        $result = $stmt->execute([
-                            $document['title'],
-                            $document['content'],
-                            $group_id,
-                            $_SESSION['user_id']
-                        ]);
-                        
-                        if (!$result) {
-                            throw new Exception("Failed to insert document " . ($doc_index + 1));
-                        }
-                    }
+						if (!isset($document['title']) || !isset($document['content'])) {
+							throw new Exception("Document " . ($doc_index + 1) . ": Missing title or content");
+						}
+						
+						// Build dynamic INSERT for individual document
+						$doc_insert_columns = ['title', 'content'];
+						$doc_insert_values = [$document['title'], $document['content']];
+						$doc_placeholders = '?, ?';
+						
+						// FIXED: Create AI summary for individual document
+						$individual_ai_summary = '';
+						
+						// Priority 1: Use document's own summary if provided
+						if (isset($document['ai_summary']) && !empty($document['ai_summary'])) {
+							$individual_ai_summary = $document['ai_summary'];
+						} 
+						// Priority 2: Use document's summary field if provided
+						elseif (isset($document['summary']) && !empty($document['summary'])) {
+							$individual_ai_summary = $document['summary'];
+						}
+						// Priority 3: Generate from group summary + document title
+						elseif (!empty($group_summary)) {
+							$individual_ai_summary = "Tóm tắt cho '" . $document['title'] . "': " . 
+								substr($group_summary, 0, 200) . "...";
+						}
+						// Priority 4: Generate from document content
+						elseif (!empty($document['content'])) {
+							$individual_ai_summary = "Tóm tắt AI cho: " . $document['title'] . ". " . 
+								substr($document['content'], 0, 150) . "...";
+						}
+						// Fallback: Basic summary
+						else {
+							$individual_ai_summary = "Tóm tắt AI cho văn bản: " . $document['title'];
+						}
+						
+						// Add ai_summary if column exists
+						if (in_array('ai_summary', $existing_columns)) {
+							$doc_insert_columns[] = 'ai_summary';
+							$doc_insert_values[] = $individual_ai_summary;
+							$doc_placeholders .= ', ?';
+						}
+						
+						// Add type if column exists
+						if (in_array('type', $existing_columns)) {
+							$doc_insert_columns[] = 'type';
+							$doc_insert_values[] = 'multi';
+							$doc_placeholders .= ', ?';
+						}
+						
+						// Add group_id if column exists
+						if (in_array('group_id', $existing_columns)) {
+							$doc_insert_columns[] = 'group_id';
+							$doc_insert_values[] = $group_id;
+							$doc_placeholders .= ', ?';
+						}
+						
+						// Add created_by if column exists
+						if (in_array('created_by', $existing_columns)) {
+							$doc_insert_columns[] = 'created_by';
+							$doc_insert_values[] = $_SESSION['user_id'];
+							$doc_placeholders .= ', ?';
+						} elseif (in_array('uploaded_by', $existing_columns)) {
+							$doc_insert_columns[] = 'uploaded_by';
+							$doc_insert_values[] = $_SESSION['user_id'];
+							$doc_placeholders .= ', ?';
+						}
+						
+						$query = "INSERT INTO documents (" . implode(', ', $doc_insert_columns) . ", created_at) VALUES (" . $doc_placeholders . ", NOW())";
+						$stmt = $db->prepare($query);
+						$result = $stmt->execute($doc_insert_values);
+						
+						if (!$result) {
+							throw new Exception("Failed to insert document " . ($doc_index + 1));
+						}
+					}
                     
                     $db->commit();
                     $success_count++;
@@ -131,11 +283,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['jsonl_file'])) {
         if ($success_count > 0) {
             $message = "Upload thành công! Đã xử lý $success_count item(s)";
             
-            // Log activity
-            logActivity($db, $_SESSION['user_id'], 'upload_jsonl', 'document', null, [
-                'success_count' => $success_count,
-                'error_count' => $error_count
-            ]);
+            // Log activity if function exists
+            if (function_exists('logActivity')) {
+                logActivity($db, $_SESSION['user_id'], 'upload_jsonl', 'document', null, [
+                    'success_count' => $success_count,
+                    'error_count' => $error_count
+                ]);
+            }
         }
         if ($error_count > 0) {
             $error = "Có $error_count lỗi xảy ra";
@@ -152,7 +306,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['jsonl_file'])) {
     }
 }
 
-// Handle manual document upload
+// Handle manual document upload (keep existing logic)
 if ($_POST && isset($_POST['action']) && $_POST['action'] === 'upload_documents') {
     $upload_type = $_POST['upload_type'];
     
@@ -171,13 +325,48 @@ if ($_POST && isset($_POST['action']) && $_POST['action'] === 'upload_documents'
                 throw new Exception("Vui lòng điền đầy đủ thông tin");
             }
             
-            $query = "INSERT INTO documents (title, content, ai_summary, type, created_by, created_at) 
-                     VALUES (?, ?, ?, 'single', ?, NOW())";
+            // Check columns exist
+            $columns_query = $db->query("SHOW COLUMNS FROM documents");
+            $existing_columns = [];
+            while ($col = $columns_query->fetch(PDO::FETCH_ASSOC)) {
+                $existing_columns[] = $col['Field'];
+            }
+            
+            // Build dynamic query
+            $insert_columns = ['title', 'content'];
+            $insert_values = [$title, $content];
+            $placeholders = '?, ?';
+            
+            if (in_array('ai_summary', $existing_columns)) {
+                $insert_columns[] = 'ai_summary';
+                $insert_values[] = $summary;
+                $placeholders .= ', ?';
+            }
+            
+            if (in_array('type', $existing_columns)) {
+                $insert_columns[] = 'type';
+                $insert_values[] = 'single';
+                $placeholders .= ', ?';
+            }
+            
+            if (in_array('created_by', $existing_columns)) {
+                $insert_columns[] = 'created_by';
+                $insert_values[] = $_SESSION['user_id'];
+                $placeholders .= ', ?';
+            } elseif (in_array('uploaded_by', $existing_columns)) {
+                $insert_columns[] = 'uploaded_by';
+                $insert_values[] = $_SESSION['user_id'];
+                $placeholders .= ', ?';
+            }
+            
+            $query = "INSERT INTO documents (" . implode(', ', $insert_columns) . ", created_at) VALUES (" . $placeholders . ", NOW())";
             $stmt = $db->prepare($query);
             
-            if ($stmt->execute([$title, $content, $summary, $_SESSION['user_id']])) {
+            if ($stmt->execute($insert_values)) {
                 $message = "Upload văn bản đơn thành công!";
-                logActivity($db, $_SESSION['user_id'], 'upload_single_document', 'document', $db->lastInsertId());
+                if (function_exists('logActivity')) {
+                    logActivity($db, $_SESSION['user_id'], 'upload_single_document', 'document', $db->lastInsertId());
+                }
             } else {
                 throw new Exception("Không thể lưu văn bản");
             }
@@ -195,6 +384,22 @@ if ($_POST && isset($_POST['action']) && $_POST['action'] === 'upload_documents'
             
             // Start transaction
             $db->beginTransaction();
+            
+            // Check if document_groups table exists
+            $check_table = $db->query("SHOW TABLES LIKE 'document_groups'");
+            if ($check_table->rowCount() == 0) {
+                // Create table if not exists
+                $create_table = "CREATE TABLE IF NOT EXISTS document_groups (
+                    id int(11) NOT NULL AUTO_INCREMENT,
+                    title varchar(255) NOT NULL,
+                    description text,
+                    ai_summary text,
+                    created_by int(11) DEFAULT 1,
+                    created_at timestamp DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+                $db->exec($create_table);
+            }
             
             // Insert document group
             $query = "INSERT INTO document_groups (title, description, ai_summary, created_by, created_at) 
@@ -217,11 +422,44 @@ if ($_POST && isset($_POST['action']) && $_POST['action'] === 'upload_documents'
                         $content = file_get_contents($_FILES['doc_file']['tmp_name'][$i]);
                     }
                     
-                    $query = "INSERT INTO documents (title, content, type, group_id, created_by, created_at) 
-                             VALUES (?, ?, 'multi', ?, ?, NOW())";
+                    // Check columns exist
+                    $columns_query = $db->query("SHOW COLUMNS FROM documents");
+                    $existing_columns = [];
+                    while ($col = $columns_query->fetch(PDO::FETCH_ASSOC)) {
+                        $existing_columns[] = $col['Field'];
+                    }
+                    
+                    // Build dynamic query
+                    $insert_columns = ['title', 'content'];
+                    $insert_values = [trim($doc_titles[$i]), $content];
+                    $placeholders = '?, ?';
+                    
+                    if (in_array('type', $existing_columns)) {
+                        $insert_columns[] = 'type';
+                        $insert_values[] = 'multi';
+                        $placeholders .= ', ?';
+                    }
+                    
+                    if (in_array('group_id', $existing_columns)) {
+                        $insert_columns[] = 'group_id';
+                        $insert_values[] = $group_id;
+                        $placeholders .= ', ?';
+                    }
+                    
+                    if (in_array('created_by', $existing_columns)) {
+                        $insert_columns[] = 'created_by';
+                        $insert_values[] = $_SESSION['user_id'];
+                        $placeholders .= ', ?';
+                    } elseif (in_array('uploaded_by', $existing_columns)) {
+                        $insert_columns[] = 'uploaded_by';
+                        $insert_values[] = $_SESSION['user_id'];
+                        $placeholders .= ', ?';
+                    }
+                    
+                    $query = "INSERT INTO documents (" . implode(', ', $insert_columns) . ", created_at) VALUES (" . $placeholders . ", NOW())";
                     $stmt = $db->prepare($query);
                     
-                    if ($stmt->execute([trim($doc_titles[$i]), $content, $group_id, $_SESSION['user_id']])) {
+                    if ($stmt->execute($insert_values)) {
                         $doc_count++;
                     }
                 }
@@ -230,7 +468,9 @@ if ($_POST && isset($_POST['action']) && $_POST['action'] === 'upload_documents'
             if ($doc_count > 0) {
                 $db->commit();
                 $message = "Upload nhóm văn bản thành công! Đã thêm $doc_count văn bản";
-                logActivity($db, $_SESSION['user_id'], 'upload_multi_documents', 'document_group', $group_id);
+                if (function_exists('logActivity')) {
+                    logActivity($db, $_SESSION['user_id'], 'upload_multi_documents', 'document_group', $group_id);
+                }
             } else {
                 $db->rollBack();
                 throw new Exception("Không có văn bản nào được thêm");
@@ -244,16 +484,37 @@ if ($_POST && isset($_POST['action']) && $_POST['action'] === 'upload_documents'
     }
 }
 
-// Get statistics
-$query = "SELECT 
-    (SELECT COUNT(*) FROM documents WHERE type = 'single') as single_docs,
-    (SELECT COUNT(*) FROM document_groups) as multi_groups,
-    (SELECT COUNT(*) FROM documents WHERE type = 'multi') as multi_docs,
-    (SELECT COUNT(*) FROM labeling_tasks WHERE status = 'pending') as pending_tasks,
-    (SELECT COUNT(*) FROM labeling_tasks WHERE status = 'completed') as completed_tasks";
-$stmt = $db->prepare($query);
-$stmt->execute();
-$stats = $stmt->fetch(PDO::FETCH_ASSOC);
+// Get statistics with error handling
+try {
+    $query = "SELECT 
+        (SELECT COUNT(*) FROM documents WHERE type = 'single' OR type IS NULL) as single_docs,
+        (SELECT COUNT(*) FROM document_groups) as multi_groups,
+        (SELECT COUNT(*) FROM documents WHERE type = 'multi') as multi_docs,
+        (SELECT COUNT(*) FROM labeling_tasks WHERE status = 'pending') as pending_tasks,
+        (SELECT COUNT(*) FROM labeling_tasks WHERE status = 'completed') as completed_tasks";
+    $stmt = $db->prepare($query);
+    $stmt->execute();
+    $stats = $stmt->fetch(PDO::FETCH_ASSOC);
+} catch (Exception $e) {
+    // Fallback statistics if some tables don't exist
+    $stats = [
+        'single_docs' => 0,
+        'multi_groups' => 0,
+        'multi_docs' => 0,
+        'pending_tasks' => 0,
+        'completed_tasks' => 0
+    ];
+    
+    try {
+        $stmt = $db->query("SELECT COUNT(*) as count FROM documents");
+        $stats['single_docs'] = $stmt->fetch()['count'];
+    } catch (Exception $e) {}
+    
+    try {
+        $stmt = $db->query("SELECT COUNT(*) as count FROM labeling_tasks");
+        $stats['pending_tasks'] = $stmt->fetch()['count'];
+    } catch (Exception $e) {}
+}
 
 ?>
 <!DOCTYPE html>
@@ -642,3 +903,250 @@ $stats = $stmt->fetch(PDO::FETCH_ASSOC);
                                                 </div>
                                             </div>
                                         </div>
+                                        <div class="col-md-4">
+                                            <div class="card">
+                                                <div class="card-header bg-success text-white">
+                                                    <h6 class="mb-0"><i class="fas fa-robot me-2"></i>Bản tóm tắt AI chung</h6>
+                                                </div>
+                                                <div class="card-body">
+                                                    <textarea class="form-control" name="group_summary" rows="15" placeholder="Nhập bản tóm tắt AI cho toàn bộ nhóm văn bản..." required></textarea>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div class="text-center mt-4">
+                                    <button type="button" class="btn btn-secondary me-3" onclick="goToStep(1)">
+                                        <i class="fas fa-arrow-left me-2"></i>Quay lại
+                                    </button>
+                                    <button type="button" class="btn btn-primary" onclick="goToStep(3)">
+                                        Xem trước <i class="fas fa-arrow-right ms-2"></i>
+                                    </button>
+                                </div>
+                            </form>
+                        </div>
+
+                        <!-- Step 3: Review and Submit -->
+                        <div class="upload-step" id="upload-step-3" style="display: none;">
+                            <h4 class="text-center mb-4">Bước 3: Xem trước và xác nhận</h4>
+                            
+                            <div class="card">
+                                <div class="card-header bg-warning text-dark">
+                                    <h6 class="mb-0"><i class="fas fa-eye me-2"></i>Xem trước dữ liệu</h6>
+                                </div>
+                                <div class="card-body" id="preview-content">
+                                    <!-- Preview will be generated here -->
+                                </div>
+                            </div>
+
+                            <div class="text-center mt-4">
+                                <button type="button" class="btn btn-secondary me-3" onclick="goToStep(2)">
+                                    <i class="fas fa-arrow-left me-2"></i>Sửa đổi
+                                </button>
+                                <button type="button" class="btn btn-success btn-lg" onclick="submitForm()">
+                                    <i class="fas fa-check me-2"></i>Xác nhận Upload
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
+    <script>
+        let selectedUploadType = '';
+        let documentCount = 1;
+
+        function selectUploadType(type) {
+            selectedUploadType = type;
+            
+            // Update UI
+            document.querySelectorAll('.upload-type-card').forEach(card => {
+                card.classList.remove('selected');
+            });
+            document.querySelector(`[data-type="${type}"]`).classList.add('selected');
+            
+            // Show next button
+            document.getElementById('next-to-step-2').style.display = 'block';
+            
+            // Set hidden input
+            document.getElementById('upload-type').value = type;
+        }
+
+        function goToStep(step) {
+            // Hide all steps
+            document.querySelectorAll('.upload-step').forEach(stepDiv => {
+                stepDiv.style.display = 'none';
+            });
+            
+            // Update step indicators
+            document.querySelectorAll('.step').forEach(stepIndicator => {
+                stepIndicator.classList.remove('active', 'completed');
+            });
+            
+            // Show current step and update indicators
+            document.getElementById(`upload-step-${step}`).style.display = 'block';
+            
+            for (let i = 1; i < step; i++) {
+                document.getElementById(`step-${i}`).classList.add('completed');
+            }
+            document.getElementById(`step-${step}`).classList.add('active');
+            
+            // Show appropriate upload form
+            if (step === 2) {
+                if (selectedUploadType === 'single') {
+                    document.getElementById('single-upload').style.display = 'block';
+                    document.getElementById('multi-upload').style.display = 'none';
+                } else {
+                    document.getElementById('single-upload').style.display = 'none';
+                    document.getElementById('multi-upload').style.display = 'block';
+                }
+            }
+            
+            // Generate preview if step 3
+            if (step === 3) {
+                generatePreview();
+            }
+        }
+
+        function addDocument() {
+            documentCount++;
+            const container = document.getElementById('documents-container');
+            
+            const newDoc = document.createElement('div');
+            newDoc.className = 'document-item';
+            newDoc.setAttribute('data-doc-index', documentCount);
+            
+            newDoc.innerHTML = `
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h6 class="mb-0"><i class="fas fa-file-text me-2"></i>Văn bản #${documentCount}</h6>
+                    <button type="button" class="btn btn-sm btn-outline-danger" onclick="removeDocument(${documentCount})">
+                        <i class="fas fa-trash"></i>
+                    </button>
+                </div>
+                
+                <div class="row">
+                    <div class="col-md-6">
+                        <div class="mb-3">
+                            <label class="form-label">Tiêu đề</label>
+                            <input type="text" class="form-control" name="doc_title[]" placeholder="Tiêu đề văn bản...">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Upload file</label>
+                            <input type="file" class="form-control" name="doc_file[]" accept=".txt,.docx">
+                        </div>
+                    </div>
+                    <div class="col-md-6">
+                        <div class="mb-3">
+                            <label class="form-label">Nội dung</label>
+                            <textarea class="form-control" name="doc_content[]" rows="6" placeholder="Hoặc nhập nội dung trực tiếp..."></textarea>
+                        </div>
+                    </div>
+                </div>
+            `;
+            
+            container.appendChild(newDoc);
+            
+            // Show remove buttons for all documents except first
+            document.querySelectorAll('.document-item').forEach((item, index) => {
+                const removeBtn = item.querySelector('.btn-outline-danger');
+                if (index > 0) {
+                    removeBtn.style.display = 'block';
+                }
+            });
+        }
+
+        function removeDocument(index) {
+            const docElement = document.querySelector(`[data-doc-index="${index}"]`);
+            if (docElement) {
+                docElement.remove();
+                
+                // Update numbering
+                document.querySelectorAll('.document-item').forEach((item, idx) => {
+                    const title = item.querySelector('h6');
+                    title.innerHTML = `<i class="fas fa-file-text me-2"></i>Văn bản #${idx + 1}`;
+                    item.setAttribute('data-doc-index', idx + 1);
+                });
+                
+                documentCount = document.querySelectorAll('.document-item').length;
+                
+                // Hide remove button for first document if only one left
+                if (documentCount === 1) {
+                    document.querySelector('.btn-outline-danger').style.display = 'none';
+                }
+            }
+        }
+
+        function generatePreview() {
+            const previewContent = document.getElementById('preview-content');
+            let html = '';
+            
+            if (selectedUploadType === 'single') {
+                const title = document.querySelector('[name="single_title"]').value;
+                const content = document.querySelector('[name="single_content"]').value;
+                const summary = document.querySelector('[name="single_summary"]').value;
+                
+                html = `
+                    <h5><i class="fas fa-file-text me-2"></i>${title || 'Chưa nhập tiêu đề'}</h5>
+                    <p><strong>Loại:</strong> Văn bản đơn</p>
+                    <p><strong>Nội dung:</strong> ${content ? content.substring(0, 200) + '...' : 'Chưa nhập nội dung'}</p>
+                    <p><strong>Bản tóm tắt AI:</strong> ${summary ? summary.substring(0, 200) + '...' : 'Chưa nhập tóm tắt'}</p>
+                `;
+            } else {
+                const groupTitle = document.querySelector('[name="group_title"]').value;
+                const groupDesc = document.querySelector('[name="group_description"]').value;
+                const groupSummary = document.querySelector('[name="group_summary"]').value;
+                const docTitles = document.querySelectorAll('[name="doc_title[]"]');
+                
+                html = `
+                    <h5><i class="fas fa-copy me-2"></i>${groupTitle || 'Chưa nhập tiêu đề nhóm'}</h5>
+                    <p><strong>Loại:</strong> Đa văn bản</p>
+                    <p><strong>Mô tả:</strong> ${groupDesc || 'Chưa có mô tả'}</p>
+                    <p><strong>Số văn bản:</strong> ${docTitles.length}</p>
+                    <p><strong>Danh sách văn bản:</strong></p>
+                    <ul>
+                `;
+                
+                docTitles.forEach((titleInput, index) => {
+                    html += `<li>${titleInput.value || 'Văn bản ' + (index + 1)}</li>`;
+                });
+                
+                html += `
+                    </ul>
+                    <p><strong>Bản tóm tắt AI chung:</strong> ${groupSummary ? groupSummary.substring(0, 200) + '...' : 'Chưa nhập tóm tắt'}</p>
+                `;
+            }
+            
+            previewContent.innerHTML = html;
+        }
+
+        function submitForm() {
+            document.getElementById('manual-upload-form').submit();
+        }
+
+        // Auto-save functionality
+        setInterval(() => {
+            // Auto-save form data to localStorage
+            const formData = new FormData(document.getElementById('manual-upload-form'));
+            const data = {};
+            for (let [key, value] of formData.entries()) {
+                data[key] = value;
+            }
+            localStorage.setItem('upload_form_backup', JSON.stringify(data));
+        }, 30000); // Save every 30 seconds
+
+        // Load saved data on page load
+        window.addEventListener('load', () => {
+            const savedData = localStorage.getItem('upload_form_backup');
+            if (savedData) {
+                // Optionally restore form data
+                console.log('Backup data available');
+            }
+        });
+    </script>
+</body>
+</html>
+                        
