@@ -372,46 +372,128 @@ if ($_POST && isset($_POST['action']) && $_POST['action'] === 'upload_documents'
             }
             
         } else if ($upload_type === 'multi') {
-            $group_title = trim($_POST['group_title']);
-            $group_description = trim($_POST['group_description']);
-            $group_summary = trim($_POST['group_summary']);
-            $doc_titles = $_POST['doc_title'];
-            $doc_contents = $_POST['doc_content'];
+            $columns_query = $db->query("SHOW COLUMNS FROM documents");
+			$existing_columns = [];
+			while ($col = $columns_query->fetch(PDO::FETCH_ASSOC)) {
+				$existing_columns[] = $col['Field'];
+			}
+			
+			// FIXED: Handle nested documents format
+			if (!isset($data['group_title']) && !isset($data['group_name'])) {
+				throw new Exception("Thiếu trường bắt buộc: group_title hoặc group_name");
+			}
+			
+			if (!isset($data['documents']) || !is_array($data['documents'])) {
+				throw new Exception("Thiếu trường bắt buộc: documents (phải là array)");
+			}
+			
+			// FIXED: Check if documents array is empty
+			if (empty($data['documents'])) {
+				throw new Exception("Không có documents trong multi-document group");
+			}
+			
+			// Start transaction
+			$db->beginTransaction();
+			
+			// Create document_groups table if not exists
+			$check_table = $db->query("SHOW TABLES LIKE 'document_groups'");
+			if ($check_table->rowCount() == 0) {
+				$create_table = "CREATE TABLE IF NOT EXISTS document_groups (
+					id int(11) NOT NULL AUTO_INCREMENT,
+					group_name varchar(255) NOT NULL,
+					title varchar(255) NOT NULL,
+					description text,
+					ai_summary text,
+					combined_ai_summary text,
+					created_by int(11) DEFAULT 1,
+					created_at timestamp DEFAULT CURRENT_TIMESTAMP,
+					updated_at timestamp DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+					status enum('pending','assigned','completed','reviewed') DEFAULT 'pending',
+					total_documents int DEFAULT 0,
+					PRIMARY KEY (id)
+				) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci";
+				$db->exec($create_table);
+			}
+			
+			// Extract group info
+			$group_title = $data['group_title'] ?? $data['group_name'] ?? 'Multi-Document Group ' . date('Y-m-d H:i:s');
+			$group_description = $data['group_description'] ?? $data['description'] ?? 'Auto-generated group description';
+			
+			// Lấy summary cho nhóm từ nhiều trường có thể
+			$group_summary = $data['group_summary'] ?? $data['ai_summary'] ?? $data['combined_ai_summary'] ?? '';
+			
+			// Nếu không có summary, tạo summary mặc định
+			if (empty($group_summary)) {
+				$group_summary = "Nhóm văn bản về: " . $group_title . ". Bao gồm " . count($data['documents']) . " văn bản liên quan.";
+			}
+			
+			$documents = $data['documents'];
+			
+			// Insert group - check which columns exist
+			$group_columns_query = $db->query("SHOW COLUMNS FROM document_groups");
+			$group_existing_columns = [];
+			while ($col = $group_columns_query->fetch(PDO::FETCH_ASSOC)) {
+				$group_existing_columns[] = $col['Field'];
+			}
+			
+			// Build INSERT query for group - FIXED: Use title instead of group_name if available
+			$group_insert_columns = ['created_by'];
+			$group_insert_values = [$_SESSION['user_id']];
+			$group_placeholders = '?';
+			
+			// Add title if column exists
+			if (in_array('title', $group_existing_columns)) {
+				$group_insert_columns[] = 'title';
+				$group_insert_values[] = $group_title;
+				$group_placeholders .= ', ?';
+			}
+			
+			// Add group_name if column exists (fallback)
+			if (in_array('group_name', $group_existing_columns)) {
+				$group_insert_columns[] = 'group_name';
+				$group_insert_values[] = $group_title;
+				$group_placeholders .= ', ?';
+			}
+			
+			// Add description if column exists
+			if (in_array('description', $group_existing_columns)) {
+				$group_insert_columns[] = 'description';
+				$group_insert_values[] = $group_description;
+				$group_placeholders .= ', ?';
+			}
+			
+			// Add ai_summary if column exists
+			if (in_array('ai_summary', $group_existing_columns)) {
+				$group_insert_columns[] = 'ai_summary';
+				$group_insert_values[] = $group_summary;
+				$group_placeholders .= ', ?';
+			}
+			
+			// Add combined_ai_summary if column exists (backup)
+			if (in_array('combined_ai_summary', $group_existing_columns)) {
+				$group_insert_columns[] = 'combined_ai_summary';
+				$group_insert_values[] = $group_summary;
+				$group_placeholders .= ', ?';
+			}
+			
+			// Add total_documents if column exists
+			if (in_array('total_documents', $group_existing_columns)) {
+				$group_insert_columns[] = 'total_documents';
+				$group_insert_values[] = count($documents);
+				$group_placeholders .= ', ?';
+			}
+			
+			$query = "INSERT INTO document_groups (" . implode(', ', $group_insert_columns) . ", created_at) VALUES (" . $group_placeholders . ", NOW())";
+			$stmt = $db->prepare($query);
+			$result = $stmt->execute($group_insert_values);
+			
+			if (!$result) {
+				throw new Exception("Failed to insert document group");
+			}
+			
+			$group_id = $db->lastInsertId();
             
-            if (empty($group_title) || empty($group_summary)) {
-                throw new Exception("Vui lòng điền đầy đủ thông tin nhóm");
-            }
-            
-            // Start transaction
-            $db->beginTransaction();
-            
-            // Check if document_groups table exists
-            $check_table = $db->query("SHOW TABLES LIKE 'document_groups'");
-            if ($check_table->rowCount() == 0) {
-                // Create table if not exists
-                $create_table = "CREATE TABLE IF NOT EXISTS document_groups (
-                    id int(11) NOT NULL AUTO_INCREMENT,
-                    title varchar(255) NOT NULL,
-                    description text,
-                    ai_summary text,
-                    created_by int(11) DEFAULT 1,
-                    created_at timestamp DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (id)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
-                $db->exec($create_table);
-            }
-            
-            // Insert document group
-            $query = "INSERT INTO document_groups (title, description, ai_summary, created_by, created_at) 
-                     VALUES (?, ?, ?, ?, NOW())";
-            $stmt = $db->prepare($query);
-            
-            if (!$stmt->execute([$group_title, $group_description, $group_summary, $_SESSION['user_id']])) {
-                throw new Exception("Không thể tạo nhóm văn bản");
-            }
-            
-            $group_id = $db->lastInsertId();
-            $doc_count = 0;
+			$doc_count = 0;
             
             // Insert individual documents
             for ($i = 0; $i < count($doc_titles); $i++) {
