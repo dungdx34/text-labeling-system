@@ -1,70 +1,35 @@
 <?php
-// Start session and error handling
+// Bắt lỗi và khởi tạo session an toàn
 if (session_status() == PHP_SESSION_NONE) {
     session_start();
 }
 
+require_once '../includes/auth.php';
 require_once '../config/database.php';
 
-// Simple auth check - no external functions needed
-if (!isset($_SESSION['user_id']) || $_SESSION['role'] !== 'reviewer') {
-    header('Location: ../login.php');
-    exit();
-}
+// Kiểm tra quyền reviewer
+requireRole('reviewer');
 
 $database = new Database();
 $db = $database->getConnection();
-$current_user_id = $_SESSION['user_id'];
-
-// Get current user info
-try {
-    $stmt = $db->prepare("SELECT * FROM users WHERE id = ?");
-    $stmt->execute([$current_user_id]);
-    $current_user = $stmt->fetch(PDO::FETCH_ASSOC);
-    if (!$current_user) {
-        session_destroy();
-        header('Location: ../login.php');
-        exit();
-    }
-} catch (Exception $e) {
-    die("Database error: " . $e->getMessage());
-}
+$current_user = getCurrentUser();
 
 $error_message = '';
 $success_message = '';
 
-// Handle actions
+// Xử lý actions
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['action'])) {
     try {
         if ($_POST['action'] == 'update_review') {
-            // Create reviews table if it doesn't exist
-            try {
-                $create_reviews_table = "CREATE TABLE IF NOT EXISTS reviews (
-                    id int(11) NOT NULL AUTO_INCREMENT,
-                    assignment_id int(11) NOT NULL,
-                    reviewer_id int(11) NOT NULL,
-                    rating int(11) DEFAULT NULL,
-                    comments text,
-                    status enum('pending','approved','rejected','needs_revision') DEFAULT 'pending',
-                    feedback longtext,
-                    created_at timestamp DEFAULT CURRENT_TIMESTAMP,
-                    updated_at timestamp DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                    PRIMARY KEY (id),
-                    UNIQUE KEY unique_assignment_reviewer (assignment_id, reviewer_id)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
-                $db->exec($create_reviews_table);
-            } catch (Exception $e) {
-                // Table already exists or creation failed
-            }
-            
             $review_id = intval($_POST['review_id']);
             $rating = intval($_POST['rating']);
             $comments = trim($_POST['comments']);
             $status = $_POST['status'];
             
-            $query = "UPDATE reviews SET rating = ?, comments = ?, status = ? WHERE id = ? AND reviewer_id = ?";
+            $query = "UPDATE reviews SET rating = ?, comments = ?, status = ?, updated_at = CURRENT_TIMESTAMP 
+                      WHERE id = ? AND reviewer_id = ?";
             $stmt = $db->prepare($query);
-            $stmt->execute([$rating, $comments, $status, $review_id, $current_user_id]);
+            $stmt->execute([$rating, $comments, $status, $review_id, $current_user['id']]);
             
             $success_message = 'Cập nhật review thành công!';
         }
@@ -74,7 +39,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['action'])) {
             
             $query = "DELETE FROM reviews WHERE id = ? AND reviewer_id = ?";
             $stmt = $db->prepare($query);
-            $stmt->execute([$review_id, $current_user_id]);
+            $stmt->execute([$review_id, $current_user['id']]);
             
             $success_message = 'Xóa review thành công!';
         }
@@ -83,7 +48,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['action'])) {
     }
 }
 
-// Get reviews list
+// Lấy danh sách reviews
 $filter_status = $_GET['status'] ?? '';
 $page = isset($_GET['page']) ? intval($_GET['page']) : 1;
 $limit = 10;
@@ -91,88 +56,61 @@ $offset = ($page - 1) * $limit;
 
 $reviews = [];
 try {
-    // Check if reviews table exists first
-    $table_check = $db->query("SHOW TABLES LIKE 'reviews'");
-    if ($table_check->rowCount() == 0) {
-        // Reviews table doesn't exist - show empty state
-        $reviews = [];
-        $total_records = 0;
-        $total_pages = 0;
-    } else {
-        $where_clause = "r.reviewer_id = ?";
-        $params = [$current_user_id];
-        
-        if (!empty($filter_status)) {
-            $where_clause .= " AND r.status = ?";
-            $params[] = $filter_status;
-        }
-        
-        // Count total records
-        $count_query = "SELECT COUNT(*) as total FROM reviews r WHERE $where_clause";
-        $stmt = $db->prepare($count_query);
-        $stmt->execute($params);
-        $total_records = $stmt->fetch()['total'];
-        $total_pages = ceil($total_records / $limit);
-        
-        // Get reviews with assignment info
-        $query = "SELECT r.*, a.id as assignment_id,
-                         CASE 
-                             WHEN a.document_id IS NOT NULL AND a.document_id > 0 THEN d.title 
-                             WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN dg.group_name 
-                             ELSE 'Untitled'
-                         END as document_title,
-                         CASE 
-                             WHEN a.document_id IS NOT NULL AND a.document_id > 0 THEN 'single' 
-                             WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN 'multi' 
-                             ELSE 'single'
-                         END as assignment_type,
-                         u.full_name as labeler_name
-                  FROM reviews r
-                  JOIN assignments a ON r.assignment_id = a.id
-                  LEFT JOIN documents d ON a.document_id = d.id
-                  LEFT JOIN document_groups dg ON a.group_id = dg.id
-                  JOIN users u ON a.user_id = u.id
-                  WHERE $where_clause 
-                  ORDER BY r.id DESC 
-                  LIMIT $limit OFFSET $offset";
-                  
-        $stmt = $db->prepare($query);
-        $stmt->execute($params);
-        $reviews = $stmt->fetchAll(PDO::FETCH_ASSOC);
-        
-        // Add dummy data for missing fields
-        foreach ($reviews as &$review) {
-            $review['step1_completed'] = 1;
-            $review['step2_completed'] = 1; 
-            $review['step3_completed'] = 1;
-            $review['writing_style'] = $review['writing_style'] ?? '';
-            $review['completed_at'] = $review['updated_at'] ?? $review['created_at'];
-        }
+    $where_clause = "r.reviewer_id = ?";
+    $params = [$current_user['id']];
+    
+    if (!empty($filter_status)) {
+        $where_clause .= " AND r.status = ?";
+        $params[] = $filter_status;
     }
+    
+    // Đếm tổng số records
+    $count_query = "SELECT COUNT(*) as total FROM reviews r WHERE $where_clause";
+    $stmt = $db->prepare($count_query);
+    $stmt->execute($params);
+    $total_records = $stmt->fetch()['total'];
+    $total_pages = ceil($total_records / $limit);
+    
+    // Lấy reviews với thông tin assignment
+    $query = "SELECT r.*, a.id as assignment_id, a.type as assignment_type,
+                     CASE 
+                         WHEN a.type = 'single' THEN d.title 
+                         WHEN a.type = 'multi' THEN dg.title 
+                     END as document_title,
+                     u.full_name as labeler_name,
+                     lr.step1_completed, lr.step2_completed, lr.step3_completed,
+                     lr.writing_style, lr.completed_at
+              FROM reviews r
+              JOIN assignments a ON r.assignment_id = a.id
+              LEFT JOIN documents d ON a.document_id = d.id AND a.type = 'single'
+              LEFT JOIN document_groups dg ON a.group_id = dg.id AND a.type = 'multi'
+              JOIN users u ON a.user_id = u.id
+              LEFT JOIN labeling_results lr ON a.id = lr.assignment_id
+              WHERE $where_clause 
+              ORDER BY r.created_at DESC 
+              LIMIT $limit OFFSET $offset";
+              
+    $stmt = $db->prepare($query);
+    $stmt->execute($params);
+    $reviews = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    
 } catch (Exception $e) {
     $error_message = 'Lỗi khi lấy danh sách reviews: ' . $e->getMessage();
-    $reviews = [];
-    $total_records = 0;
-    $total_pages = 0;
 }
 
-// Statistics  
+// Thống kê
 $stats = [];
 try {
-    if (!empty($reviews) || ($table_check && $table_check->rowCount() > 0)) {
-        $query = "SELECT 
-                    COUNT(*) as total,
-                    AVG(rating) as avg_rating,
-                    SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) as approved,
-                    SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) as rejected,
-                    SUM(CASE WHEN status = 'needs_revision' THEN 1 ELSE 0 END) as needs_revision
-                  FROM reviews WHERE reviewer_id = ?";
-        $stmt = $db->prepare($query);
-        $stmt->execute([$current_user_id]);
-        $stats = $stmt->fetch(PDO::FETCH_ASSOC);
-    } else {
-        $stats = ['total' => 0, 'avg_rating' => 0, 'approved' => 0, 'rejected' => 0, 'needs_revision' => 0];
-    }
+    $query = "SELECT 
+                COUNT(*) as total,
+                AVG(rating) as avg_rating,
+                SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) as approved,
+                SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) as rejected,
+                SUM(CASE WHEN status = 'needs_revision' THEN 1 ELSE 0 END) as needs_revision
+              FROM reviews WHERE reviewer_id = ?";
+    $stmt = $db->prepare($query);
+    $stmt->execute([$current_user['id']]);
+    $stats = $stmt->fetch(PDO::FETCH_ASSOC);
 } catch (Exception $e) {
     $stats = ['total' => 0, 'avg_rating' => 0, 'approved' => 0, 'rejected' => 0, 'needs_revision' => 0];
 }
@@ -449,7 +387,7 @@ try {
                                     </td>
                                     <td>
                                         <small><?php echo date('d/m/Y H:i', strtotime($review['created_at'])); ?></small>
-                                        <?php if (isset($review['updated_at']) && $review['updated_at'] != $review['created_at']): ?>
+                                        <?php if ($review['updated_at'] != $review['created_at']): ?>
                                             <small class="text-muted d-block">Sửa: <?php echo date('d/m/Y H:i', strtotime($review['updated_at'])); ?></small>
                                         <?php endif; ?>
                                     </td>

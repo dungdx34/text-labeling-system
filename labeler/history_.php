@@ -1,99 +1,70 @@
 <?php
-// Start session and error handling
+// Bắt lỗi và khởi tạo session an toàn
 if (session_status() == PHP_SESSION_NONE) {
     session_start();
 }
 
+require_once '../includes/auth.php';
 require_once '../config/database.php';
 
-// Simple auth check - no external functions needed
-if (!isset($_SESSION['user_id']) || $_SESSION['role'] !== 'labeler') {
-    header('Location: ../login.php');
-    exit();
-}
+// Kiểm tra quyền labeler
+requireRole('labeler');
 
 $database = new Database();
 $db = $database->getConnection();
-$current_user_id = $_SESSION['user_id'];
-
-// Get current user info
-try {
-    $stmt = $db->prepare("SELECT * FROM users WHERE id = ?");
-    $stmt->execute([$current_user_id]);
-    $current_user = $stmt->fetch(PDO::FETCH_ASSOC);
-    if (!$current_user) {
-        session_destroy();
-        header('Location: ../login.php');
-        exit();
-    }
-} catch (Exception $e) {
-    die("Database error: " . $e->getMessage());
-}
+$current_user = getCurrentUser();
 
 $error_message = '';
 
-// Get assignment history
+// Lấy lịch sử assignments
 $assignments = [];
 $page = isset($_GET['page']) ? intval($_GET['page']) : 1;
 $limit = 10;
 $offset = ($page - 1) * $limit;
 
 try {
-    // Count total records
+    // Đếm tổng số records
     $count_query = "SELECT COUNT(*) as total FROM assignments WHERE user_id = ?";
     $stmt = $db->prepare($count_query);
-    $stmt->execute([$current_user_id]);
+    $stmt->execute([$current_user['id']]);
     $total_records = $stmt->fetch()['total'];
     $total_pages = ceil($total_records / $limit);
     
-    // Get assignments with detailed info
+    // Lấy assignments với thông tin chi tiết
     $query = "SELECT a.*, 
                      CASE 
-                         WHEN a.document_id IS NOT NULL AND a.document_id > 0 THEN d.title 
-                         WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN dg.group_name 
-                         ELSE 'Untitled'
+                         WHEN a.type = 'single' THEN d.title 
+                         WHEN a.type = 'multi' THEN dg.title 
                      END as title,
                      CASE 
-                         WHEN a.document_id IS NOT NULL AND a.document_id > 0 THEN d.content 
-                         WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN dg.description 
-                         ELSE 'No content'
+                         WHEN a.type = 'single' THEN d.content 
+                         WHEN a.type = 'multi' THEN dg.description 
                      END as content,
-                     CASE 
-                         WHEN a.document_id IS NOT NULL AND a.document_id > 0 THEN 'single' 
-                         WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN 'multi' 
-                         ELSE 'single'
-                     END as type,
-                     admin.full_name as assigned_by_name
+                     admin.full_name as assigned_by_name,
+                     lr.step1_completed, lr.step2_completed, lr.step3_completed,
+                     lr.writing_style, lr.completed_at,
+                     r.rating, r.comments as review_comments, r.status as review_status,
+                     reviewer.full_name as reviewer_name
               FROM assignments a 
-              LEFT JOIN documents d ON a.document_id = d.id
-              LEFT JOIN document_groups dg ON a.group_id = dg.id
+              LEFT JOIN documents d ON a.document_id = d.id AND a.type = 'single'
+              LEFT JOIN document_groups dg ON a.group_id = dg.id AND a.type = 'multi'
               LEFT JOIN users admin ON a.assigned_by = admin.id
+              LEFT JOIN labeling_results lr ON a.id = lr.assignment_id
+              LEFT JOIN reviews r ON a.id = r.assignment_id
+              LEFT JOIN users reviewer ON r.reviewer_id = reviewer.id
               WHERE a.user_id = ? 
-              ORDER BY a.id DESC 
+              ORDER BY a.updated_at DESC 
               LIMIT $limit OFFSET $offset";
               
     $stmt = $db->prepare($query);
-    $stmt->execute([$current_user_id]);
+    $stmt->execute([$current_user['id']]);
     $assignments = $stmt->fetchAll(PDO::FETCH_ASSOC);
-    
-    // Add dummy progress data if labeling_results table doesn't exist
-    foreach ($assignments as &$assignment) {
-        $assignment['step1_completed'] = 0;
-        $assignment['step2_completed'] = 0;
-        $assignment['step3_completed'] = 0;
-        $assignment['writing_style'] = '';
-        $assignment['completed_at'] = null;
-        $assignment['rating'] = null;
-        $assignment['review_comments'] = null;
-        $assignment['review_status'] = null;
-        $assignment['reviewer_name'] = null;
-    }
     
 } catch (Exception $e) {
     $error_message = 'Lỗi khi lấy lịch sử: ' . $e->getMessage();
 }
 
-// Overall statistics
+// Thống kê tổng quan
 $stats = [];
 try {
     $query = "SELECT 
@@ -102,7 +73,7 @@ try {
                 AVG(CASE WHEN status = 'completed' THEN TIMESTAMPDIFF(HOUR, created_at, updated_at) ELSE NULL END) as avg_hours
               FROM assignments WHERE user_id = ?";
     $stmt = $db->prepare($query);
-    $stmt->execute([$current_user_id]);
+    $stmt->execute([$current_user['id']]);
     $stats = $stmt->fetch(PDO::FETCH_ASSOC);
 } catch (Exception $e) {
     $stats = ['total' => 0, 'completed' => 0, 'avg_hours' => 0];

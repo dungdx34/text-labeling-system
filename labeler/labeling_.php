@@ -1,631 +1,792 @@
 <?php
-session_start();
+// Bắt lỗi và khởi tạo session an toàn
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
 
-// Include files in correct order (database first, then functions)
+if (session_status() == PHP_SESSION_NONE) {
+    session_start();
+}
+
+require_once '../includes/auth.php';
 require_once '../config/database.php';
-require_once '../includes/functions.php';
 
-// Check authentication using function from functions.php
+// Kiểm tra quyền labeler
 requireRole('labeler');
 
-$user_id = $_SESSION['user_id'];
-$username = $_SESSION['username'] ?? 'Unknown';
+$database = new Database();
+$db = $database->getConnection();
+$current_user = getCurrentUser();
 
-// Get group_id from URL
-$group_id = isset($_GET['group_id']) ? (int)$_GET['group_id'] : 0;
+$error_message = '';
+$success_message = '';
+$assignment = null;
+$documents = [];
+$view_only = isset($_GET['view']) && $_GET['view'] == '1';
 
-if (!$group_id) {
-    header('Location: dashboard.php?error=no_group_id');
-    exit();
+// Lấy assignment ID
+$assignment_id = $_GET['id'] ?? null;
+
+if (!$assignment_id) {
+    // Nếu không có ID cụ thể, lấy assignment đầu tiên chưa hoàn thành
+    try {
+        $query = "SELECT id FROM assignments WHERE user_id = ? AND status IN ('pending', 'in_progress') ORDER BY created_at ASC LIMIT 1";
+        $stmt = $db->prepare($query);
+        $stmt->execute([$current_user['id']]);
+        $result = $stmt->fetch();
+        
+        if ($result) {
+            $assignment_id = $result['id'];
+        } else {
+            $error_message = 'Không có công việc nào để gán nhãn.';
+        }
+    } catch (Exception $e) {
+        $error_message = 'Lỗi khi tìm công việc: ' . $e->getMessage();
+    }
 }
 
-try {
-    // Get document group info
-    $group = getDocumentGroup($group_id);
-    
-    if (!$group) {
-        header('Location: dashboard.php?error=group_not_found');
-        exit();
+// Lấy thông tin assignment
+if ($assignment_id) {
+    try {
+        $query = "SELECT a.*, 
+                         CASE 
+                             WHEN a.type = 'single' THEN d.title 
+                             WHEN a.type = 'multi' THEN dg.title 
+                         END as title,
+                         CASE 
+                             WHEN a.type = 'single' THEN d.ai_summary 
+                             WHEN a.type = 'multi' THEN dg.ai_summary 
+                         END as ai_summary,
+                         admin.full_name as assigned_by_name
+                  FROM assignments a 
+                  LEFT JOIN documents d ON a.document_id = d.id AND a.type = 'single'
+                  LEFT JOIN document_groups dg ON a.group_id = dg.id AND a.type = 'multi'
+                  LEFT JOIN users admin ON a.assigned_by = admin.id
+                  WHERE a.id = ? AND a.user_id = ?";
+                  
+        $stmt = $db->prepare($query);
+        $stmt->execute([$assignment_id, $current_user['id']]);
+        $assignment = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if (!$assignment) {
+            $error_message = 'Không tìm thấy công việc hoặc bạn không có quyền truy cập.';
+        } else {
+            // Lấy documents liên quan
+            if ($assignment['type'] == 'single') {
+                $query = "SELECT * FROM documents WHERE id = ?";
+                $stmt = $db->prepare($query);
+                $stmt->execute([$assignment['document_id']]);
+                $documents = [$stmt->fetch(PDO::FETCH_ASSOC)];
+            } else {
+                $query = "SELECT d.* FROM documents d 
+                          JOIN group_documents gd ON d.id = gd.document_id 
+                          WHERE gd.group_id = ? 
+                          ORDER BY gd.order_index";
+                $stmt = $db->prepare($query);
+                $stmt->execute([$assignment['group_id']]);
+                $documents = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            }
+            
+            // Lấy kết quả gán nhãn hiện có
+            $query = "SELECT * FROM labeling_results WHERE assignment_id = ?";
+            $stmt = $db->prepare($query);
+            $stmt->execute([$assignment_id]);
+            $existing_results = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            
+            // Tạo map kết quả theo document_id
+            $results_map = [];
+            foreach ($existing_results as $result) {
+                $results_map[$result['document_id']] = $result;
+            }
+        }
+    } catch (Exception $e) {
+        $error_message = 'Lỗi khi lấy thông tin assignment: ' . $e->getMessage();
     }
-    
-    // Check if user is assigned to this group
-    if ($group['assigned_labeler'] != $user_id) {
-        header('Location: dashboard.php?error=not_assigned');
-        exit();
-    }
-    
-    // Get documents in this group
-    $documents = getDocumentsByGroup($group_id);
-    
-    // Check if labeling already exists
-    $existing_labeling = getLabeling($group_id, $user_id);
-    
-    // Initialize variables
-    $selected_sentences = [];
-    $edited_summary = $group['ai_summary'];
-    $text_style = '';
-    
-    if ($existing_labeling) {
-        $selected_sentences = json_decode($existing_labeling['selected_sentences'] ?? '[]', true);
-        $edited_summary = $existing_labeling['edited_summary'] ?? $group['ai_summary'];
-        $text_style = $existing_labeling['text_style'] ?? '';
-    }
+}
 
-} catch (Exception $e) {
-    $error_message = "Lỗi khi tải dữ liệu: " . $e->getMessage();
+// Xử lý lưu kết quả
+if ($_SERVER['REQUEST_METHOD'] == 'POST' && !$view_only) {
+    try {
+        $action = $_POST['action'] ?? '';
+        
+        if ($action == 'save_labeling') {
+            $document_id = intval($_POST['document_id']);
+            $selected_sentences = $_POST['selected_sentences'] ?? '[]';
+            $writing_style = $_POST['writing_style'] ?? '';
+            $edited_summary = $_POST['edited_summary'] ?? '';
+            $step1_completed = isset($_POST['step1_completed']) ? 1 : 0;
+            $step2_completed = isset($_POST['step2_completed']) ? 1 : 0;
+            $step3_completed = isset($_POST['step3_completed']) ? 1 : 0;
+            
+            // Check if result exists
+            $query = "SELECT id FROM labeling_results WHERE assignment_id = ? AND document_id = ?";
+            $stmt = $db->prepare($query);
+            $stmt->execute([$assignment_id, $document_id]);
+            $existing = $stmt->fetch();
+            
+            if ($existing) {
+                // Update
+                $query = "UPDATE labeling_results SET 
+                          selected_sentences = ?, writing_style = ?, edited_summary = ?,
+                          step1_completed = ?, step2_completed = ?, step3_completed = ?,
+                          auto_saved_at = CURRENT_TIMESTAMP,
+                          completed_at = CASE WHEN ? = 1 AND ? = 1 AND ? = 1 THEN CURRENT_TIMESTAMP ELSE completed_at END
+                          WHERE assignment_id = ? AND document_id = ?";
+                $stmt = $db->prepare($query);
+                $stmt->execute([
+                    $selected_sentences, $writing_style, $edited_summary,
+                    $step1_completed, $step2_completed, $step3_completed,
+                    $step1_completed, $step2_completed, $step3_completed,
+                    $assignment_id, $document_id
+                ]);
+            } else {
+                // Insert
+                $query = "INSERT INTO labeling_results 
+                          (assignment_id, document_id, selected_sentences, writing_style, edited_summary,
+                           step1_completed, step2_completed, step3_completed, auto_saved_at,
+                           completed_at)
+                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 
+                                  CASE WHEN ? = 1 AND ? = 1 AND ? = 1 THEN CURRENT_TIMESTAMP ELSE NULL END)";
+                $stmt = $db->prepare($query);
+                $stmt->execute([
+                    $assignment_id, $document_id, $selected_sentences, $writing_style, $edited_summary,
+                    $step1_completed, $step2_completed, $step3_completed,
+                    $step1_completed, $step2_completed, $step3_completed
+                ]);
+            }
+            
+            // Cập nhật status của assignment nếu tất cả steps hoàn thành
+            if ($step1_completed && $step2_completed && $step3_completed) {
+                $query = "UPDATE assignments SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE id = ?";
+                $stmt = $db->prepare($query);
+                $stmt->execute([$assignment_id]);
+            } else {
+                $query = "UPDATE assignments SET status = 'in_progress', updated_at = CURRENT_TIMESTAMP WHERE id = ?";
+                $stmt = $db->prepare($query);
+                $stmt->execute([$assignment_id]);
+            }
+            
+            $success_message = 'Lưu kết quả gán nhãn thành công!';
+            
+            // Reload data
+            header("Location: labeling.php?id=$assignment_id&saved=1");
+            exit();
+        }
+    } catch (Exception $e) {
+        $error_message = 'Lỗi khi lưu: ' . $e->getMessage();
+    }
+}
+
+if (isset($_GET['saved'])) {
+    $success_message = 'Đã lưu thành công!';
 }
 ?>
-
 <!DOCTYPE html>
 <html lang="vi">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Gán nhãn văn bản - Text Labeling System</title>
+    <title>Gán nhãn - Text Labeling System</title>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
-    <link href="../css/style.css" rel="stylesheet">
     <style>
+        body { 
+            background: #f8f9fa; 
+            font-family: 'Segoe UI', sans-serif; 
+        }
+        .sidebar {
+            background: linear-gradient(135deg, #28a745 0%, #20c997 100%);
+            min-height: 100vh;
+            position: fixed;
+            left: 0;
+            top: 0;
+            width: 250px;
+            padding: 20px 0;
+            z-index: 1000;
+        }
+        .main-content {
+            margin-left: 250px;
+            padding: 20px;
+        }
+        .nav-link {
+            color: rgba(255,255,255,0.8);
+            padding: 12px 25px;
+            border-radius: 0;
+            transition: all 0.3s ease;
+        }
+        .nav-link:hover, .nav-link.active {
+            background: rgba(255,255,255,0.1);
+            color: white;
+            transform: translateX(5px);
+        }
+        .labeling-container {
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        .step-header {
+            background: linear-gradient(135deg, #007bff 0%, #6610f2 100%);
+            color: white;
+            padding: 20px;
+            text-align: center;
+        }
+        .step-content {
+            padding: 30px;
+        }
         .sentence {
-            padding: 8px 12px;
-            margin: 4px 0;
+            padding: 10px;
+            margin: 5px 0;
             border-radius: 8px;
             cursor: pointer;
             transition: all 0.3s ease;
             border: 2px solid transparent;
-            line-height: 1.6;
-            background-color: #f8f9fa;
         }
         .sentence:hover {
-            background-color: #e9ecef;
-            border-color: #007bff;
+            background: #f8f9fa;
+            border-color: #dee2e6;
         }
         .sentence.selected {
-            background-color: #d4edda;
-            border-color: #28a745;
-            color: #155724;
+            background: #e3f2fd;
+            border-color: #2196f3;
+            color: #1976d2;
         }
-        .summary-editor {
-            min-height: 300px;
-            resize: vertical;
-            border: 2px solid #dee2e6;
-            border-radius: 10px;
-            padding: 15px;
+        .document-tab {
+            background: white;
+            border: 1px solid #dee2e6;
+            border-bottom: none;
+            padding: 15px 20px;
+            cursor: pointer;
+            transition: all 0.3s ease;
         }
-        .summary-editor:focus {
-            border-color: #007bff;
-            box-shadow: 0 0 0 0.2rem rgba(0,123,255,.25);
+        .document-tab.active {
+            background: #007bff;
+            color: white;
         }
-        .progress-step {
+        .progress-indicator {
             display: flex;
             justify-content: center;
-            margin: 30px 0;
+            margin: 20px 0;
         }
-        .step {
+        .progress-step {
             width: 40px;
             height: 40px;
             border-radius: 50%;
             background: #e9ecef;
-            color: #6c757d;
             display: flex;
             align-items: center;
             justify-content: center;
             margin: 0 10px;
+            color: #6c757d;
             font-weight: bold;
-            transition: all 0.3s ease;
         }
-        .step.active {
+        .progress-step.completed {
+            background: #28a745;
+            color: white;
+        }
+        .progress-step.active {
             background: #007bff;
             color: white;
         }
-        .step.completed {
+        .writing-style-option {
+            border: 2px solid #dee2e6;
+            border-radius: 10px;
+            padding: 15px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin: 10px;
+        }
+        .writing-style-option:hover {
+            border-color: #007bff;
+            background: #f8f9ff;
+        }
+        .writing-style-option.selected {
+            border-color: #007bff;
+            background: #e3f2fd;
+            color: #1976d2;
+        }
+        .auto-save-indicator {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            padding: 10px 15px;
             background: #28a745;
             color: white;
+            border-radius: 20px;
+            display: none;
+            z-index: 1100;
         }
     </style>
 </head>
 <body>
-    <?php include '../includes/header.php'; ?>
+    <!-- Auto-save indicator -->
+    <div id="autoSaveIndicator" class="auto-save-indicator">
+        <i class="fas fa-check me-2"></i>Đã lưu tự động
+    </div>
 
-    <div class="container-fluid">
-        <div class="row">
-            <!-- Sidebar -->
-            <nav class="col-md-3 col-lg-2 d-md-block bg-light sidebar">
-                <div class="position-sticky pt-3">
-                    <ul class="nav flex-column">
-                        <li class="nav-item">
-                            <a class="nav-link" href="dashboard.php">
-                                <i class="fas fa-tachometer-alt me-2"></i>Dashboard
-                            </a>
-                        </li>
-                        <li class="nav-item">
-                            <a class="nav-link" href="my_tasks.php">
-                                <i class="fas fa-tasks me-2"></i>My Tasks
-                            </a>
-                        </li>
-                        <li class="nav-item">
-                            <a class="nav-link active" href="labeling.php">
-                                <i class="fas fa-edit me-2"></i>Labeling
-                            </a>
-                        </li>
-                        <li class="nav-item">
-                            <a class="nav-link" href="multi_labeling.php">
-                                <i class="fas fa-copy me-2"></i>Multi Labeling
-                            </a>
-                        </li>
-                    </ul>
+    <!-- Sidebar -->
+    <nav class="sidebar">
+        <div class="text-center text-white mb-4">
+            <i class="fas fa-user-edit fa-2x mb-2"></i>
+            <h5>Labeler Panel</h5>
+            <small>Xin chào, <?php echo htmlspecialchars($current_user['full_name']); ?></small>
+        </div>
+        
+        <ul class="nav flex-column">
+            <li class="nav-item">
+                <a class="nav-link" href="dashboard.php">
+                    <i class="fas fa-tachometer-alt me-2"></i>Dashboard
+                </a>
+            </li>
+            <li class="nav-item">
+                <a class="nav-link" href="my_tasks.php">
+                    <i class="fas fa-tasks me-2"></i>Công việc của tôi
+                </a>
+            </li>
+            <li class="nav-item">
+                <a class="nav-link active" href="labeling.php">
+                    <i class="fas fa-edit me-2"></i>Gán nhãn
+                </a>
+            </li>
+            <li class="nav-item">
+                <a class="nav-link" href="history.php">
+                    <i class="fas fa-history me-2"></i>Lịch sử
+                </a>
+            </li>
+            <li class="nav-item mt-3">
+                <a class="nav-link" href="../logout.php">
+                    <i class="fas fa-sign-out-alt me-2"></i>Đăng xuất
+                </a>
+            </li>
+        </ul>
+    </nav>
+
+    <!-- Main Content -->
+    <div class="main-content">
+        <?php if ($error_message): ?>
+            <div class="alert alert-danger">
+                <i class="fas fa-exclamation-circle me-2"></i><?php echo $error_message; ?>
+                <div class="mt-2">
+                    <a href="my_tasks.php" class="btn btn-outline-primary">← Quay lại danh sách công việc</a>
                 </div>
-            </nav>
-
-            <!-- Main content -->
-            <main class="col-md-9 ms-sm-auto col-lg-10 px-md-4">
-                <div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
-                    <h1 class="h2">
-                        <i class="fas fa-edit me-2 text-primary"></i>
-                        Gán nhãn văn bản
-                    </h1>
-                    <div class="btn-toolbar mb-2 mb-md-0">
-                        <a href="dashboard.php" class="btn btn-outline-secondary">
-                            <i class="fas fa-arrow-left me-2"></i>Quay lại Dashboard
-                        </a>
-                    </div>
+            </div>
+        <?php elseif ($assignment): ?>
+            
+            <div class="d-flex justify-content-between align-items-center mb-4">
+                <div>
+                    <h2 class="text-dark">Gán nhãn: <?php echo htmlspecialchars($assignment['title']); ?></h2>
+                    <small class="text-muted">
+                        Assignment #<?php echo $assignment['id']; ?> • 
+                        <?php echo $assignment['type'] == 'single' ? 'Đơn văn bản' : 'Đa văn bản'; ?>
+                        <?php if ($view_only): ?>
+                            • <span class="badge bg-secondary">Chế độ xem</span>
+                        <?php endif; ?>
+                    </small>
                 </div>
+                <div>
+                    <a href="my_tasks.php" class="btn btn-outline-secondary me-2">
+                        <i class="fas fa-arrow-left me-2"></i>Quay lại
+                    </a>
+                    <?php if (!$view_only): ?>
+                        <button type="button" class="btn btn-success" onclick="saveAll()">
+                            <i class="fas fa-save me-2"></i>Lưu tất cả
+                        </button>
+                    <?php endif; ?>
+                </div>
+            </div>
 
-                <?php if (isset($error_message)): ?>
-                    <div class="alert alert-danger" role="alert">
-                        <i class="fas fa-exclamation-triangle me-2"></i>
-                        <?php echo $error_message; ?>
-                    </div>
-                <?php endif; ?>
+            <?php if ($success_message): ?>
+                <div class="alert alert-success alert-dismissible fade show">
+                    <i class="fas fa-check-circle me-2"></i><?php echo $success_message; ?>
+                    <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                </div>
+            <?php endif; ?>
 
-                <!-- Group Information -->
-                <div class="card mb-4">
-                    <div class="card-header bg-primary text-white">
-                        <h5 class="mb-0">
-                            <i class="fas fa-info-circle me-2"></i>
-                            Thông tin văn bản
-                        </h5>
-                    </div>
-                    <div class="card-body">
-                        <div class="row">
-                            <div class="col-md-8">
-                                <h6 class="text-primary">Tiêu đề:</h6>
-                                <p class="mb-2"><strong><?php echo htmlspecialchars($group['title']); ?></strong></p>
-                                
-                                <h6 class="text-primary">Mô tả:</h6>
-                                <p class="mb-2"><?php echo htmlspecialchars($group['description'] ?? ''); ?></p>
-                            </div>
-                            <div class="col-md-4">
-                                <h6 class="text-primary">Thông tin khác:</h6>
-                                <p class="mb-1"><strong>Loại:</strong> <?php echo $group['group_type'] === 'multi' ? 'Đa văn bản' : 'Đơn văn bản'; ?></p>
-                                <p class="mb-1"><strong>Số văn bản:</strong> <?php echo count($documents); ?></p>
-                                <p class="mb-0"><strong>Ngày tạo:</strong> <?php echo date('d/m/Y H:i', strtotime($group['created_at'])); ?></p>
-                            </div>
+            <!-- Document Tabs (for multi-document) -->
+            <?php if (count($documents) > 1): ?>
+                <div class="d-flex mb-3">
+                    <?php foreach ($documents as $index => $doc): ?>
+                        <div class="document-tab <?php echo $index == 0 ? 'active' : ''; ?>" 
+                             onclick="switchDocument(<?php echo $index; ?>)" 
+                             id="tab-<?php echo $index; ?>">
+                            <i class="fas fa-file-text me-2"></i>
+                            <?php echo htmlspecialchars(substr($doc['title'], 0, 20)); ?>
+                            <?php if (strlen($doc['title']) > 20): ?>...<?php endif; ?>
                         </div>
-                    </div>
+                    <?php endforeach; ?>
                 </div>
+            <?php endif; ?>
 
-                <!-- Progress Steps -->
-                <div class="progress-step">
-                    <div class="step active" id="step-1">1</div>
-                    <div class="step" id="step-2">2</div>
-                    <div class="step" id="step-3">3</div>
-                </div>
-
-                <!-- Navigation Tabs -->
-                <ul class="nav nav-tabs" id="labelingTabs" role="tablist">
-                    <li class="nav-item" role="presentation">
-                        <button class="nav-link active" id="step1-tab" data-bs-toggle="tab" data-bs-target="#step1" type="button">
-                            <i class="fas fa-mouse-pointer me-2"></i>Bước 1: Chọn câu quan trọng
-                        </button>
-                    </li>
-                    <li class="nav-item" role="presentation">
-                        <button class="nav-link" id="step2-tab" data-bs-toggle="tab" data-bs-target="#step2" type="button">
-                            <i class="fas fa-palette me-2"></i>Bước 2: Xác định phong cách
-                        </button>
-                    </li>
-                    <li class="nav-item" role="presentation">
-                        <button class="nav-link" id="step3-tab" data-bs-toggle="tab" data-bs-target="#step3" type="button">
-                            <i class="fas fa-edit me-2"></i>Bước 3: Chỉnh sửa tóm tắt
-                        </button>
-                    </li>
-                </ul>
-
-                <!-- Tab Content -->
-                <div class="tab-content" id="labelingTabContent">
-                    <!-- Step 1: Select Important Sentences -->
-                    <div class="tab-pane fade show active" id="step1" role="tabpanel">
-                        <div class="row">
-                            <div class="col-md-8">
-                                <!-- Documents -->
-                                <?php if (!empty($documents)): ?>
-                                    <?php foreach ($documents as $index => $document): ?>
-                                        <div class="card mb-3">
-                                            <div class="card-header bg-light">
-                                                <h6 class="mb-0">
-                                                    <i class="fas fa-file-text me-2"></i>
-                                                    <?php echo htmlspecialchars($document['title']); ?>
-                                                </h6>
-                                            </div>
-                                            <div class="card-body">
-                                                <div class="document-content" data-document-id="<?php echo $document['id']; ?>">
-                                                    <?php
-                                                    $sentences = preg_split('/(?<=[.!?])\s+/', $document['content'], -1, PREG_SPLIT_NO_EMPTY);
-                                                    foreach ($sentences as $sentence_index => $sentence):
-                                                        $sentence_id = $document['id'] . '_' . $sentence_index;
-                                                        $is_selected = in_array($sentence_id, $selected_sentences);
-                                                    ?>
-                                                        <div class="sentence <?php echo $is_selected ? 'selected' : ''; ?>" 
-                                                             data-sentence-id="<?php echo $sentence_id; ?>"
-                                                             data-document-id="<?php echo $document['id']; ?>"
-                                                             data-sentence-index="<?php echo $sentence_index; ?>">
-                                                            <?php echo htmlspecialchars(trim($sentence)); ?>
-                                                        </div>
-                                                    <?php endforeach; ?>
-                                                </div>
-                                            </div>
-                                        </div>
-                                    <?php endforeach; ?>
-                                <?php else: ?>
-                                    <div class="alert alert-warning">
-                                        <i class="fas fa-exclamation-triangle me-2"></i>
-                                        Không có văn bản nào trong nhóm này.
-                                    </div>
-                                <?php endif; ?>
-                            </div>
-
-                            <div class="col-md-4">
-                                <!-- Selected Sentences Summary -->
-                                <div class="card">
-                                    <div class="card-header bg-success text-white">
-                                        <h6 class="mb-0">
-                                            <i class="fas fa-list me-2"></i>
-                                            Câu đã chọn (<span id="selected-count">0</span>)
-                                        </h6>
-                                    </div>
-                                    <div class="card-body">
-                                        <div id="selected-sentences-summary">
-                                            <div class="text-muted text-center py-3">
-                                                <i class="fas fa-info-circle me-2"></i>
-                                                Chưa chọn câu nào
-                                            </div>
-                                        </div>
-                                        <div class="mt-3">
-                                            <button type="button" class="btn btn-primary w-100" onclick="goToStep(2)">
-                                                Tiếp theo <i class="fas fa-arrow-right ms-2"></i>
-                                            </button>
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
+            <!-- Labeling Interface -->
+            <?php foreach ($documents as $doc_index => $document): ?>
+                <div class="document-container <?php echo $doc_index == 0 ? '' : 'd-none'; ?>" id="document-<?php echo $doc_index; ?>">
+                    <div class="labeling-container">
+                        
+                        <!-- Progress Indicator -->
+                        <div class="progress-indicator">
+                            <?php 
+                            $result = $results_map[$document['id']] ?? null;
+                            $step1 = $result['step1_completed'] ?? false;
+                            $step2 = $result['step2_completed'] ?? false;
+                            $step3 = $result['step3_completed'] ?? false;
+                            ?>
+                            <div class="progress-step <?php echo $step1 ? 'completed' : 'active'; ?>">1</div>
+                            <div class="progress-step <?php echo $step2 ? 'completed' : ($step1 ? 'active' : ''); ?>">2</div>
+                            <div class="progress-step <?php echo $step3 ? 'completed' : ($step2 ? 'active' : ''); ?>">3</div>
                         </div>
-                    </div>
 
-                    <!-- Step 2: Text Style -->
-                    <div class="tab-pane fade" id="step2" role="tabpanel">
-                        <div class="card">
-                            <div class="card-header bg-warning text-dark">
-                                <h5 class="mb-0">
-                                    <i class="fas fa-palette me-2"></i>
-                                    Xác định phong cách văn bản
-                                </h5>
+                        <!-- Step 1: Select Important Sentences -->
+                        <div class="step-section" id="step1-<?php echo $doc_index; ?>">
+                            <div class="step-header">
+                                <h4><i class="fas fa-mouse-pointer me-2"></i>Bước 1: Chọn câu quan trọng</h4>
+                                <p class="mb-0">Click vào các câu quan trọng trong văn bản</p>
                             </div>
-                            <div class="card-body">
+                            <div class="step-content">
                                 <div class="row">
-                                    <div class="col-md-6">
-                                        <h6>Chọn phong cách văn bản phù hợp:</h6>
-                                        <div class="form-check mb-3">
-                                            <input class="form-check-input" type="radio" name="text_style" id="formal" value="formal" <?php echo $text_style === 'formal' ? 'checked' : ''; ?>>
-                                            <label class="form-check-label" for="formal">
-                                                <strong>Trang trọng</strong> - Ngôn ngữ chính thức, khách quan
-                                            </label>
-                                        </div>
-                                        <div class="form-check mb-3">
-                                            <input class="form-check-input" type="radio" name="text_style" id="informal" value="informal" <?php echo $text_style === 'informal' ? 'checked' : ''; ?>>
-                                            <label class="form-check-label" for="informal">
-                                                <strong>Thân thiện</strong> - Ngôn ngữ gần gụi, dễ hiểu
-                                            </label>
-                                        </div>
-                                        <div class="form-check mb-3">
-                                            <input class="form-check-input" type="radio" name="text_style" id="academic" value="academic" <?php echo $text_style === 'academic' ? 'checked' : ''; ?>>
-                                            <label class="form-check-label" for="academic">
-                                                <strong>Học thuật</strong> - Ngôn ngữ chuyên môn, chi tiết
-                                            </label>
-                                        </div>
-                                        <div class="form-check mb-3">
-                                            <input class="form-check-input" type="radio" name="text_style" id="news" value="news" <?php echo $text_style === 'news' ? 'checked' : ''; ?>>
-                                            <label class="form-check-label" for="news">
-                                                <strong>Báo chí</strong> - Ngôn ngữ tin tức, súc tích
-                                            </label>
+                                    <div class="col-md-8">
+                                        <h6>Nội dung văn bản:</h6>
+                                        <div class="border rounded p-3" style="max-height: 400px; overflow-y: auto;">
+                                            <div id="sentences-<?php echo $doc_index; ?>">
+                                                <?php 
+                                                $sentences = preg_split('/(?<=[.!?])\s+/', $document['content']);
+                                                foreach ($sentences as $i => $sentence):
+                                                    if (trim($sentence)):
+                                                ?>
+                                                    <div class="sentence" data-doc="<?php echo $doc_index; ?>" data-sentence="<?php echo $i; ?>" onclick="toggleSentence(this)">
+                                                        <?php echo htmlspecialchars(trim($sentence)); ?>
+                                                    </div>
+                                                <?php 
+                                                    endif;
+                                                endforeach; 
+                                                ?>
+                                            </div>
                                         </div>
                                     </div>
-                                    <div class="col-md-6">
-                                        <h6>Hướng dẫn:</h6>
-                                        <div class="alert alert-info">
-                                            <ul class="mb-0">
-                                                <li><strong>Trang trọng:</strong> Phù hợp với văn bản công việc, báo cáo</li>
-                                                <li><strong>Thân thiện:</strong> Phù hợp với blog, bài viết cá nhân</li>
-                                                <li><strong>Học thuật:</strong> Phù hợp với nghiên cứu, luận văn</li>
-                                                <li><strong>Báo chí:</strong> Phù hợp với tin tức, bài viết truyền thông</li>
-                                            </ul>
+                                    <div class="col-md-4">
+                                        <h6>Câu đã chọn:</h6>
+                                        <div class="border rounded p-3" style="max-height: 400px; overflow-y: auto;">
+                                            <div id="selected-sentences-<?php echo $doc_index; ?>" class="text-muted">
+                                                Chưa có câu nào được chọn
+                                            </div>
+                                        </div>
+                                        <button type="button" class="btn btn-outline-danger btn-sm mt-2" onclick="clearSelections(<?php echo $doc_index; ?>)">
+                                            <i class="fas fa-eraser me-1"></i>Xóa tất cả
+                                        </button>
+                                    </div>
+                                </div>
+                                <div class="text-end mt-3">
+                                    <button type="button" class="btn btn-primary" onclick="completeStep(1, <?php echo $doc_index; ?>)">
+                                        Hoàn thành bước 1 <i class="fas fa-arrow-right ms-2"></i>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Step 2: Choose Writing Style -->
+                        <div class="step-section d-none" id="step2-<?php echo $doc_index; ?>">
+                            <div class="step-header">
+                                <h4><i class="fas fa-palette me-2"></i>Bước 2: Chọn phong cách văn bản</h4>
+                                <p class="mb-0">Chọn phong cách phù hợp cho bản tóm tắt</p>
+                            </div>
+                            <div class="step-content">
+                                <div class="row">
+                                    <div class="col-md-3">
+                                        <div class="writing-style-option" data-style="formal" onclick="selectStyle('formal', <?php echo $doc_index; ?>)">
+                                            <i class="fas fa-university fa-2x mb-2"></i>
+                                            <h6>Trang trọng</h6>
+                                            <small>Phù hợp cho báo cáo, tài liệu chính thức</small>
+                                        </div>
+                                    </div>
+                                    <div class="col-md-3">
+                                        <div class="writing-style-option" data-style="casual" onclick="selectStyle('casual', <?php echo $doc_index; ?>)">
+                                            <i class="fas fa-comments fa-2x mb-2"></i>
+                                            <h6>Thân thiện</h6>
+                                            <small>Phù hợp cho blog, bài viết cá nhân</small>
+                                        </div>
+                                    </div>
+                                    <div class="col-md-3">
+                                        <div class="writing-style-option" data-style="technical" onclick="selectStyle('technical', <?php echo $doc_index; ?>)">
+                                            <i class="fas fa-cogs fa-2x mb-2"></i>
+                                            <h6>Kỹ thuật</h6>
+                                            <small>Phù hợp cho tài liệu chuyên môn</small>
+                                        </div>
+                                    </div>
+                                    <div class="col-md-3">
+                                        <div class="writing-style-option" data-style="news" onclick="selectStyle('news', <?php echo $doc_index; ?>)">
+                                            <i class="fas fa-newspaper fa-2x mb-2"></i>
+                                            <h6>Tin tức</h6>
+                                            <small>Phù hợp cho báo chí, thông tin</small>
                                         </div>
                                     </div>
                                 </div>
-                                <div class="d-flex justify-content-between mt-4">
-                                    <button type="button" class="btn btn-outline-secondary" onclick="goToStep(1)">
+                                <div class="text-end mt-3">
+                                    <button type="button" class="btn btn-outline-secondary me-2" onclick="showStep(1, <?php echo $doc_index; ?>)">
                                         <i class="fas fa-arrow-left me-2"></i>Quay lại
                                     </button>
-                                    <button type="button" class="btn btn-primary" onclick="goToStep(3)">
-                                        Tiếp theo <i class="fas fa-arrow-right ms-2"></i>
+                                    <button type="button" class="btn btn-primary" onclick="completeStep(2, <?php echo $doc_index; ?>)" disabled id="step2-complete-<?php echo $doc_index; ?>">
+                                        Hoàn thành bước 2 <i class="fas fa-arrow-right ms-2"></i>
                                     </button>
                                 </div>
                             </div>
                         </div>
-                    </div>
 
-                    <!-- Step 3: Edit Summary -->
-                    <div class="tab-pane fade" id="step3" role="tabpanel">
-                        <div class="row">
-                            <div class="col-md-6">
-                                <div class="card">
-                                    <div class="card-header bg-secondary text-white">
-                                        <h6 class="mb-0">
-                                            <i class="fas fa-robot me-2"></i>
-                                            Bản tóm tắt AI gốc
-                                        </h6>
-                                    </div>
-                                    <div class="card-body">
-                                        <div class="border rounded p-3 bg-light" style="min-height: 300px;">
-                                            <?php echo nl2br(htmlspecialchars($group['ai_summary'])); ?>
+                        <!-- Step 3: Edit Summary -->
+                        <div class="step-section d-none" id="step3-<?php echo $doc_index; ?>">
+                            <div class="step-header">
+                                <h4><i class="fas fa-edit me-2"></i>Bước 3: Chỉnh sửa bản tóm tắt</h4>
+                                <p class="mb-0">Chỉnh sửa bản tóm tắt AI dựa trên các câu đã chọn</p>
+                            </div>
+                            <div class="step-content">
+                                <div class="row">
+                                    <div class="col-md-6">
+                                        <h6>Bản tóm tắt AI gốc:</h6>
+                                        <div class="border rounded p-3 bg-light" style="max-height: 300px; overflow-y: auto;">
+                                            <?php echo htmlspecialchars($document['ai_summary']); ?>
                                         </div>
                                     </div>
+                                    <div class="col-md-6">
+                                        <h6>Bản tóm tắt đã chỉnh sửa:</h6>
+                                        <textarea class="form-control" id="edited-summary-<?php echo $doc_index; ?>" rows="12" 
+                                                  placeholder="Chỉnh sửa bản tóm tắt dựa trên các câu quan trọng đã chọn..."
+                                                  <?php echo $view_only ? 'readonly' : ''; ?>><?php echo htmlspecialchars($result['edited_summary'] ?? $document['ai_summary']); ?></textarea>
+                                    </div>
                                 </div>
-                            </div>
-
-                            <div class="col-md-6">
-                                <div class="card">
-                                    <div class="card-header bg-primary text-white">
-                                        <h6 class="mb-0">
-                                            <i class="fas fa-edit me-2"></i>
-                                            Bản tóm tắt đã chỉnh sửa
-                                        </h6>
-                                    </div>
-                                    <div class="card-body p-0">
-                                        <textarea class="summary-editor border-0 w-100" 
-                                                  id="edited-summary" 
-                                                  placeholder="Chỉnh sửa bản tóm tắt dựa trên các câu đã chọn và phong cách đã xác định..."><?php echo htmlspecialchars($edited_summary); ?></textarea>
-                                    </div>
+                                <div class="text-end mt-3">
+                                    <button type="button" class="btn btn-outline-secondary me-2" onclick="showStep(2, <?php echo $doc_index; ?>)">
+                                        <i class="fas fa-arrow-left me-2"></i>Quay lại
+                                    </button>
+                                    <?php if (!$view_only): ?>
+                                        <button type="button" class="btn btn-success" onclick="completeStep(3, <?php echo $doc_index; ?>)">
+                                            <i class="fas fa-check me-2"></i>Hoàn thành gán nhãn
+                                        </button>
+                                    <?php endif; ?>
                                 </div>
                             </div>
                         </div>
 
-                        <div class="d-flex justify-content-between mt-4">
-                            <button type="button" class="btn btn-outline-secondary" onclick="goToStep(2)">
-                                <i class="fas fa-arrow-left me-2"></i>Quay lại
-                            </button>
-                            <div>
-                                <button type="button" class="btn btn-success me-2" onclick="saveDraft()">
-                                    <i class="fas fa-save me-2"></i>Lưu nháp
-                                </button>
-                                <button type="button" class="btn btn-primary" onclick="completeLabeling()">
-                                    <i class="fas fa-check me-2"></i>Hoàn thành
-                                </button>
-                            </div>
-                        </div>
                     </div>
                 </div>
-            </main>
-        </div>
+            <?php endforeach; ?>
+
+        <?php endif; ?>
     </div>
+
+    <!-- Hidden forms for saving -->
+    <?php foreach ($documents as $doc_index => $document): ?>
+        <form id="save-form-<?php echo $doc_index; ?>" method="POST" style="display: none;">
+            <input type="hidden" name="action" value="save_labeling">
+            <input type="hidden" name="document_id" value="<?php echo $document['id']; ?>">
+            <input type="hidden" name="selected_sentences" id="form-selected-sentences-<?php echo $doc_index; ?>">
+            <input type="hidden" name="writing_style" id="form-writing-style-<?php echo $doc_index; ?>">
+            <input type="hidden" name="edited_summary" id="form-edited-summary-<?php echo $doc_index; ?>">
+            <input type="hidden" name="step1_completed" id="form-step1-<?php echo $doc_index; ?>">
+            <input type="hidden" name="step2_completed" id="form-step2-<?php echo $doc_index; ?>">
+            <input type="hidden" name="step3_completed" id="form-step3-<?php echo $doc_index; ?>">
+        </form>
+    <?php endforeach; ?>
 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
     <script>
-        let selectedSentences = <?php echo json_encode($selected_sentences); ?>;
-        let autoSaveTimer;
+        let currentDocument = 0;
+        let selectedSentences = {};
+        let writingStyles = {};
+        let completedSteps = {};
 
-        // Initialize page
+        // Initialize data from PHP
+        <?php foreach ($documents as $doc_index => $document): ?>
+            selectedSentences[<?php echo $doc_index; ?>] = <?php 
+                $result = $results_map[$document['id']] ?? null;
+                echo $result['selected_sentences'] ?? '[]'; 
+            ?>;
+            writingStyles[<?php echo $doc_index; ?>] = '<?php echo $result['writing_style'] ?? ''; ?>';
+            completedSteps[<?php echo $doc_index; ?>] = {
+                step1: <?php echo $result['step1_completed'] ? 'true' : 'false'; ?>,
+                step2: <?php echo $result['step2_completed'] ? 'true' : 'false'; ?>,
+                step3: <?php echo $result['step3_completed'] ? 'true' : 'false'; ?>
+            };
+        <?php endforeach; ?>
+
+        // Initialize interface
         document.addEventListener('DOMContentLoaded', function() {
-            updateSelectedSentencesDisplay();
-            setupAutoSave();
-        });
-
-        // Sentence selection
-        document.addEventListener('click', function(e) {
-            if (e.target.classList.contains('sentence')) {
-                const sentenceId = e.target.getAttribute('data-sentence-id');
-                
-                if (e.target.classList.contains('selected')) {
-                    // Deselect
-                    e.target.classList.remove('selected');
-                    selectedSentences = selectedSentences.filter(id => id !== sentenceId);
+            <?php foreach ($documents as $doc_index => $document): ?>
+                loadSavedData(<?php echo $doc_index; ?>);
+            <?php endforeach; ?>
+            
+            // Show appropriate step
+            <?php foreach ($documents as $doc_index => $document): ?>
+                if (completedSteps[<?php echo $doc_index; ?>].step3) {
+                    showStep(3, <?php echo $doc_index; ?>);
+                } else if (completedSteps[<?php echo $doc_index; ?>].step2) {
+                    showStep(3, <?php echo $doc_index; ?>);
+                } else if (completedSteps[<?php echo $doc_index; ?>].step1) {
+                    showStep(2, <?php echo $doc_index; ?>);
                 } else {
-                    // Select
-                    e.target.classList.add('selected');
-                    selectedSentences.push(sentenceId);
+                    showStep(1, <?php echo $doc_index; ?>);
                 }
-                
-                updateSelectedSentencesDisplay();
-                autoSave();
-            }
+            <?php endforeach; ?>
         });
 
-        // Update selected sentences display
-        function updateSelectedSentencesDisplay() {
-            const container = document.getElementById('selected-sentences-summary');
-            const countElement = document.getElementById('selected-count');
+        function switchDocument(docIndex) {
+            // Hide all documents
+            document.querySelectorAll('.document-container').forEach(el => el.classList.add('d-none'));
+            document.querySelectorAll('.document-tab').forEach(el => el.classList.remove('active'));
             
-            countElement.textContent = selectedSentences.length;
+            // Show selected document
+            document.getElementById('document-' + docIndex).classList.remove('d-none');
+            document.getElementById('tab-' + docIndex).classList.add('active');
             
-            if (selectedSentences.length === 0) {
-                container.innerHTML = `
-                    <div class="text-muted text-center py-3">
-                        <i class="fas fa-info-circle me-2"></i>
-                        Chưa chọn câu nào
-                    </div>
-                `;
-                return;
+            currentDocument = docIndex;
+        }
+
+        function toggleSentence(element) {
+            const docIndex = parseInt(element.dataset.doc);
+            const sentenceIndex = parseInt(element.dataset.sentence);
+            
+            if (!selectedSentences[docIndex]) {
+                selectedSentences[docIndex] = [];
             }
             
-            let html = '';
-            selectedSentences.forEach(sentenceId => {
-                const sentenceElement = document.querySelector(`[data-sentence-id="${sentenceId}"]`);
-                if (sentenceElement) {
-                    const text = sentenceElement.textContent.trim();
-                    html += `
-                        <div class="alert alert-success small mb-2">
-                            <button class="btn-close btn-close-sm float-end" onclick="removeSentence('${sentenceId}')"></button>
-                            ${text}
-                        </div>
-                    `;
-                }
+            if (element.classList.contains('selected')) {
+                element.classList.remove('selected');
+                selectedSentences[docIndex] = selectedSentences[docIndex].filter(i => i !== sentenceIndex);
+            } else {
+                element.classList.add('selected');
+                selectedSentences[docIndex].push(sentenceIndex);
+            }
+            
+            updateSelectedDisplay(docIndex);
+            autoSave(docIndex);
+        }
+
+        function updateSelectedDisplay(docIndex) {
+            const container = document.getElementById('selected-sentences-' + docIndex);
+            const sentences = document.querySelectorAll(`#sentences-${docIndex} .sentence`);
+            
+            if (selectedSentences[docIndex] && selectedSentences[docIndex].length > 0) {
+                let html = '';
+                selectedSentences[docIndex].forEach(index => {
+                    if (sentences[index]) {
+                        html += '<div class="mb-2 p-2 bg-light rounded">' + sentences[index].textContent + '</div>';
+                    }
+                });
+                container.innerHTML = html;
+            } else {
+                container.innerHTML = '<div class="text-muted">Chưa có câu nào được chọn</div>';
+            }
+        }
+
+        function clearSelections(docIndex) {
+            selectedSentences[docIndex] = [];
+            document.querySelectorAll(`#sentences-${docIndex} .sentence`).forEach(el => {
+                el.classList.remove('selected');
             });
+            updateSelectedDisplay(docIndex);
+            autoSave(docIndex);
+        }
+
+        function selectStyle(style, docIndex) {
+            writingStyles[docIndex] = style;
             
-            container.innerHTML = html;
+            // Update UI
+            document.querySelectorAll(`#step2-${docIndex} .writing-style-option`).forEach(el => {
+                el.classList.remove('selected');
+            });
+            document.querySelector(`#step2-${docIndex} .writing-style-option[data-style="${style}"]`).classList.add('selected');
+            
+            // Enable next button
+            document.getElementById('step2-complete-' + docIndex).disabled = false;
+            
+            autoSave(docIndex);
         }
 
-        // Remove sentence
-        function removeSentence(sentenceId) {
-            const sentenceElement = document.querySelector(`[data-sentence-id="${sentenceId}"]`);
-            if (sentenceElement) {
-                sentenceElement.classList.remove('selected');
+        function showStep(step, docIndex) {
+            // Hide all steps
+            for (let i = 1; i <= 3; i++) {
+                document.getElementById(`step${i}-${docIndex}`).classList.add('d-none');
             }
-            selectedSentences = selectedSentences.filter(id => id !== sentenceId);
-            updateSelectedSentencesDisplay();
-            autoSave();
+            
+            // Show selected step
+            document.getElementById(`step${step}-${docIndex}`).classList.remove('d-none');
         }
 
-        // Step navigation
-        function goToStep(step) {
-            // Update progress steps
-            document.querySelectorAll('.step').forEach(el => el.classList.remove('active'));
-            for (let i = 1; i <= step; i++) {
-                const stepEl = document.getElementById(`step-${i}`);
-                if (i < step) {
-                    stepEl.classList.add('completed');
-                } else if (i === step) {
-                    stepEl.classList.add('active');
+        function completeStep(step, docIndex) {
+            if (step === 1) {
+                if (!selectedSentences[docIndex] || selectedSentences[docIndex].length === 0) {
+                    alert('Vui lòng chọn ít nhất một câu quan trọng!');
+                    return;
                 }
+                completedSteps[docIndex].step1 = true;
+                showStep(2, docIndex);
+            } else if (step === 2) {
+                if (!writingStyles[docIndex]) {
+                    alert('Vui lòng chọn phong cách văn bản!');
+                    return;
+                }
+                completedSteps[docIndex].step2 = true;
+                showStep(3, docIndex);
+            } else if (step === 3) {
+                const summary = document.getElementById('edited-summary-' + docIndex).value.trim();
+                if (!summary) {
+                    alert('Vui lòng nhập bản tóm tắt!');
+                    return;
+                }
+                completedSteps[docIndex].step3 = true;
+                saveDocument(docIndex);
             }
             
-            // Switch tabs
-            const tabTrigger = document.querySelector(`#step${step}-tab`);
-            if (tabTrigger) {
-                const tab = new bootstrap.Tab(tabTrigger);
-                tab.show();
-            }
+            autoSave(docIndex);
         }
 
-        // Text style change
-        document.addEventListener('change', function(e) {
-            if (e.target.name === 'text_style') {
-                autoSave();
-            }
-        });
-
-        // Summary editing
-        document.getElementById('edited-summary').addEventListener('input', function() {
-            autoSave();
-        });
-
-        // Auto save setup
-        function setupAutoSave() {
-            setInterval(function() {
-                autoSave();
-            }, 30000);
-        }
-
-        // Auto save function
-        function autoSave() {
-            clearTimeout(autoSaveTimer);
-            autoSaveTimer = setTimeout(function() {
-                saveData(false);
+        function autoSave(docIndex) {
+            // Update form data
+            updateFormData(docIndex);
+            
+            // Show auto-save indicator
+            const indicator = document.getElementById('autoSaveIndicator');
+            indicator.style.display = 'block';
+            setTimeout(() => {
+                indicator.style.display = 'none';
             }, 2000);
         }
 
-        // Save data
-        function saveData(showMessage = false) {
-            const data = {
-                group_id: <?php echo $group_id; ?>,
-                selected_sentences: selectedSentences,
-                text_style: document.querySelector('input[name="text_style"]:checked')?.value || '',
-                edited_summary: document.getElementById('edited-summary').value,
-                is_draft: true
-            };
-
-            fetch('save_labeling.php', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify(data)
-            })
-            .then(response => response.json())
-            .then(result => {
-                if (showMessage && result.success) {
-                    alert('Đã lưu nháp thành công!');
-                }
-            })
-            .catch(error => {
-                console.error('Auto-save error:', error);
-            });
+        function updateFormData(docIndex) {
+            document.getElementById('form-selected-sentences-' + docIndex).value = JSON.stringify(selectedSentences[docIndex] || []);
+            document.getElementById('form-writing-style-' + docIndex).value = writingStyles[docIndex] || '';
+            document.getElementById('form-edited-summary-' + docIndex).value = document.getElementById('edited-summary-' + docIndex).value;
+            document.getElementById('form-step1-' + docIndex).value = completedSteps[docIndex].step1 ? '1' : '';
+            document.getElementById('form-step2-' + docIndex).value = completedSteps[docIndex].step2 ? '1' : '';
+            document.getElementById('form-step3-' + docIndex).value = completedSteps[docIndex].step3 ? '1' : '';
         }
 
-        // Save draft
-        function saveDraft() {
-            saveData(true);
+        function saveDocument(docIndex) {
+            updateFormData(docIndex);
+            document.getElementById('save-form-' + docIndex).submit();
         }
 
-        // Complete labeling
-        function completeLabeling() {
-            if (selectedSentences.length === 0) {
-                alert('Vui lòng chọn ít nhất một câu quan trọng!');
-                goToStep(1);
-                return;
-            }
+        function saveAll() {
+            updateFormData(currentDocument);
+            document.getElementById('save-form-' + currentDocument).submit();
+        }
 
-            const textStyle = document.querySelector('input[name="text_style"]:checked');
-            if (!textStyle) {
-                alert('Vui lòng chọn phong cách văn bản!');
-                goToStep(2);
-                return;
-            }
-
-            const editedSummary = document.getElementById('edited-summary').value.trim();
-            if (!editedSummary) {
-                alert('Vui lòng chỉnh sửa bản tóm tắt!');
-                goToStep(3);
-                return;
-            }
-
-            if (confirm('Bạn có chắc chắn muốn hoàn thành công việc gán nhãn này?')) {
-                const data = {
-                    group_id: <?php echo $group_id; ?>,
-                    selected_sentences: selectedSentences,
-                    text_style: textStyle.value,
-                    edited_summary: editedSummary,
-                    is_draft: false
-                };
-
-                fetch('save_labeling.php', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify(data)
-                })
-                .then(response => response.json())
-                .then(result => {
-                    if (result.success) {
-                        alert('Hoàn thành gán nhãn thành công!');
-                        window.location.href = 'dashboard.php';
-                    } else {
-                        alert('Có lỗi xảy ra: ' + (result.error || 'Unknown error'));
+        function loadSavedData(docIndex) {
+            // Load selected sentences
+            if (selectedSentences[docIndex] && selectedSentences[docIndex].length > 0) {
+                const sentences = document.querySelectorAll(`#sentences-${docIndex} .sentence`);
+                selectedSentences[docIndex].forEach(index => {
+                    if (sentences[index]) {
+                        sentences[index].classList.add('selected');
                     }
-                })
-                .catch(error => {
-                    console.error('Error:', error);
-                    alert('Có lỗi xảy ra khi lưu dữ liệu!');
                 });
+                updateSelectedDisplay(docIndex);
+            }
+            
+            // Load writing style
+            if (writingStyles[docIndex]) {
+                const styleElement = document.querySelector(`#step2-${docIndex} .writing-style-option[data-style="${writingStyles[docIndex]}"]`);
+                if (styleElement) {
+                    styleElement.classList.add('selected');
+                    document.getElementById('step2-complete-' + docIndex).disabled = false;
+                }
             }
         }
     </script>
