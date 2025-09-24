@@ -33,6 +33,45 @@ try {
     die("Database error: " . $e->getMessage());
 }
 
+// Create necessary tables if they don't exist
+try {
+    // Create assignments table
+    $create_assignments_table = "CREATE TABLE IF NOT EXISTS assignments (
+        id int(11) NOT NULL AUTO_INCREMENT,
+        user_id int(11) NOT NULL,
+        document_id int(11) DEFAULT NULL,
+        group_id int(11) DEFAULT NULL,
+        assigned_by int(11) NOT NULL,
+        status enum('pending','in_progress','completed','reviewed') DEFAULT 'pending',
+        deadline datetime DEFAULT NULL,
+        assigned_at timestamp DEFAULT CURRENT_TIMESTAMP,
+        updated_at timestamp DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+    $db->exec($create_assignments_table);
+    
+    // Create labeling_results table
+    $create_results_table = "CREATE TABLE IF NOT EXISTS labeling_results (
+        id int(11) NOT NULL AUTO_INCREMENT,
+        assignment_id int(11) NOT NULL,
+        document_id int(11) NOT NULL,
+        selected_sentences longtext,
+        writing_style varchar(50) DEFAULT 'formal',
+        edited_summary text,
+        step1_completed tinyint(1) DEFAULT 0,
+        step2_completed tinyint(1) DEFAULT 0,
+        step3_completed tinyint(1) DEFAULT 0,
+        completed_at timestamp NULL DEFAULT NULL,
+        created_at timestamp DEFAULT CURRENT_TIMESTAMP,
+        updated_at timestamp DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+    $db->exec($create_results_table);
+    
+} catch (Exception $e) {
+    // Tables might already exist - continue
+}
+
 $error_message = '';
 $success_message = '';
 
@@ -43,7 +82,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['action'])) {
             $assignment_id = intval($_POST['assignment_id']);
             $new_status = $_POST['status'];
             
-            $query = "UPDATE assignments SET status = ? WHERE id = ? AND user_id = ?";
+            $query = "UPDATE assignments SET status = ?, updated_at = NOW() WHERE id = ? AND user_id = ?";
             $stmt = $db->prepare($query);
             $stmt->execute([$new_status, $assignment_id, $current_user_id]);
             
@@ -52,6 +91,18 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['action'])) {
     } catch (Exception $e) {
         $error_message = 'Lỗi: ' . $e->getMessage();
     }
+}
+
+// Check what columns exist in assignments table
+$assignment_columns = [];
+try {
+    $columns_result = $db->query("SHOW COLUMNS FROM assignments");
+    while ($col = $columns_result->fetch(PDO::FETCH_ASSOC)) {
+        $assignment_columns[] = $col['Field'];
+    }
+} catch (Exception $e) {
+    // If we can't check columns, assume basic structure
+    $assignment_columns = ['id', 'user_id', 'document_id', 'group_id', 'assigned_by', 'status', 'assigned_at', 'updated_at'];
 }
 
 // Get assignments list
@@ -67,8 +118,15 @@ try {
         $params[] = $filter_status;
     }
     
-    // Fixed query to match actual database structure
-    $query = "SELECT a.*, 
+    // Build SELECT clause based on available columns
+    $deadline_field = in_array('deadline', $assignment_columns) ? 'a.deadline' : 'NULL as deadline';
+    $assigned_at_field = in_array('assigned_at', $assignment_columns) ? 'a.assigned_at' : 'NOW() as assigned_at';
+    $updated_at_field = in_array('updated_at', $assignment_columns) ? 'a.updated_at' : 'NOW() as updated_at';
+    
+    $query = "SELECT a.id, a.user_id, a.document_id, a.group_id, a.assigned_by, a.status,
+                     $deadline_field,
+                     $assigned_at_field,
+                     $updated_at_field,
                      CASE 
                          WHEN a.document_id IS NOT NULL AND a.document_id > 0 THEN d.title 
                          WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN dg.group_name 
@@ -81,7 +139,7 @@ try {
                      END as content,
                      CASE 
                          WHEN a.document_id IS NOT NULL AND a.document_id > 0 THEN d.ai_summary 
-                         WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN dg.description 
+                         WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN dg.combined_ai_summary 
                          ELSE ''
                      END as ai_summary,
                      CASE 
@@ -101,16 +159,55 @@ try {
     $stmt->execute($params);
     $assignments = $stmt->fetchAll(PDO::FETCH_ASSOC);
     
-    // Add dummy progress data if labeling_results table doesn't exist
+    // Get progress data from labeling_results and ensure all fields exist
     foreach ($assignments as &$assignment) {
+        // Set default values for fields that might not exist
         $assignment['step1_completed'] = 0;
         $assignment['step2_completed'] = 0; 
         $assignment['step3_completed'] = 0;
         $assignment['writing_style'] = '';
+        
+        // Ensure deadline is properly set (fix for the warning)
+        if (!isset($assignment['deadline']) || $assignment['deadline'] === null) {
+            $assignment['deadline'] = null;
+        }
+        
+        // Ensure title and content have values
+        if (empty($assignment['title']) || $assignment['title'] == 'Untitled') {
+            $assignment['title'] = 'Assignment #' . $assignment['id'];
+        }
+        
+        if (empty($assignment['content']) || $assignment['content'] == 'No content') {
+            $assignment['content'] = 'Nội dung đang được tải...';
+        }
+        
+        // Get labeling progress if labeling_results table exists
+        try {
+            $check_results_table = $db->query("SHOW TABLES LIKE 'labeling_results'");
+            if ($check_results_table->rowCount() > 0) {
+                $progress_query = "SELECT step1_completed, step2_completed, step3_completed, writing_style 
+                                   FROM labeling_results 
+                                   WHERE assignment_id = ? 
+                                   LIMIT 1";
+                $progress_stmt = $db->prepare($progress_query);
+                $progress_stmt->execute([$assignment['id']]);
+                $progress = $progress_stmt->fetch(PDO::FETCH_ASSOC);
+                
+                if ($progress) {
+                    $assignment['step1_completed'] = $progress['step1_completed'] ?? 0;
+                    $assignment['step2_completed'] = $progress['step2_completed'] ?? 0;
+                    $assignment['step3_completed'] = $progress['step3_completed'] ?? 0;
+                    $assignment['writing_style'] = $progress['writing_style'] ?? '';
+                }
+            }
+        } catch (Exception $e) {
+            // Ignore progress lookup errors
+        }
     }
     
 } catch (Exception $e) {
     $error_message = 'Lỗi khi lấy danh sách công việc: ' . $e->getMessage();
+    $assignments = [];
 }
 
 // Statistics
@@ -125,7 +222,7 @@ try {
         $stats['total'] += $row['count'];
     }
 } catch (Exception $e) {
-    // Ignore stats error
+    // Ignore stats error - keep default values
 }
 ?>
 <!DOCTYPE html>
@@ -212,6 +309,7 @@ try {
             align-items: center;
             justify-content: center;
             margin-bottom: 5px;
+            font-weight: bold;
         }
         .step-circle.completed {
             background: #28a745;
@@ -220,6 +318,22 @@ try {
         .step-circle.current {
             background: #007bff;
             color: white;
+        }
+        .stat-card {
+            background: white;
+            border-radius: 10px;
+            padding: 15px;
+            text-align: center;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: #6c757d;
+        }
+        .empty-state i {
+            font-size: 4rem;
+            margin-bottom: 20px;
         }
     </style>
 </head>
@@ -294,37 +408,37 @@ try {
         <!-- Statistics -->
         <div class="row mb-4">
             <div class="col-md-2">
-                <div class="text-center">
+                <div class="stat-card">
                     <div class="h4 text-primary"><?php echo $stats['total']; ?></div>
-                    <div class="text-muted small">Tổng cộng</div>
+                    <div class="text-muted small">Tổng công</div>
                 </div>
             </div>
             <div class="col-md-2">
-                <div class="text-center">
+                <div class="stat-card">
                     <div class="h4 text-warning"><?php echo $stats['pending']; ?></div>
                     <div class="text-muted small">Chờ thực hiện</div>
                 </div>
             </div>
             <div class="col-md-2">
-                <div class="text-center">
+                <div class="stat-card">
                     <div class="h4 text-info"><?php echo $stats['in_progress']; ?></div>
                     <div class="text-muted small">Đang thực hiện</div>
                 </div>
             </div>
             <div class="col-md-2">
-                <div class="text-center">
+                <div class="stat-card">
                     <div class="h4 text-success"><?php echo $stats['completed']; ?></div>
                     <div class="text-muted small">Hoàn thành</div>
                 </div>
             </div>
             <div class="col-md-2">
-                <div class="text-center">
+                <div class="stat-card">
                     <div class="h4 text-secondary"><?php echo $stats['reviewed']; ?></div>
                     <div class="text-muted small">Đã review</div>
                 </div>
             </div>
             <div class="col-md-2">
-                <div class="text-center">
+                <div class="stat-card">
                     <div class="h4 text-dark">
                         <?php echo $stats['total'] > 0 ? round(($stats['completed'] / $stats['total']) * 100, 1) : 0; ?>%
                     </div>
@@ -336,8 +450,8 @@ try {
         <!-- Assignments List -->
         <div class="content-card">
             <?php if (empty($assignments)): ?>
-                <div class="text-center text-muted py-5">
-                    <i class="fas fa-inbox fa-3x mb-3"></i>
+                <div class="empty-state">
+                    <i class="fas fa-inbox"></i>
                     <h5>Không có công việc nào</h5>
                     <p>
                         <?php if ($filter_status): ?>
@@ -357,7 +471,7 @@ try {
                             <div class="assignment-card">
                                 <div class="d-flex justify-content-between align-items-start mb-3">
                                     <div>
-                                        <h5 class="mb-1"><?php echo htmlspecialchars(substr($assignment['title'] ?: 'Không có tiêu đề', 0, 50)); ?></h5>
+                                        <h5 class="mb-1"><?php echo htmlspecialchars(substr($assignment['title'], 0, 50)); ?></h5>
                                         <small class="text-muted">
                                             ID: #<?php echo $assignment['id']; ?> • 
                                             Giao bởi: <?php echo htmlspecialchars($assignment['assigned_by_name'] ?: 'N/A'); ?>
@@ -372,7 +486,7 @@ try {
                                 
                                 <div class="mb-3">
                                     <p class="text-muted mb-2">
-                                        <?php echo htmlspecialchars(substr(strip_tags($assignment['content'] ?: ''), 0, 100)); ?>...
+                                        <?php echo htmlspecialchars(substr(strip_tags($assignment['content']), 0, 100)); ?>...
                                     </p>
                                 </div>
                                 
@@ -422,7 +536,8 @@ try {
                                             <?php echo $status_text; ?>
                                         </span>
                                         
-                                        <?php if ($assignment['deadline']): ?>
+                                        <!-- Fixed deadline display to prevent warning -->
+                                        <?php if (!empty($assignment['deadline']) && $assignment['deadline'] !== null): ?>
                                             <small class="text-muted ms-2">
                                                 <i class="fas fa-calendar me-1"></i>
                                                 <?php echo date('d/m/Y', strtotime($assignment['deadline'])); ?>
@@ -446,7 +561,8 @@ try {
                                 <div class="mt-2 small text-muted">
                                     <i class="fas fa-clock me-1"></i>
                                     Assignment ID: <?php echo $assignment['id']; ?>
-                                    <?php if (isset($assignment['deadline'])): ?>
+                                    <!-- Fixed deadline display in footer as well -->
+                                    <?php if (!empty($assignment['deadline']) && $assignment['deadline'] !== null): ?>
                                         • Deadline: <?php echo date('d/m/Y H:i', strtotime($assignment['deadline'])); ?>
                                     <?php endif; ?>
                                 </div>

@@ -1,5 +1,5 @@
 <?php
-// Bắt lỗi và khởi tạo session an toàn
+// Start session and error handling
 error_reporting(E_ALL);
 ini_set('display_errors', 1);
 
@@ -7,15 +7,31 @@ if (session_status() == PHP_SESSION_NONE) {
     session_start();
 }
 
-require_once '../includes/auth.php';
 require_once '../config/database.php';
 
-// Kiểm tra quyền labeler
-requireRole('labeler');
+// Simple auth check - no external functions needed
+if (!isset($_SESSION['user_id']) || $_SESSION['role'] !== 'labeler') {
+    header('Location: ../login.php');
+    exit();
+}
 
 $database = new Database();
 $db = $database->getConnection();
-$current_user = getCurrentUser();
+$current_user_id = $_SESSION['user_id'];
+
+// Get current user info
+try {
+    $stmt = $db->prepare("SELECT * FROM users WHERE id = ?");
+    $stmt->execute([$current_user_id]);
+    $current_user = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$current_user) {
+        session_destroy();
+        header('Location: ../login.php');
+        exit();
+    }
+} catch (Exception $e) {
+    die("Database error: " . $e->getMessage());
+}
 
 $error_message = '';
 $success_message = '';
@@ -23,15 +39,15 @@ $assignment = null;
 $documents = [];
 $view_only = isset($_GET['view']) && $_GET['view'] == '1';
 
-// Lấy assignment ID
+// Get assignment ID
 $assignment_id = $_GET['id'] ?? null;
 
 if (!$assignment_id) {
-    // Nếu không có ID cụ thể, lấy assignment đầu tiên chưa hoàn thành
+    // If no specific ID, get first unfinished assignment
     try {
-        $query = "SELECT id FROM assignments WHERE user_id = ? AND status IN ('pending', 'in_progress') ORDER BY created_at ASC LIMIT 1";
+        $query = "SELECT id FROM assignments WHERE user_id = ? AND status IN ('pending', 'in_progress') ORDER BY id ASC LIMIT 1";
         $stmt = $db->prepare($query);
-        $stmt->execute([$current_user['id']]);
+        $stmt->execute([$current_user_id]);
         $result = $stmt->fetch();
         
         if ($result) {
@@ -44,58 +60,98 @@ if (!$assignment_id) {
     }
 }
 
-// Lấy thông tin assignment
+// Get assignment info
 if ($assignment_id) {
     try {
         $query = "SELECT a.*, 
                          CASE 
-                             WHEN a.type = 'single' THEN d.title 
-                             WHEN a.type = 'multi' THEN dg.title 
+                             WHEN a.document_id IS NOT NULL AND a.document_id > 0 THEN d.title 
+                             WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN dg.group_name 
+                             ELSE 'Untitled'
                          END as title,
                          CASE 
-                             WHEN a.type = 'single' THEN d.ai_summary 
-                             WHEN a.type = 'multi' THEN dg.ai_summary 
+                             WHEN a.document_id IS NOT NULL AND a.document_id > 0 THEN d.ai_summary 
+                             WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN dg.description 
+                             ELSE ''
                          END as ai_summary,
+                         CASE 
+                             WHEN a.document_id IS NOT NULL AND a.document_id > 0 THEN 'single' 
+                             WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN 'multi' 
+                             ELSE 'single'
+                         END as assignment_type,
                          admin.full_name as assigned_by_name
                   FROM assignments a 
-                  LEFT JOIN documents d ON a.document_id = d.id AND a.type = 'single'
-                  LEFT JOIN document_groups dg ON a.group_id = dg.id AND a.type = 'multi'
+                  LEFT JOIN documents d ON a.document_id = d.id
+                  LEFT JOIN document_groups dg ON a.group_id = dg.id
                   LEFT JOIN users admin ON a.assigned_by = admin.id
                   WHERE a.id = ? AND a.user_id = ?";
                   
         $stmt = $db->prepare($query);
-        $stmt->execute([$assignment_id, $current_user['id']]);
+        $stmt->execute([$assignment_id, $current_user_id]);
         $assignment = $stmt->fetch(PDO::FETCH_ASSOC);
         
         if (!$assignment) {
             $error_message = 'Không tìm thấy công việc hoặc bạn không có quyền truy cập.';
         } else {
-            // Lấy documents liên quan
-            if ($assignment['type'] == 'single') {
+            // Get related documents
+            $assignment['type'] = $assignment['assignment_type']; // For backward compatibility
+            
+            if ($assignment['assignment_type'] == 'single' && $assignment['document_id']) {
                 $query = "SELECT * FROM documents WHERE id = ?";
                 $stmt = $db->prepare($query);
                 $stmt->execute([$assignment['document_id']]);
-                $documents = [$stmt->fetch(PDO::FETCH_ASSOC)];
-            } else {
+                $doc = $stmt->fetch(PDO::FETCH_ASSOC);
+                if ($doc) {
+                    $documents = [$doc];
+                }
+            } elseif ($assignment['assignment_type'] == 'multi' && $assignment['group_id']) {
+                // Get documents in group via document_group_items table
                 $query = "SELECT d.* FROM documents d 
-                          JOIN group_documents gd ON d.id = gd.document_id 
-                          WHERE gd.group_id = ? 
-                          ORDER BY gd.order_index";
+                          JOIN document_group_items dgi ON d.id = dgi.document_id 
+                          WHERE dgi.group_id = ? 
+                          ORDER BY dgi.sort_order";
                 $stmt = $db->prepare($query);
                 $stmt->execute([$assignment['group_id']]);
                 $documents = $stmt->fetchAll(PDO::FETCH_ASSOC);
             }
             
-            // Lấy kết quả gán nhãn hiện có
-            $query = "SELECT * FROM labeling_results WHERE assignment_id = ?";
-            $stmt = $db->prepare($query);
-            $stmt->execute([$assignment_id]);
-            $existing_results = $stmt->fetchAll(PDO::FETCH_ASSOC);
-            
-            // Tạo map kết quả theo document_id
+            // Get existing labeling results if table exists
             $results_map = [];
-            foreach ($existing_results as $result) {
-                $results_map[$result['document_id']] = $result;
+            try {
+                $query = "SELECT * FROM labeling_results WHERE assignment_id = ?";
+                $stmt = $db->prepare($query);
+                $stmt->execute([$assignment_id]);
+                $existing_results = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                
+                // Create results map by document_id
+                foreach ($existing_results as $result) {
+                    $results_map[$result['document_id']] = $result;
+                }
+            } catch (Exception $e) {
+                // Table doesn't exist, create it
+                try {
+                    $create_table = "CREATE TABLE IF NOT EXISTS labeling_results (
+                        id int(11) NOT NULL AUTO_INCREMENT,
+                        assignment_id int(11) NOT NULL,
+                        document_id int(11) NOT NULL,
+                        selected_sentences longtext,
+                        writing_style varchar(50) DEFAULT NULL,
+                        edited_summary longtext,
+                        step1_completed tinyint(1) DEFAULT 0,
+                        step2_completed tinyint(1) DEFAULT 0,
+                        step3_completed tinyint(1) DEFAULT 0,
+                        auto_saved_at timestamp NULL DEFAULT NULL,
+                        completed_at timestamp NULL DEFAULT NULL,
+                        created_at timestamp DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (id),
+                        UNIQUE KEY unique_assignment_document (assignment_id, document_id)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+                    $db->exec($create_table);
+                    $results_map = [];
+                } catch (Exception $e2) {
+                    // If we can't create table, use empty results
+                    $results_map = [];
+                }
             }
         }
     } catch (Exception $e) {
@@ -103,7 +159,7 @@ if ($assignment_id) {
     }
 }
 
-// Xử lý lưu kết quả
+// Handle save labeling
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && !$view_only) {
     try {
         $action = $_POST['action'] ?? '';
@@ -117,50 +173,89 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && !$view_only) {
             $step2_completed = isset($_POST['step2_completed']) ? 1 : 0;
             $step3_completed = isset($_POST['step3_completed']) ? 1 : 0;
             
-            // Check if result exists
-            $query = "SELECT id FROM labeling_results WHERE assignment_id = ? AND document_id = ?";
-            $stmt = $db->prepare($query);
-            $stmt->execute([$assignment_id, $document_id]);
-            $existing = $stmt->fetch();
-            
-            if ($existing) {
-                // Update
-                $query = "UPDATE labeling_results SET 
-                          selected_sentences = ?, writing_style = ?, edited_summary = ?,
-                          step1_completed = ?, step2_completed = ?, step3_completed = ?,
-                          auto_saved_at = CURRENT_TIMESTAMP,
-                          completed_at = CASE WHEN ? = 1 AND ? = 1 AND ? = 1 THEN CURRENT_TIMESTAMP ELSE completed_at END
-                          WHERE assignment_id = ? AND document_id = ?";
+            try {
+                // Check if result exists
+                $query = "SELECT id FROM labeling_results WHERE assignment_id = ? AND document_id = ?";
                 $stmt = $db->prepare($query);
-                $stmt->execute([
-                    $selected_sentences, $writing_style, $edited_summary,
-                    $step1_completed, $step2_completed, $step3_completed,
-                    $step1_completed, $step2_completed, $step3_completed,
-                    $assignment_id, $document_id
-                ]);
-            } else {
-                // Insert
-                $query = "INSERT INTO labeling_results 
-                          (assignment_id, document_id, selected_sentences, writing_style, edited_summary,
-                           step1_completed, step2_completed, step3_completed, auto_saved_at,
-                           completed_at)
-                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 
-                                  CASE WHEN ? = 1 AND ? = 1 AND ? = 1 THEN CURRENT_TIMESTAMP ELSE NULL END)";
-                $stmt = $db->prepare($query);
-                $stmt->execute([
-                    $assignment_id, $document_id, $selected_sentences, $writing_style, $edited_summary,
-                    $step1_completed, $step2_completed, $step3_completed,
-                    $step1_completed, $step2_completed, $step3_completed
-                ]);
+                $stmt->execute([$assignment_id, $document_id]);
+                $existing = $stmt->fetch();
+                
+                if ($existing) {
+                    // Update
+                    $query = "UPDATE labeling_results SET 
+                              selected_sentences = ?, writing_style = ?, edited_summary = ?,
+                              step1_completed = ?, step2_completed = ?, step3_completed = ?,
+                              auto_saved_at = CURRENT_TIMESTAMP,
+                              completed_at = CASE WHEN ? = 1 AND ? = 1 AND ? = 1 THEN CURRENT_TIMESTAMP ELSE completed_at END
+                              WHERE assignment_id = ? AND document_id = ?";
+                    $stmt = $db->prepare($query);
+                    $stmt->execute([
+                        $selected_sentences, $writing_style, $edited_summary,
+                        $step1_completed, $step2_completed, $step3_completed,
+                        $step1_completed, $step2_completed, $step3_completed,
+                        $assignment_id, $document_id
+                    ]);
+                } else {
+                    // Insert
+                    $query = "INSERT INTO labeling_results 
+                              (assignment_id, document_id, selected_sentences, writing_style, edited_summary,
+                               step1_completed, step2_completed, step3_completed, auto_saved_at,
+                               completed_at)
+                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 
+                                      CASE WHEN ? = 1 AND ? = 1 AND ? = 1 THEN CURRENT_TIMESTAMP ELSE NULL END)";
+                    $stmt = $db->prepare($query);
+                    $stmt->execute([
+                        $assignment_id, $document_id, $selected_sentences, $writing_style, $edited_summary,
+                        $step1_completed, $step2_completed, $step3_completed,
+                        $step1_completed, $step2_completed, $step3_completed
+                    ]);
+                }
+            } catch (Exception $e) {
+                // If table doesn't exist, create it and try again
+                if (strpos($e->getMessage(), "doesn't exist") !== false) {
+                    $create_table = "CREATE TABLE IF NOT EXISTS labeling_results (
+                        id int(11) NOT NULL AUTO_INCREMENT,
+                        assignment_id int(11) NOT NULL,
+                        document_id int(11) NOT NULL,
+                        selected_sentences longtext,
+                        writing_style varchar(50) DEFAULT NULL,
+                        edited_summary longtext,
+                        step1_completed tinyint(1) DEFAULT 0,
+                        step2_completed tinyint(1) DEFAULT 0,
+                        step3_completed tinyint(1) DEFAULT 0,
+                        auto_saved_at timestamp NULL DEFAULT NULL,
+                        completed_at timestamp NULL DEFAULT NULL,
+                        created_at timestamp DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (id),
+                        UNIQUE KEY unique_assignment_document (assignment_id, document_id)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+                    $db->exec($create_table);
+                    
+                    // Try insert again
+                    $query = "INSERT INTO labeling_results 
+                              (assignment_id, document_id, selected_sentences, writing_style, edited_summary,
+                               step1_completed, step2_completed, step3_completed, auto_saved_at,
+                               completed_at)
+                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 
+                                      CASE WHEN ? = 1 AND ? = 1 AND ? = 1 THEN CURRENT_TIMESTAMP ELSE NULL END)";
+                    $stmt = $db->prepare($query);
+                    $stmt->execute([
+                        $assignment_id, $document_id, $selected_sentences, $writing_style, $edited_summary,
+                        $step1_completed, $step2_completed, $step3_completed,
+                        $step1_completed, $step2_completed, $step3_completed
+                    ]);
+                } else {
+                    throw $e;
+                }
             }
             
-            // Cập nhật status của assignment nếu tất cả steps hoàn thành
+            // Update assignment status if all steps completed
             if ($step1_completed && $step2_completed && $step3_completed) {
-                $query = "UPDATE assignments SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE id = ?";
+                $query = "UPDATE assignments SET status = 'completed' WHERE id = ?";
                 $stmt = $db->prepare($query);
                 $stmt->execute([$assignment_id]);
             } else {
-                $query = "UPDATE assignments SET status = 'in_progress', updated_at = CURRENT_TIMESTAMP WHERE id = ?";
+                $query = "UPDATE assignments SET status = 'in_progress' WHERE id = ?";
                 $stmt = $db->prepare($query);
                 $stmt->execute([$assignment_id]);
             }
@@ -541,14 +636,14 @@ if (isset($_GET['saved'])) {
                                     <div class="col-md-6">
                                         <h6>Bản tóm tắt AI gốc:</h6>
                                         <div class="border rounded p-3 bg-light" style="max-height: 300px; overflow-y: auto;">
-                                            <?php echo htmlspecialchars($document['ai_summary']); ?>
+                                            <?php echo htmlspecialchars($document['ai_summary'] ?? 'Không có tóm tắt AI'); ?>
                                         </div>
                                     </div>
                                     <div class="col-md-6">
                                         <h6>Bản tóm tắt đã chỉnh sửa:</h6>
                                         <textarea class="form-control" id="edited-summary-<?php echo $doc_index; ?>" rows="12" 
                                                   placeholder="Chỉnh sửa bản tóm tắt dựa trên các câu quan trọng đã chọn..."
-                                                  <?php echo $view_only ? 'readonly' : ''; ?>><?php echo htmlspecialchars($result['edited_summary'] ?? $document['ai_summary']); ?></textarea>
+                                                  <?php echo $view_only ? 'readonly' : ''; ?>><?php echo htmlspecialchars($result['edited_summary'] ?? $document['ai_summary'] ?? ''); ?></textarea>
                                     </div>
                                 </div>
                                 <div class="text-end mt-3">

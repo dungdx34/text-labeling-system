@@ -33,6 +33,60 @@ try {
     die("Database error: " . $e->getMessage());
 }
 
+// Create necessary tables if they don't exist
+try {
+    // Create reviews table with correct structure
+    $create_reviews_table = "CREATE TABLE IF NOT EXISTS reviews (
+        id int(11) NOT NULL AUTO_INCREMENT,
+        assignment_id int(11) NOT NULL,
+        reviewer_id int(11) NOT NULL,
+        rating int(11) DEFAULT NULL,
+        comments text,
+        status enum('pending','approved','rejected','needs_revision') DEFAULT 'pending',
+        feedback longtext,
+        created_at timestamp DEFAULT CURRENT_TIMESTAMP,
+        updated_at timestamp DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY unique_assignment_reviewer (assignment_id, reviewer_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+    $db->exec($create_reviews_table);
+    
+    // Create assignments table if it doesn't exist
+    $create_assignments_table = "CREATE TABLE IF NOT EXISTS assignments (
+        id int(11) NOT NULL AUTO_INCREMENT,
+        user_id int(11) NOT NULL,
+        document_id int(11) DEFAULT NULL,
+        group_id int(11) DEFAULT NULL,
+        assigned_by int(11) NOT NULL,
+        status enum('pending','in_progress','completed','reviewed') DEFAULT 'pending',
+        assigned_at timestamp DEFAULT CURRENT_TIMESTAMP,
+        updated_at timestamp DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+    $db->exec($create_assignments_table);
+    
+    // Create labeling_results table if it doesn't exist
+    $create_results_table = "CREATE TABLE IF NOT EXISTS labeling_results (
+        id int(11) NOT NULL AUTO_INCREMENT,
+        assignment_id int(11) NOT NULL,
+        document_id int(11) NOT NULL,
+        selected_sentences longtext,
+        writing_style varchar(50) DEFAULT 'formal',
+        edited_summary text,
+        step1_completed tinyint(1) DEFAULT 0,
+        step2_completed tinyint(1) DEFAULT 0,
+        step3_completed tinyint(1) DEFAULT 0,
+        completed_at timestamp NULL DEFAULT NULL,
+        created_at timestamp DEFAULT CURRENT_TIMESTAMP,
+        updated_at timestamp DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+    $db->exec($create_results_table);
+    
+} catch (Exception $e) {
+    // Tables might already exist - continue
+}
+
 $error_message = '';
 $success_message = '';
 
@@ -46,26 +100,6 @@ $labeling_results = [];
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['action'])) {
     try {
         if ($_POST['action'] == 'submit_review') {
-            // Create reviews table if it doesn't exist
-            try {
-                $create_reviews_table = "CREATE TABLE IF NOT EXISTS reviews (
-                    id int(11) NOT NULL AUTO_INCREMENT,
-                    assignment_id int(11) NOT NULL,
-                    reviewer_id int(11) NOT NULL,
-                    rating int(11) DEFAULT NULL,
-                    comments text,
-                    status enum('pending','approved','rejected','needs_revision') DEFAULT 'pending',
-                    feedback longtext,
-                    created_at timestamp DEFAULT CURRENT_TIMESTAMP,
-                    updated_at timestamp DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                    PRIMARY KEY (id),
-                    UNIQUE KEY unique_assignment_reviewer (assignment_id, reviewer_id)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
-                $db->exec($create_reviews_table);
-            } catch (Exception $e) {
-                // Table already exists or creation failed
-            }
-            
             $assignment_id = intval($_POST['assignment_id']);
             $rating = intval($_POST['rating']);
             $comments = trim($_POST['comments']);
@@ -73,16 +107,16 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['action'])) {
             $feedback = json_encode($_POST['feedback'] ?? []);
             
             // Check if review already exists
-            $query = "SELECT id FROM reviews WHERE assignment_id = ?";
+            $query = "SELECT id FROM reviews WHERE assignment_id = ? AND reviewer_id = ?";
             $stmt = $db->prepare($query);
-            $stmt->execute([$assignment_id]);
+            $stmt->execute([$assignment_id, $current_user_id]);
             $existing_review = $stmt->fetch();
             
             if ($existing_review) {
                 // Update existing review
-                $query = "UPDATE reviews SET rating = ?, comments = ?, status = ?, feedback = ? WHERE assignment_id = ?";
+                $query = "UPDATE reviews SET rating = ?, comments = ?, status = ?, feedback = ?, updated_at = NOW() WHERE assignment_id = ? AND reviewer_id = ?";
                 $stmt = $db->prepare($query);
-                $stmt->execute([$rating, $comments, $status, $feedback, $assignment_id]);
+                $stmt->execute([$rating, $comments, $status, $feedback, $assignment_id, $current_user_id]);
             } else {
                 // Insert new review
                 $query = "INSERT INTO reviews (assignment_id, reviewer_id, rating, comments, status, feedback) VALUES (?, ?, ?, ?, ?, ?)";
@@ -91,7 +125,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['action'])) {
             }
             
             // Update assignment status
-            $query = "UPDATE assignments SET status = 'reviewed' WHERE id = ?";
+            $query = "UPDATE assignments SET status = 'reviewed', updated_at = NOW() WHERE id = ?";
             $stmt = $db->prepare($query);
             $stmt->execute([$assignment_id]);
             
@@ -105,87 +139,96 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['action'])) {
 // Get assignment info if ID provided
 if ($assignment_id) {
     try {
-        $query = "SELECT a.*, 
-                         CASE 
-                             WHEN a.document_id IS NOT NULL AND a.document_id > 0 THEN d.title 
-                             WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN dg.group_name 
-                             ELSE 'Untitled'
-                         END as title,
-                         CASE 
-                             WHEN a.document_id IS NOT NULL AND a.document_id > 0 THEN d.ai_summary 
-                             WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN dg.description 
-                             ELSE ''
-                         END as original_ai_summary,
-                         CASE 
-                             WHEN a.document_id IS NOT NULL AND a.document_id > 0 THEN 'single' 
-                             WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN 'multi' 
-                             ELSE 'single'
-                         END as type,
-                         labeler.full_name as labeler_name,
-                         admin.full_name as assigned_by_name,
-                         r.rating as existing_rating,
-                         r.comments as existing_comments,
-                         r.status as existing_review_status
-                  FROM assignments a 
-                  LEFT JOIN documents d ON a.document_id = d.id
-                  LEFT JOIN document_groups dg ON a.group_id = dg.id
-                  LEFT JOIN users labeler ON a.user_id = labeler.id
-                  LEFT JOIN users admin ON a.assigned_by = admin.id
-                  LEFT JOIN reviews r ON a.id = r.assignment_id
-                  WHERE a.id = ? AND a.status IN ('completed', 'reviewed')";
-                  
-        $stmt = $db->prepare($query);
-        $stmt->execute([$assignment_id]);
-        $assignment = $stmt->fetch(PDO::FETCH_ASSOC);
-        
-        if (!$assignment) {
-            $error_message = 'Không tìm thấy assignment hoặc assignment chưa hoàn thành.';
+        // Check if assignments table exists and has data
+        $check_assignments = $db->query("SHOW TABLES LIKE 'assignments'");
+        if ($check_assignments->rowCount() == 0) {
+            $error_message = 'Bảng assignments chưa được tạo. Vui lòng liên hệ admin.';
         } else {
-            // Get related documents
-            if ($assignment['type'] == 'single' && $assignment['document_id']) {
-                $query = "SELECT * FROM documents WHERE id = ?";
-                $stmt = $db->prepare($query);
-                $stmt->execute([$assignment['document_id']]);
-                $doc = $stmt->fetch(PDO::FETCH_ASSOC);
-                if ($doc) {
-                    $documents = [$doc];
-                }
-            } elseif ($assignment['type'] == 'multi' && $assignment['group_id']) {
-                // Get documents in group via document_group_items table
-                $query = "SELECT d.* FROM documents d 
-                          JOIN document_group_items dgi ON d.id = dgi.document_id 
-                          WHERE dgi.group_id = ? 
-                          ORDER BY dgi.sort_order";
-                $stmt = $db->prepare($query);
-                $stmt->execute([$assignment['group_id']]);
-                $documents = $stmt->fetchAll(PDO::FETCH_ASSOC);
-            }
+            $query = "SELECT a.*, 
+                             CASE 
+                                 WHEN a.document_id IS NOT NULL AND a.document_id > 0 THEN d.title 
+                                 WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN dg.group_name 
+                                 ELSE 'Untitled'
+                             END as title,
+                             CASE 
+                                 WHEN a.document_id IS NOT NULL AND a.document_id > 0 THEN d.ai_summary 
+                                 WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN dg.description 
+                                 ELSE ''
+                             END as original_ai_summary,
+                             CASE 
+                                 WHEN a.document_id IS NOT NULL AND a.document_id > 0 THEN 'single' 
+                                 WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN 'multi' 
+                                 ELSE 'single'
+                             END as type,
+                             labeler.full_name as labeler_name,
+                             admin.full_name as assigned_by_name,
+                             r.rating as existing_rating,
+                             r.comments as existing_comments,
+                             r.status as existing_review_status
+                      FROM assignments a 
+                      LEFT JOIN documents d ON a.document_id = d.id
+                      LEFT JOIN document_groups dg ON a.group_id = dg.id
+                      LEFT JOIN users labeler ON a.user_id = labeler.id
+                      LEFT JOIN users admin ON a.assigned_by = admin.id
+                      LEFT JOIN reviews r ON a.id = r.assignment_id AND r.reviewer_id = ?
+                      WHERE a.id = ? AND a.status IN ('completed', 'reviewed')";
+                      
+            $stmt = $db->prepare($query);
+            $stmt->execute([$current_user_id, $assignment_id]);
+            $assignment = $stmt->fetch(PDO::FETCH_ASSOC);
             
-            // Get labeling results
-            try {
-                $query = "SELECT * FROM labeling_results WHERE assignment_id = ?";
-                $stmt = $db->prepare($query);
-                $stmt->execute([$assignment_id]);
-                $labeling_results = $stmt->fetchAll(PDO::FETCH_ASSOC);
-                
-                // Create results map by document_id
-                $results_map = [];
-                foreach ($labeling_results as $result) {
-                    $results_map[$result['document_id']] = $result;
+            if (!$assignment) {
+                $error_message = 'Không tìm thấy assignment hoặc assignment chưa hoàn thành.';
+            } else {
+                // Get related documents
+                if ($assignment['type'] == 'single' && $assignment['document_id']) {
+                    $query = "SELECT * FROM documents WHERE id = ?";
+                    $stmt = $db->prepare($query);
+                    $stmt->execute([$assignment['document_id']]);
+                    $doc = $stmt->fetch(PDO::FETCH_ASSOC);
+                    if ($doc) {
+                        $documents = [$doc];
+                    }
+                } elseif ($assignment['type'] == 'multi' && $assignment['group_id']) {
+                    // Check if document_group_items table exists
+                    $check_items = $db->query("SHOW TABLES LIKE 'document_group_items'");
+                    if ($check_items->rowCount() > 0) {
+                        $query = "SELECT d.* FROM documents d 
+                                  JOIN document_group_items dgi ON d.id = dgi.document_id 
+                                  WHERE dgi.group_id = ? 
+                                  ORDER BY dgi.sort_order";
+                        $stmt = $db->prepare($query);
+                        $stmt->execute([$assignment['group_id']]);
+                        $documents = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                    }
                 }
-            } catch (Exception $e) {
-                // labeling_results table doesn't exist - create dummy data
-                $results_map = [];
-                foreach ($documents as $doc) {
-                    $results_map[$doc['id']] = [
-                        'selected_sentences' => '[]',
-                        'writing_style' => 'formal',
-                        'edited_summary' => $doc['ai_summary'] ?? 'No summary available',
-                        'step1_completed' => 1,
-                        'step2_completed' => 1,
-                        'step3_completed' => 1,
-                        'completed_at' => $assignment['updated_at'] ?? date('Y-m-d H:i:s')
-                    ];
+                
+                // Get labeling results
+                try {
+                    $query = "SELECT * FROM labeling_results WHERE assignment_id = ?";
+                    $stmt = $db->prepare($query);
+                    $stmt->execute([$assignment_id]);
+                    $labeling_results = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                    
+                    // Create results map by document_id
+                    $results_map = [];
+                    foreach ($labeling_results as $result) {
+                        $results_map[$result['document_id']] = $result;
+                    }
+                } catch (Exception $e) {
+                    // labeling_results table doesn't exist - create dummy data
+                    $results_map = [];
+                    foreach ($documents as $doc) {
+                        $results_map[$doc['id']] = [
+                            'selected_sentences' => '[]',
+                            'writing_style' => 'formal',
+                            'edited_summary' => $doc['ai_summary'] ?? 'No summary available',
+                            'step1_completed' => 1,
+                            'step2_completed' => 1,
+                            'step3_completed' => 1,
+                            'completed_at' => $assignment['updated_at'] ?? date('Y-m-d H:i:s')
+                        ];
+                    }
                 }
             }
         }
@@ -195,16 +238,21 @@ if ($assignment_id) {
 } else {
     // If no ID, get first assignment that needs review
     try {
-        $query = "SELECT id FROM assignments WHERE status = 'completed' ORDER BY id ASC LIMIT 1";
-        $stmt = $db->prepare($query);
-        $stmt->execute();
-        $result = $stmt->fetch();
-        
-        if ($result) {
-            header("Location: review.php?id=" . $result['id']);
-            exit();
+        $check_assignments = $db->query("SHOW TABLES LIKE 'assignments'");
+        if ($check_assignments->rowCount() > 0) {
+            $query = "SELECT id FROM assignments WHERE status = 'completed' ORDER BY id ASC LIMIT 1";
+            $stmt = $db->prepare($query);
+            $stmt->execute();
+            $result = $stmt->fetch();
+            
+            if ($result) {
+                header("Location: review.php?id=" . $result['id']);
+                exit();
+            } else {
+                $error_message = 'Không có assignment nào cần review.';
+            }
         } else {
-            $error_message = 'Không có assignment nào cần review.';
+            $error_message = 'Hệ thống chưa được cấu hình đầy đủ. Vui lòng liên hệ admin.';
         }
     } catch (Exception $e) {
         $error_message = 'Lỗi khi tìm assignment: ' . $e->getMessage();
@@ -417,134 +465,135 @@ if ($assignment_id) {
             <?php endif; ?>
 
             <!-- Review Interface -->
-            <?php foreach ($documents as $doc_index => $document): ?>
-                <?php $result = $results_map[$document['id']] ?? []; ?>
-                <div class="document-container <?php echo $doc_index == 0 ? '' : 'd-none'; ?>" id="document-<?php echo $doc_index; ?>">
-                    <div class="review-container mb-4">
-                        
-                        <!-- Progress Overview -->
-                        <div class="review-header">
-                            <h4><i class="fas fa-clipboard-check me-2"></i><?php echo htmlspecialchars($document['title']); ?></h4>
-                            <div class="step-progress">
-                                <div class="step-circle <?php echo ($result['step1_completed'] ?? 0) ? 'step-completed' : 'step-incomplete'; ?>">1</div>
-                                <div class="step-circle <?php echo ($result['step2_completed'] ?? 0) ? 'step-completed' : 'step-incomplete'; ?>">2</div>
-                                <div class="step-circle <?php echo ($result['step3_completed'] ?? 0) ? 'step-completed' : 'step-incomplete'; ?>">3</div>
-                            </div>
-                            <p class="text-center mb-0">
-                                Hoàn thành: <?php echo date('d/m/Y H:i', strtotime($result['completed_at'] ?? $assignment['updated_at'] ?? date('Y-m-d H:i:s'))); ?>
-                            </p>
-                        </div>
-
-                        <!-- Step 1 Review: Selected Sentences -->
-                        <div class="content-section">
-                            <h5><i class="fas fa-mouse-pointer me-2 text-primary"></i>Bước 1: Câu được chọn</h5>
-                            <div class="row">
-                                <div class="col-md-6">
-                                    <h6>Nội dung gốc:</h6>
-                                    <div class="comparison-box" style="max-height: 300px; overflow-y: auto;">
-                                        <?php echo nl2br(htmlspecialchars($document['content'])); ?>
-                                    </div>
+            <?php if (!empty($documents)): ?>
+                <?php foreach ($documents as $doc_index => $document): ?>
+                    <?php $result = $results_map[$document['id']] ?? []; ?>
+                    <div class="document-container <?php echo $doc_index == 0 ? '' : 'd-none'; ?>" id="document-<?php echo $doc_index; ?>">
+                        <div class="review-container mb-4">
+                            
+                            <!-- Progress Overview -->
+                            <div class="review-header">
+                                <h4><i class="fas fa-clipboard-check me-2"></i><?php echo htmlspecialchars($document['title']); ?></h4>
+                                <div class="step-progress">
+                                    <div class="step-circle <?php echo ($result['step1_completed'] ?? 0) ? 'step-completed' : 'step-incomplete'; ?>">1</div>
+                                    <div class="step-circle <?php echo ($result['step2_completed'] ?? 0) ? 'step-completed' : 'step-incomplete'; ?>">2</div>
+                                    <div class="step-circle <?php echo ($result['step3_completed'] ?? 0) ? 'step-completed' : 'step-incomplete'; ?>">3</div>
                                 </div>
-                                <div class="col-md-6">
-                                    <h6>Câu quan trọng đã chọn:</h6>
-                                    <div class="comparison-box" style="max-height: 300px; overflow-y: auto;">
-                                        <?php 
-                                        $selected_sentences = json_decode($result['selected_sentences'] ?? '[]', true);
-                                        if (!empty($selected_sentences)) {
-                                            $sentences = preg_split('/(?<=[.!?])\s+/', $document['content']);
-                                            foreach ($selected_sentences as $index) {
-                                                if (isset($sentences[$index])) {
-                                                    echo '<div class="selected-sentence">' . htmlspecialchars(trim($sentences[$index])) . '</div>';
+                                <p class="text-center mb-0">
+                                    Hoàn thành: <?php echo date('d/m/Y H:i', strtotime($result['completed_at'] ?? $assignment['updated_at'] ?? date('Y-m-d H:i:s'))); ?>
+                                </p>
+                            </div>
+
+                            <!-- Step 1 Review: Selected Sentences -->
+                            <div class="content-section">
+                                <h5><i class="fas fa-mouse-pointer me-2 text-primary"></i>Bước 1: Câu được chọn</h5>
+                                <div class="row">
+                                    <div class="col-md-6">
+                                        <h6>Nội dung gốc:</h6>
+                                        <div class="comparison-box" style="max-height: 300px; overflow-y: auto;">
+                                            <?php echo nl2br(htmlspecialchars($document['content'])); ?>
+                                        </div>
+                                    </div>
+                                    <div class="col-md-6">
+                                        <h6>Câu quan trọng đã chọn:</h6>
+                                        <div class="comparison-box" style="max-height: 300px; overflow-y: auto;">
+                                            <?php 
+                                            $selected_sentences = json_decode($result['selected_sentences'] ?? '[]', true);
+                                            if (!empty($selected_sentences) && is_array($selected_sentences)) {
+                                                $sentences = preg_split('/(?<=[.!?])\s+/', $document['content']);
+                                                foreach ($selected_sentences as $index) {
+                                                    if (isset($sentences[$index])) {
+                                                        echo '<div class="selected-sentence">' . htmlspecialchars(trim($sentences[$index])) . '</div>';
+                                                    }
                                                 }
+                                            } else {
+                                                echo '<div class="text-muted">Không có câu nào được chọn</div>';
                                             }
-                                        } else {
-                                            echo '<div class="text-muted">Không có câu nào được chọn</div>';
-                                        }
-                                        ?>
-                                    </div>
-                                </div>
-                            </div>
-                            <div class="mt-3">
-                                <label class="form-label">Đánh giá việc chọn câu:</label>
-                                <select class="form-select" name="step1_feedback">
-                                    <option value="excellent">Xuất sắc - Chọn đúng các câu quan trọng</option>
-                                    <option value="good">Tốt - Chọn hầu hết câu quan trọng</option>
-                                    <option value="fair">Khá - Còn thiếu một số câu quan trọng</option>
-                                    <option value="poor">Cần cải thiện - Chọn chưa chính xác</option>
-                                </select>
-                            </div>
-                        </div>
-
-                        <!-- Step 2 Review: Writing Style -->
-                        <div class="content-section">
-                            <h5><i class="fas fa-palette me-2 text-info"></i>Bước 2: Phong cách văn bản</h5>
-                            <div class="row">
-                                <div class="col-md-6">
-                                    <h6>Phong cách đã chọn:</h6>
-                                    <div class="comparison-box">
-                                        <?php 
-                                        $style_names = [
-                                            'formal' => 'Trang trọng',
-                                            'casual' => 'Thân thiện',
-                                            'technical' => 'Kỹ thuật',
-                                            'news' => 'Tin tức'
-                                        ];
-                                        $chosen_style = $result['writing_style'] ?? 'Chưa chọn';
-                                        echo '<span class="badge bg-primary fs-6">' . ($style_names[$chosen_style] ?? $chosen_style) . '</span>';
-                                        ?>
-                                    </div>
-                                </div>
-                                <div class="col-md-6">
-                                    <h6>Phù hợp với nội dung:</h6>
-                                    <div class="comparison-box">
-                                        <div class="form-check">
-                                            <input class="form-check-input" type="radio" name="step2_feedback" value="appropriate" id="style_appropriate">
-                                            <label class="form-check-label" for="style_appropriate">
-                                                <i class="fas fa-check text-success me-1"></i>Phù hợp
-                                            </label>
+                                            ?>
                                         </div>
-                                        <div class="form-check">
-                                            <input class="form-check-input" type="radio" name="step2_feedback" value="inappropriate" id="style_inappropriate">
-                                            <label class="form-check-label" for="style_inappropriate">
-                                                <i class="fas fa-times text-danger me-1"></i>Không phù hợp
-                                            </label>
+                                    </div>
+                                </div>
+                                <div class="mt-3">
+                                    <label class="form-label">Đánh giá việc chọn câu:</label>
+                                    <select class="form-select" name="step1_feedback">
+                                        <option value="excellent">Xuất sắc - Chọn đúng các câu quan trọng</option>
+                                        <option value="good">Tốt - Chọn hầu hết câu quan trọng</option>
+                                        <option value="fair">Khá - Còn thiếu một số câu quan trọng</option>
+                                        <option value="poor">Cần cải thiện - Chọn chưa chính xác</option>
+                                    </select>
+                                </div>
+                            </div>
+
+                            <!-- Step 2 Review: Writing Style -->
+                            <div class="content-section">
+                                <h5><i class="fas fa-palette me-2 text-info"></i>Bước 2: Phong cách văn bản</h5>
+                                <div class="row">
+                                    <div class="col-md-6">
+                                        <h6>Phong cách đã chọn:</h6>
+                                        <div class="comparison-box">
+                                            <?php 
+                                            $style_names = [
+                                                'formal' => 'Trang trọng',
+                                                'casual' => 'Thân thiện',
+                                                'technical' => 'Kỹ thuật',
+                                                'news' => 'Tin tức'
+                                            ];
+                                            $chosen_style = $result['writing_style'] ?? 'Chưa chọn';
+                                            echo '<span class="badge bg-primary fs-6">' . ($style_names[$chosen_style] ?? $chosen_style) . '</span>';
+                                            ?>
+                                        </div>
+                                    </div>
+                                    <div class="col-md-6">
+                                        <h6>Phù hợp với nội dung:</h6>
+                                        <div class="comparison-box">
+                                            <div class="form-check">
+                                                <input class="form-check-input" type="radio" name="step2_feedback" value="appropriate" id="style_appropriate">
+                                                <label class="form-check-label" for="style_appropriate">
+                                                    <i class="fas fa-check text-success me-1"></i>Phù hợp
+                                                </label>
+                                            </div>
+                                            <div class="form-check">
+                                                <input class="form-check-input" type="radio" name="step2_feedback" value="inappropriate" id="style_inappropriate">
+                                                <label class="form-check-label" for="style_inappropriate">
+                                                    <i class="fas fa-times text-danger me-1"></i>Không phù hợp
+                                                </label>
+                                            </div>
                                         </div>
                                     </div>
                                 </div>
                             </div>
-                        </div>
 
-                        <!-- Step 3 Review: Summary Comparison -->
-                        <div class="content-section">
-                            <h5><i class="fas fa-edit me-2 text-success"></i>Bước 3: So sánh bản tóm tắt</h5>
-                            <div class="row">
-                                <div class="col-md-6">
-                                    <h6>Bản tóm tắt AI gốc:</h6>
-                                    <div class="comparison-box" style="max-height: 200px; overflow-y: auto;">
-                                        <?php echo nl2br(htmlspecialchars($document['ai_summary'] ?? 'Không có tóm tắt')); ?>
+                            <!-- Step 3 Review: Summary Comparison -->
+                            <div class="content-section">
+                                <h5><i class="fas fa-edit me-2 text-success"></i>Bước 3: So sánh bản tóm tắt</h5>
+                                <div class="row">
+                                    <div class="col-md-6">
+                                        <h6>Bản tóm tắt AI gốc:</h6>
+                                        <div class="comparison-box" style="max-height: 200px; overflow-y: auto;">
+                                            <?php echo nl2br(htmlspecialchars($document['ai_summary'] ?? 'Không có tóm tắt')); ?>
+                                        </div>
+                                    </div>
+                                    <div class="col-md-6">
+                                        <h6>Bản tóm tắt đã chỉnh sửa:</h6>
+                                        <div class="comparison-box" style="max-height: 200px; overflow-y: auto;">
+                                            <?php echo nl2br(htmlspecialchars($result['edited_summary'] ?? 'Chưa có chỉnh sửa')); ?>
+                                        </div>
                                     </div>
                                 </div>
-                                <div class="col-md-6">
-                                    <h6>Bản tóm tắt đã chỉnh sửa:</h6>
-                                    <div class="comparison-box" style="max-height: 200px; overflow-y: auto;">
-                                        <?php echo nl2br(htmlspecialchars($result['edited_summary'] ?? 'Chưa có chỉnh sửa')); ?>
-                                    </div>
+                                <div class="mt-3">
+                                    <label class="form-label">Chất lượng chỉnh sửa:</label>
+                                    <select class="form-select" name="step3_feedback">
+                                        <option value="improved">Cải thiện đáng kể so với bản gốc</option>
+                                        <option value="same">Tương đương với bản gốc</option>
+                                        <option value="slightly_better">Cải thiện nhẹ</option>
+                                        <option value="worse">Kém hơn bản gốc</option>
+                                    </select>
                                 </div>
                             </div>
-                            <div class="mt-3">
-                                <label class="form-label">Chất lượng chỉnh sửa:</label>
-                                <select class="form-select" name="step3_feedback">
-                                    <option value="improved">Cải thiện đáng kể so với bản gốc</option>
-                                    <option value="same">Tương đương với bản gốc</option>
-                                    <option value="slightly_better">Cải thiện nhẹ</option>
-                                    <option value="worse">Kém hơn bản gốc</option>
-                                </select>
-                            </div>
                         </div>
-
                     </div>
-                </div>
-            <?php endforeach; ?>
+                <?php endforeach; ?>
+            <?php endif; ?>
 
             <!-- Review Form -->
             <div class="review-container">
@@ -576,7 +625,7 @@ if ($assignment_id) {
                                 
                                 <div class="mb-3">
                                     <label class="form-label">Kết quả review:</label>
-                                    <select class="form-select" name="review_status" required>
+                                    <select class="form-select" name="review_status" required <?php echo $assignment['existing_rating'] ? 'disabled' : ''; ?>>
                                         <option value="">Chọn kết quả</option>
                                         <option value="approved" <?php echo ($assignment['existing_review_status'] == 'approved') ? 'selected' : ''; ?>>
                                             Chấp thuận
@@ -637,6 +686,9 @@ if ($assignment_id) {
         }
 
         function setRating(rating) {
+            const existingRating = <?php echo $assignment['existing_rating'] ?? 0; ?>;
+            if (existingRating > 0) return; // Prevent changing existing rating
+            
             document.getElementById('ratingValue').value = rating;
             
             // Update visual stars
@@ -690,6 +742,11 @@ if ($assignment_id) {
             const existingRating = <?php echo $assignment['existing_rating'] ?? 0; ?>;
             if (existingRating > 0) {
                 setRating(existingRating);
+                // Disable rating interaction for existing reviews
+                document.querySelectorAll('.rating-stars').forEach(star => {
+                    star.style.cursor = 'default';
+                    star.onclick = null;
+                });
             }
         });
     </script>

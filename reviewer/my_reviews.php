@@ -30,6 +30,42 @@ try {
     die("Database error: " . $e->getMessage());
 }
 
+// Create necessary tables if they don't exist
+try {
+    // Create reviews table with correct structure
+    $create_reviews_table = "CREATE TABLE IF NOT EXISTS reviews (
+        id int(11) NOT NULL AUTO_INCREMENT,
+        assignment_id int(11) NOT NULL,
+        reviewer_id int(11) NOT NULL,
+        rating int(11) DEFAULT NULL,
+        comments text,
+        status enum('pending','approved','rejected','needs_revision') DEFAULT 'pending',
+        feedback longtext,
+        created_at timestamp DEFAULT CURRENT_TIMESTAMP,
+        updated_at timestamp DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY unique_assignment_reviewer (assignment_id, reviewer_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+    $db->exec($create_reviews_table);
+    
+    // Create assignments table if it doesn't exist
+    $create_assignments_table = "CREATE TABLE IF NOT EXISTS assignments (
+        id int(11) NOT NULL AUTO_INCREMENT,
+        user_id int(11) NOT NULL,
+        document_id int(11) DEFAULT NULL,
+        group_id int(11) DEFAULT NULL,
+        assigned_by int(11) NOT NULL,
+        status enum('pending','in_progress','completed','reviewed') DEFAULT 'pending',
+        assigned_at timestamp DEFAULT CURRENT_TIMESTAMP,
+        updated_at timestamp DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+    $db->exec($create_assignments_table);
+    
+} catch (Exception $e) {
+    // Tables might already exist - continue
+}
+
 $error_message = '';
 $success_message = '';
 
@@ -37,32 +73,12 @@ $success_message = '';
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['action'])) {
     try {
         if ($_POST['action'] == 'update_review') {
-            // Create reviews table if it doesn't exist
-            try {
-                $create_reviews_table = "CREATE TABLE IF NOT EXISTS reviews (
-                    id int(11) NOT NULL AUTO_INCREMENT,
-                    assignment_id int(11) NOT NULL,
-                    reviewer_id int(11) NOT NULL,
-                    rating int(11) DEFAULT NULL,
-                    comments text,
-                    status enum('pending','approved','rejected','needs_revision') DEFAULT 'pending',
-                    feedback longtext,
-                    created_at timestamp DEFAULT CURRENT_TIMESTAMP,
-                    updated_at timestamp DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                    PRIMARY KEY (id),
-                    UNIQUE KEY unique_assignment_reviewer (assignment_id, reviewer_id)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
-                $db->exec($create_reviews_table);
-            } catch (Exception $e) {
-                // Table already exists or creation failed
-            }
-            
             $review_id = intval($_POST['review_id']);
             $rating = intval($_POST['rating']);
             $comments = trim($_POST['comments']);
             $status = $_POST['status'];
             
-            $query = "UPDATE reviews SET rating = ?, comments = ?, status = ? WHERE id = ? AND reviewer_id = ?";
+            $query = "UPDATE reviews SET rating = ?, comments = ?, status = ?, updated_at = NOW() WHERE id = ? AND reviewer_id = ?";
             $stmt = $db->prepare($query);
             $stmt->execute([$rating, $comments, $status, $review_id, $current_user_id]);
             
@@ -90,8 +106,11 @@ $limit = 10;
 $offset = ($page - 1) * $limit;
 
 $reviews = [];
+$total_records = 0;
+$total_pages = 0;
+
 try {
-    // Check if reviews table exists first
+    // Check if tables exist first
     $table_check = $db->query("SHOW TABLES LIKE 'reviews'");
     if ($table_check->rowCount() == 0) {
         // Reviews table doesn't exist - show empty state
@@ -99,6 +118,17 @@ try {
         $total_records = 0;
         $total_pages = 0;
     } else {
+        // Check what columns exist in reviews table
+        $reviews_columns = [];
+        try {
+            $check_reviews_columns = $db->query("SHOW COLUMNS FROM reviews");
+            while ($col = $check_reviews_columns->fetch(PDO::FETCH_ASSOC)) {
+                $reviews_columns[] = $col['Field'];
+            }
+        } catch (Exception $e) {
+            $reviews_columns = [];
+        }
+        
         $where_clause = "r.reviewer_id = ?";
         $params = [$current_user_id];
         
@@ -114,8 +144,15 @@ try {
         $total_records = $stmt->fetch()['total'];
         $total_pages = ceil($total_records / $limit);
         
+        // Build select fields based on available columns
+        $rating_field = in_array('rating', $reviews_columns) ? 'r.rating' : 'NULL as rating';
+        $comments_field = in_array('comments', $reviews_columns) ? 'r.comments' : 'NULL as comments';
+        $status_field = in_array('status', $reviews_columns) ? 'r.status' : "'pending' as status";
+        $created_field = in_array('created_at', $reviews_columns) ? 'r.created_at' : 'NOW() as created_at';
+        $updated_field = in_array('updated_at', $reviews_columns) ? 'r.updated_at' : 'r.created_at as updated_at';
+        
         // Get reviews with assignment info
-        $query = "SELECT r.*, a.id as assignment_id,
+        $query = "SELECT r.id, r.assignment_id, $rating_field, $comments_field, $status_field, $created_field, $updated_field,
                          CASE 
                              WHEN a.document_id IS NOT NULL AND a.document_id > 0 THEN d.title 
                              WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN dg.group_name 
@@ -126,12 +163,12 @@ try {
                              WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN 'multi' 
                              ELSE 'single'
                          END as assignment_type,
-                         u.full_name as labeler_name
+                         COALESCE(u.full_name, 'Unknown') as labeler_name
                   FROM reviews r
                   JOIN assignments a ON r.assignment_id = a.id
                   LEFT JOIN documents d ON a.document_id = d.id
                   LEFT JOIN document_groups dg ON a.group_id = dg.id
-                  JOIN users u ON a.user_id = u.id
+                  LEFT JOIN users u ON a.user_id = u.id
                   WHERE $where_clause 
                   ORDER BY r.id DESC 
                   LIMIT $limit OFFSET $offset";
@@ -140,13 +177,23 @@ try {
         $stmt->execute($params);
         $reviews = $stmt->fetchAll(PDO::FETCH_ASSOC);
         
-        // Add dummy data for missing fields
+        // Add dummy data for missing fields and format data
         foreach ($reviews as &$review) {
             $review['step1_completed'] = 1;
             $review['step2_completed'] = 1; 
             $review['step3_completed'] = 1;
             $review['writing_style'] = $review['writing_style'] ?? '';
             $review['completed_at'] = $review['updated_at'] ?? $review['created_at'];
+            
+            // Ensure document_title is not empty
+            if (empty($review['document_title']) || $review['document_title'] == 'Untitled') {
+                $review['document_title'] = 'Assignment #' . $review['assignment_id'];
+            }
+            
+            // Ensure labeler_name is not empty
+            if (empty($review['labeler_name'])) {
+                $review['labeler_name'] = 'Unknown Labeler';
+            }
         }
     }
 } catch (Exception $e) {
@@ -159,7 +206,7 @@ try {
 // Statistics  
 $stats = [];
 try {
-    if (!empty($reviews) || ($table_check && $table_check->rowCount() > 0)) {
+    if ($table_check && $table_check->rowCount() > 0) {
         $query = "SELECT 
                     COUNT(*) as total,
                     AVG(rating) as avg_rating,
@@ -249,6 +296,15 @@ try {
         }
         .rating-stars {
             color: #ffc107;
+        }
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+        }
+        .empty-state i {
+            font-size: 4rem;
+            color: #dee2e6;
+            margin-bottom: 20px;
         }
     </style>
 </head>
@@ -365,10 +421,10 @@ try {
         <!-- Reviews List -->
         <div class="content-card">
             <?php if (empty($reviews)): ?>
-                <div class="text-center text-muted py-5">
-                    <i class="fas fa-clipboard-list fa-3x mb-3"></i>
+                <div class="empty-state">
+                    <i class="fas fa-clipboard-list"></i>
                     <h5>Không có review nào</h5>
-                    <p>
+                    <p class="text-muted">
                         <?php if ($filter_status): ?>
                             Không có review nào với trạng thái "<?php echo ucfirst($filter_status); ?>".
                         <?php else: ?>
@@ -401,7 +457,8 @@ try {
                                     <td>#<?php echo $review['id']; ?></td>
                                     <td>
                                         <div class="fw-bold">
-                                            <?php echo htmlspecialchars(substr($review['document_title'] ?: 'Không có tiêu đề', 0, 30)); ?>...
+                                            <?php echo htmlspecialchars(substr($review['document_title'], 0, 30)); ?>
+                                            <?php if (strlen($review['document_title']) > 30): ?>...<?php endif; ?>
                                         </div>
                                         <small class="text-muted">
                                             Assignment #<?php echo $review['assignment_id']; ?> • 

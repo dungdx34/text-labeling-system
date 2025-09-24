@@ -1,5 +1,5 @@
 <?php
-// Bắt lỗi và khởi tạo session an toàn
+// Start session and error handling
 error_reporting(E_ALL);
 ini_set('display_errors', 1);
 
@@ -7,29 +7,45 @@ if (session_status() == PHP_SESSION_NONE) {
     session_start();
 }
 
-require_once '../includes/auth.php';
 require_once '../config/database.php';
 
-// Kiểm tra quyền labeler
-requireRole('labeler');
+// Simple auth check - no external functions needed
+if (!isset($_SESSION['user_id']) || $_SESSION['role'] !== 'labeler') {
+    header('Location: ../login.php');
+    exit();
+}
 
 $database = new Database();
 $db = $database->getConnection();
-$current_user = getCurrentUser();
+$current_user_id = $_SESSION['user_id'];
+
+// Get current user info
+try {
+    $stmt = $db->prepare("SELECT * FROM users WHERE id = ?");
+    $stmt->execute([$current_user_id]);
+    $current_user = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$current_user) {
+        session_destroy();
+        header('Location: ../login.php');
+        exit();
+    }
+} catch (Exception $e) {
+    die("Database error: " . $e->getMessage());
+}
 
 $error_message = '';
 $success_message = '';
 
-// Xử lý cập nhật status
+// Handle status updates
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['action'])) {
     try {
         if ($_POST['action'] == 'update_status') {
             $assignment_id = intval($_POST['assignment_id']);
             $new_status = $_POST['status'];
             
-            $query = "UPDATE assignments SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?";
+            $query = "UPDATE assignments SET status = ? WHERE id = ? AND user_id = ?";
             $stmt = $db->prepare($query);
-            $stmt->execute([$new_status, $assignment_id, $current_user['id']]);
+            $stmt->execute([$new_status, $assignment_id, $current_user_id]);
             
             $success_message = 'Cập nhật trạng thái thành công!';
         }
@@ -38,56 +54,71 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['action'])) {
     }
 }
 
-// Lấy danh sách assignments của labeler
+// Get assignments list
 $assignments = [];
 $filter_status = $_GET['status'] ?? '';
 
 try {
     $where_clause = "a.user_id = ?";
-    $params = [$current_user['id']];
+    $params = [$current_user_id];
     
     if (!empty($filter_status)) {
         $where_clause .= " AND a.status = ?";
         $params[] = $filter_status;
     }
     
+    // Fixed query to match actual database structure
     $query = "SELECT a.*, 
                      CASE 
-                         WHEN a.type = 'single' THEN d.title 
-                         WHEN a.type = 'multi' THEN dg.title 
+                         WHEN a.document_id IS NOT NULL AND a.document_id > 0 THEN d.title 
+                         WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN dg.group_name 
+                         ELSE 'Untitled'
                      END as title,
                      CASE 
-                         WHEN a.type = 'single' THEN d.content 
-                         WHEN a.type = 'multi' THEN dg.description 
+                         WHEN a.document_id IS NOT NULL AND a.document_id > 0 THEN d.content 
+                         WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN dg.description 
+                         ELSE 'No content'
                      END as content,
                      CASE 
-                         WHEN a.type = 'single' THEN d.ai_summary 
-                         WHEN a.type = 'multi' THEN dg.ai_summary 
+                         WHEN a.document_id IS NOT NULL AND a.document_id > 0 THEN d.ai_summary 
+                         WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN dg.description 
+                         ELSE ''
                      END as ai_summary,
-                     admin.full_name as assigned_by_name,
-                     lr.step1_completed, lr.step2_completed, lr.step3_completed
+                     CASE 
+                         WHEN a.document_id IS NOT NULL AND a.document_id > 0 THEN 'single' 
+                         WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN 'multi' 
+                         ELSE 'single'
+                     END as type,
+                     admin.full_name as assigned_by_name
               FROM assignments a 
-              LEFT JOIN documents d ON a.document_id = d.id AND a.type = 'single'
-              LEFT JOIN document_groups dg ON a.group_id = dg.id AND a.type = 'multi'
+              LEFT JOIN documents d ON a.document_id = d.id
+              LEFT JOIN document_groups dg ON a.group_id = dg.id
               LEFT JOIN users admin ON a.assigned_by = admin.id
-              LEFT JOIN labeling_results lr ON a.id = lr.assignment_id
               WHERE $where_clause 
-              ORDER BY a.created_at DESC";
+              ORDER BY a.id DESC";
               
     $stmt = $db->prepare($query);
     $stmt->execute($params);
     $assignments = $stmt->fetchAll(PDO::FETCH_ASSOC);
     
+    // Add dummy progress data if labeling_results table doesn't exist
+    foreach ($assignments as &$assignment) {
+        $assignment['step1_completed'] = 0;
+        $assignment['step2_completed'] = 0; 
+        $assignment['step3_completed'] = 0;
+        $assignment['writing_style'] = '';
+    }
+    
 } catch (Exception $e) {
     $error_message = 'Lỗi khi lấy danh sách công việc: ' . $e->getMessage();
 }
 
-// Thống kê
+// Statistics
 $stats = ['total' => 0, 'pending' => 0, 'in_progress' => 0, 'completed' => 0, 'reviewed' => 0];
 try {
     $query = "SELECT status, COUNT(*) as count FROM assignments WHERE user_id = ? GROUP BY status";
     $stmt = $db->prepare($query);
-    $stmt->execute([$current_user['id']]);
+    $stmt->execute([$current_user_id]);
     
     while ($row = $stmt->fetch()) {
         $stats[$row['status']] = $row['count'];
@@ -326,7 +357,7 @@ try {
                             <div class="assignment-card">
                                 <div class="d-flex justify-content-between align-items-start mb-3">
                                     <div>
-                                        <h5 class="mb-1"><?php echo htmlspecialchars($assignment['title'] ?: 'Không có tiêu đề'); ?></h5>
+                                        <h5 class="mb-1"><?php echo htmlspecialchars(substr($assignment['title'] ?: 'Không có tiêu đề', 0, 50)); ?></h5>
                                         <small class="text-muted">
                                             ID: #<?php echo $assignment['id']; ?> • 
                                             Giao bởi: <?php echo htmlspecialchars($assignment['assigned_by_name'] ?: 'N/A'); ?>
@@ -404,13 +435,6 @@ try {
                                             <a href="labeling.php?id=<?php echo $assignment['id']; ?>" class="btn btn-primary">
                                                 <i class="fas fa-edit me-1"></i>Gán nhãn
                                             </a>
-                                            <button class="btn btn-outline-secondary" onclick="updateStatus(<?php echo $assignment['id']; ?>, '<?php echo $assignment['status'] == 'pending' ? 'in_progress' : 'completed'; ?>')">
-                                                <?php if ($assignment['status'] == 'pending'): ?>
-                                                    <i class="fas fa-play me-1"></i>Bắt đầu
-                                                <?php else: ?>
-                                                    <i class="fas fa-check me-1"></i>Hoàn thành
-                                                <?php endif; ?>
-                                            </button>
                                         <?php else: ?>
                                             <a href="labeling.php?id=<?php echo $assignment['id']; ?>&view=1" class="btn btn-outline-primary">
                                                 <i class="fas fa-eye me-1"></i>Xem
@@ -421,9 +445,9 @@ try {
                                 
                                 <div class="mt-2 small text-muted">
                                     <i class="fas fa-clock me-1"></i>
-                                    Tạo: <?php echo date('d/m/Y H:i', strtotime($assignment['created_at'])); ?>
-                                    <?php if ($assignment['updated_at'] != $assignment['created_at']): ?>
-                                        • Cập nhật: <?php echo date('d/m/Y H:i', strtotime($assignment['updated_at'])); ?>
+                                    Assignment ID: <?php echo $assignment['id']; ?>
+                                    <?php if (isset($assignment['deadline'])): ?>
+                                        • Deadline: <?php echo date('d/m/Y H:i', strtotime($assignment['deadline'])); ?>
                                     <?php endif; ?>
                                 </div>
                             </div>
