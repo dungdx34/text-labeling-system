@@ -136,6 +136,43 @@ DELIMITER ;
 /*!50003 SET collation_connection  = @saved_col_connection */ ;
 
 --
+-- Table structure for table `assignments`
+--
+
+DROP TABLE IF EXISTS `assignments`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!40101 SET character_set_client = utf8 */;
+CREATE TABLE `assignments` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `user_id` int(11) NOT NULL,
+  `document_id` int(11) DEFAULT NULL,
+  `group_id` int(11) DEFAULT NULL,
+  `task_type` enum('single','multi') DEFAULT 'single',
+  `status` enum('pending','in_progress','completed','reviewed') DEFAULT 'pending',
+  `assigned_by` int(11) DEFAULT NULL,
+  `assigned_at` timestamp NOT NULL DEFAULT current_timestamp(),
+  `started_at` timestamp NULL DEFAULT NULL,
+  `completed_at` timestamp NULL DEFAULT NULL,
+  `notes` text DEFAULT NULL,
+  `deadline` datetime DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `idx_user_id` (`user_id`),
+  KEY `idx_status` (`status`),
+  KEY `idx_assigned_at` (`assigned_at`)
+) ENGINE=InnoDB AUTO_INCREMENT=4 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+/*!40101 SET character_set_client = @saved_cs_client */;
+
+--
+-- Dumping data for table `assignments`
+--
+
+LOCK TABLES `assignments` WRITE;
+/*!40000 ALTER TABLE `assignments` DISABLE KEYS */;
+INSERT INTO `assignments` VALUES (1,9,83,NULL,'single','pending',1,'2025-09-24 07:29:05',NULL,NULL,NULL,NULL),(2,9,82,NULL,'single','in_progress',1,'2025-09-24 07:29:05',NULL,NULL,NULL,NULL),(3,9,81,NULL,'single','completed',1,'2025-09-24 07:29:05',NULL,NULL,NULL,NULL);
+/*!40000 ALTER TABLE `assignments` ENABLE KEYS */;
+UNLOCK TABLES;
+
+--
 -- Table structure for table `backup_documents`
 --
 
@@ -276,6 +313,9 @@ CREATE TABLE `document_groups` (
   `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
   `updated_at` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp(),
   `is_auto_generated_title` tinyint(1) DEFAULT 0,
+  `combined_ai_summary` text DEFAULT NULL,
+  `status` enum('pending','assigned','completed','reviewed') DEFAULT 'pending',
+  `total_documents` int(11) DEFAULT 0,
   PRIMARY KEY (`id`),
   KEY `idx_created_by` (`created_by`),
   KEY `idx_created_at` (`created_at`),
@@ -291,7 +331,7 @@ CREATE TABLE `document_groups` (
 
 LOCK TABLES `document_groups` WRITE;
 /*!40000 ALTER TABLE `document_groups` DISABLE KEYS */;
-INSERT INTO `document_groups` VALUES (17,'Blockchain Công nghệ Blockchain và Cryptocurrency','Blockchain Công nghệ Blockchain và Cryptocurrency','Tổng quan về công nghệ blockchain và ứng dụng trong tiền điện tử',1,'2025-09-24 00:38:31','2025-09-24 00:38:31',0),(18,'Blockchain Cách mạng công nghiệp 4.0','Blockchain Cách mạng công nghiệp 4.0','Tổng quan về cuộc cách mạng công nghiệp thứ 4 và các công nghệ liên quan',1,'2025-09-24 00:38:31','2025-09-24 00:38:31',0),(19,'Blockchain Công nghệ Blockchain và Cryptocurrency','Blockchain Công nghệ Blockchain và Cryptocurrency','Tổng quan về công nghệ blockchain và ứng dụng trong tiền điện tử',1,'2025-09-24 00:38:32','2025-09-24 00:38:32',0),(20,'Blockchain Công nghệ Blockchain và Cryptocurrency','Blockchain Công nghệ Blockchain và Cryptocurrency','Tổng quan về công nghệ blockchain và ứng dụng trong tiền điện tử',1,'2025-09-24 00:38:32','2025-09-24 00:38:32',0),(22,'Lập trình Web hiện đại','Lập trình Web hiện đại','Tổng quan về các công nghệ web frontend và backend',1,'2025-09-24 00:38:32','2025-09-24 00:38:32',0),(23,'Data Science và Analytics','Data Science và Analytics','Khám phá về khoa học dữ liệu và phân tích dữ liệu',1,'2025-09-24 00:38:32','2025-09-24 00:38:32',0);
+INSERT INTO `document_groups` VALUES (17,'Blockchain Công nghệ Blockchain và Cryptocurrency','Blockchain Công nghệ Blockchain và Cryptocurrency','Tổng quan về công nghệ blockchain và ứng dụng trong tiền điện tử',1,'2025-09-24 00:38:31','2025-09-24 00:38:31',0,NULL,'pending',0),(18,'Blockchain Cách mạng công nghiệp 4.0','Blockchain Cách mạng công nghiệp 4.0','Tổng quan về cuộc cách mạng công nghiệp thứ 4 và các công nghệ liên quan',1,'2025-09-24 00:38:31','2025-09-24 00:38:31',0,NULL,'pending',0),(19,'Blockchain Công nghệ Blockchain và Cryptocurrency','Blockchain Công nghệ Blockchain và Cryptocurrency','Tổng quan về công nghệ blockchain và ứng dụng trong tiền điện tử',1,'2025-09-24 00:38:32','2025-09-24 00:38:32',0,NULL,'pending',0),(20,'Blockchain Công nghệ Blockchain và Cryptocurrency','Blockchain Công nghệ Blockchain và Cryptocurrency','Tổng quan về công nghệ blockchain và ứng dụng trong tiền điện tử',1,'2025-09-24 00:38:32','2025-09-24 00:38:32',0,NULL,'pending',0),(22,'Lập trình Web hiện đại','Lập trình Web hiện đại','Tổng quan về các công nghệ web frontend và backend',1,'2025-09-24 00:38:32','2025-09-24 00:38:32',0,NULL,'pending',0),(23,'Data Science và Analytics','Data Science và Analytics','Khám phá về khoa học dữ liệu và phân tích dữ liệu',1,'2025-09-24 00:38:32','2025-09-24 00:38:32',0,NULL,'pending',0);
 /*!40000 ALTER TABLE `document_groups` ENABLE KEYS */;
 UNLOCK TABLES;
 
@@ -413,6 +453,40 @@ LOCK TABLES `edited_summaries` WRITE;
 UNLOCK TABLES;
 
 --
+-- Table structure for table `labeling_results`
+--
+
+DROP TABLE IF EXISTS `labeling_results`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!40101 SET character_set_client = utf8 */;
+CREATE TABLE `labeling_results` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `assignment_id` int(11) NOT NULL,
+  `document_id` int(11) NOT NULL,
+  `selected_sentences` longtext DEFAULT NULL,
+  `writing_style` varchar(50) DEFAULT NULL,
+  `edited_summary` longtext DEFAULT NULL,
+  `step1_completed` tinyint(1) DEFAULT 0,
+  `step2_completed` tinyint(1) DEFAULT 0,
+  `step3_completed` tinyint(1) DEFAULT 0,
+  `auto_saved_at` timestamp NULL DEFAULT NULL,
+  `completed_at` timestamp NULL DEFAULT NULL,
+  `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `unique_assignment_document` (`assignment_id`,`document_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+/*!40101 SET character_set_client = @saved_cs_client */;
+
+--
+-- Dumping data for table `labeling_results`
+--
+
+LOCK TABLES `labeling_results` WRITE;
+/*!40000 ALTER TABLE `labeling_results` DISABLE KEYS */;
+/*!40000 ALTER TABLE `labeling_results` ENABLE KEYS */;
+UNLOCK TABLES;
+
+--
 -- Table structure for table `labeling_tasks`
 --
 
@@ -514,8 +588,14 @@ CREATE TABLE `reviews` (
   `approved` tinyint(1) DEFAULT 0,
   `review_time_minutes` int(11) DEFAULT NULL,
   `review_date` timestamp NOT NULL DEFAULT current_timestamp(),
+  `assignment_id` int(11) NOT NULL,
+  `comments` text DEFAULT NULL,
+  `status` enum('pending','approved','rejected','needs_revision') DEFAULT 'pending',
+  `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
+  `updated_at` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp(),
   PRIMARY KEY (`id`),
   UNIQUE KEY `unique_task_reviewer` (`task_id`,`reviewer_id`),
+  UNIQUE KEY `unique_assignment_reviewer` (`assignment_id`,`reviewer_id`),
   KEY `idx_task_id` (`task_id`),
   KEY `idx_reviewer_id` (`reviewer_id`),
   KEY `idx_rating` (`rating`),
@@ -797,7 +877,7 @@ CREATE TABLE `users` (
   KEY `idx_role` (`role`),
   KEY `idx_status` (`status`),
   KEY `idx_email` (`email`)
-) ENGINE=InnoDB AUTO_INCREMENT=6 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB AUTO_INCREMENT=11 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -806,7 +886,7 @@ CREATE TABLE `users` (
 
 LOCK TABLES `users` WRITE;
 /*!40000 ALTER TABLE `users` DISABLE KEYS */;
-INSERT INTO `users` VALUES (1,'admin','$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi','Administrator','admin@textlabeling.local','admin','active','2025-09-23 15:41:27','2025-09-23 15:41:27',NULL),(2,'labeler1','$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi','Labeler One','labeler1@textlabeling.local','labeler','active','2025-09-23 15:41:27','2025-09-23 15:41:27',NULL),(3,'labeler2','$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi','Labeler Two','labeler2@textlabeling.local','labeler','active','2025-09-23 15:41:27','2025-09-23 15:41:27',NULL),(4,'reviewer1','$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi','Reviewer One','reviewer1@textlabeling.local','reviewer','active','2025-09-23 15:41:27','2025-09-23 15:41:27',NULL),(5,'reviewer2','$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi','Reviewer Two','reviewer2@textlabeling.local','reviewer','active','2025-09-23 15:41:27','2025-09-23 15:41:27',NULL);
+INSERT INTO `users` VALUES (1,'admin','$2y$10$tVrctDW6wrsapG2q3AMWY.OmnKIDNrOOU1LoxGak4RXfq0sWmuTCC','Administrator','admin@textlabeling.local','admin','active','2025-09-23 15:41:27','2025-09-24 14:22:49','2025-09-24 14:22:49'),(2,'labeler1','$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi','Labeler One','labeler1@textlabeling.local','labeler','active','2025-09-23 15:41:27','2025-09-23 15:41:27',NULL),(3,'labeler2','$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi','Labeler Two','labeler2@textlabeling.local','labeler','active','2025-09-23 15:41:27','2025-09-23 15:41:27',NULL),(4,'reviewer1','$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi','Reviewer One','reviewer1@textlabeling.local','reviewer','active','2025-09-23 15:41:27','2025-09-23 15:41:27',NULL),(5,'reviewer2','$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi','Reviewer Two','reviewer2@textlabeling.local','reviewer','active','2025-09-23 15:41:27','2025-09-23 15:41:27',NULL),(9,'label1','$2y$10$n.xqdnyvOoB6.fLTcKWyCOPwlDVXcqUwnruYu/otf/110XPCBgb/u','Labeler One','label1@example.com','labeler','active','2025-09-24 07:24:07','2025-09-24 14:20:48','2025-09-24 14:20:48'),(10,'review1','$2y$10$l8SMMLmzwQjbum6yj.ozq.jQEp42NG7WnJz/ulND0ASC2MUSegcPG','Reviewer One','review1@example.com','reviewer','active','2025-09-24 07:24:07','2025-09-24 14:22:41','2025-09-24 14:22:41');
 /*!40000 ALTER TABLE `users` ENABLE KEYS */;
 UNLOCK TABLES;
 
@@ -977,4 +1057,4 @@ UNLOCK TABLES;
 /*!40101 SET COLLATION_CONNECTION=@OLD_COLLATION_CONNECTION */;
 /*!40111 SET SQL_NOTES=@OLD_SQL_NOTES */;
 
--- Dump completed on 2025-09-24  7:41:44
+-- Dump completed on 2025-09-24 21:26:50

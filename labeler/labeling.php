@@ -33,30 +33,6 @@ try {
     die("Database error: " . $e->getMessage());
 }
 
-// Create necessary tables if they don't exist
-try {
-    $create_results_table = "CREATE TABLE IF NOT EXISTS labeling_results (
-        id int(11) NOT NULL AUTO_INCREMENT,
-        assignment_id int(11) NOT NULL,
-        document_id int(11) NOT NULL,
-        selected_sentences longtext,
-        writing_style varchar(50) DEFAULT NULL,
-        edited_summary longtext,
-        step1_completed tinyint(1) DEFAULT 0,
-        step2_completed tinyint(1) DEFAULT 0,
-        step3_completed tinyint(1) DEFAULT 0,
-        auto_saved_at timestamp NULL DEFAULT NULL,
-        completed_at timestamp NULL DEFAULT NULL,
-        created_at timestamp DEFAULT CURRENT_TIMESTAMP,
-        updated_at timestamp DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        PRIMARY KEY (id),
-        UNIQUE KEY unique_assignment_document (assignment_id, document_id)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
-    $db->exec($create_results_table);
-} catch (Exception $e) {
-    // Table might already exist
-}
-
 $error_message = '';
 $success_message = '';
 $assignment = null;
@@ -84,36 +60,18 @@ if (!$assignment_id) {
     }
 }
 
-// Check what columns exist in related tables
-$document_group_columns = [];
-try {
-    $table_check = $db->query("SHOW TABLES LIKE 'document_groups'");
-    if ($table_check->rowCount() > 0) {
-        $columns_result = $db->query("SHOW COLUMNS FROM document_groups");
-        while ($col = $columns_result->fetch(PDO::FETCH_ASSOC)) {
-            $document_group_columns[] = $col['Field'];
-        }
-    }
-} catch (Exception $e) {
-    $document_group_columns = ['id', 'group_name', 'description'];
-}
-
 // Get assignment info
 if ($assignment_id) {
     try {
-        // Build query based on available columns
-        $group_name_field = in_array('group_name', $document_group_columns) ? 'dg.group_name' : 'CONCAT("Group #", a.group_id)';
-        $group_desc_field = in_array('description', $document_group_columns) ? 'dg.description' : '"No description"';
-        
         $query = "SELECT a.*, 
                          CASE 
                              WHEN a.document_id IS NOT NULL AND a.document_id > 0 THEN d.title 
-                             WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN $group_name_field 
+                             WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN dg.group_name 
                              ELSE 'Untitled'
                          END as title,
                          CASE 
                              WHEN a.document_id IS NOT NULL AND a.document_id > 0 THEN d.ai_summary 
-                             WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN $group_desc_field 
+                             WHEN a.group_id IS NOT NULL AND a.group_id > 0 THEN dg.description 
                              ELSE ''
                          END as ai_summary,
                          CASE 
@@ -147,20 +105,17 @@ if ($assignment_id) {
                     $documents = [$doc];
                 }
             } elseif ($assignment['assignment_type'] == 'multi' && $assignment['group_id']) {
-                // Check if document_group_items table exists
-                $table_check = $db->query("SHOW TABLES LIKE 'document_group_items'");
-                if ($table_check->rowCount() > 0) {
-                    $query = "SELECT d.* FROM documents d 
-                              JOIN document_group_items dgi ON d.id = dgi.document_id 
-                              WHERE dgi.group_id = ? 
-                              ORDER BY dgi.sort_order";
-                    $stmt = $db->prepare($query);
-                    $stmt->execute([$assignment['group_id']]);
-                    $documents = $stmt->fetchAll(PDO::FETCH_ASSOC);
-                }
+                // Get documents in group via document_group_items table
+                $query = "SELECT d.* FROM documents d 
+                          JOIN document_group_items dgi ON d.id = dgi.document_id 
+                          WHERE dgi.group_id = ? 
+                          ORDER BY dgi.sort_order";
+                $stmt = $db->prepare($query);
+                $stmt->execute([$assignment['group_id']]);
+                $documents = $stmt->fetchAll(PDO::FETCH_ASSOC);
             }
             
-            // Get existing labeling results
+            // Get existing labeling results if table exists
             $results_map = [];
             try {
                 $query = "SELECT * FROM labeling_results WHERE assignment_id = ?";
@@ -173,7 +128,30 @@ if ($assignment_id) {
                     $results_map[$result['document_id']] = $result;
                 }
             } catch (Exception $e) {
-                $results_map = [];
+                // Table doesn't exist, create it
+                try {
+                    $create_table = "CREATE TABLE IF NOT EXISTS labeling_results (
+                        id int(11) NOT NULL AUTO_INCREMENT,
+                        assignment_id int(11) NOT NULL,
+                        document_id int(11) NOT NULL,
+                        selected_sentences longtext,
+                        writing_style varchar(50) DEFAULT NULL,
+                        edited_summary longtext,
+                        step1_completed tinyint(1) DEFAULT 0,
+                        step2_completed tinyint(1) DEFAULT 0,
+                        step3_completed tinyint(1) DEFAULT 0,
+                        auto_saved_at timestamp NULL DEFAULT NULL,
+                        completed_at timestamp NULL DEFAULT NULL,
+                        created_at timestamp DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (id),
+                        UNIQUE KEY unique_assignment_document (assignment_id, document_id)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+                    $db->exec($create_table);
+                    $results_map = [];
+                } catch (Exception $e2) {
+                    // If we can't create table, use empty results
+                    $results_map = [];
+                }
             }
         }
     } catch (Exception $e) {
@@ -195,51 +173,89 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && !$view_only) {
             $step2_completed = isset($_POST['step2_completed']) ? 1 : 0;
             $step3_completed = isset($_POST['step3_completed']) ? 1 : 0;
             
-            // Check if result exists
-            $query = "SELECT id FROM labeling_results WHERE assignment_id = ? AND document_id = ?";
-            $stmt = $db->prepare($query);
-            $stmt->execute([$assignment_id, $document_id]);
-            $existing = $stmt->fetch();
-            
-            if ($existing) {
-                // Update
-                $query = "UPDATE labeling_results SET 
-                          selected_sentences = ?, writing_style = ?, edited_summary = ?,
-                          step1_completed = ?, step2_completed = ?, step3_completed = ?,
-                          auto_saved_at = CURRENT_TIMESTAMP,
-                          completed_at = CASE WHEN ? = 1 AND ? = 1 AND ? = 1 THEN CURRENT_TIMESTAMP ELSE completed_at END,
-                          updated_at = CURRENT_TIMESTAMP
-                          WHERE assignment_id = ? AND document_id = ?";
+            try {
+                // Check if result exists
+                $query = "SELECT id FROM labeling_results WHERE assignment_id = ? AND document_id = ?";
                 $stmt = $db->prepare($query);
-                $stmt->execute([
-                    $selected_sentences, $writing_style, $edited_summary,
-                    $step1_completed, $step2_completed, $step3_completed,
-                    $step1_completed, $step2_completed, $step3_completed,
-                    $assignment_id, $document_id
-                ]);
-            } else {
-                // Insert
-                $query = "INSERT INTO labeling_results 
-                          (assignment_id, document_id, selected_sentences, writing_style, edited_summary,
-                           step1_completed, step2_completed, step3_completed, auto_saved_at,
-                           completed_at)
-                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 
-                                  CASE WHEN ? = 1 AND ? = 1 AND ? = 1 THEN CURRENT_TIMESTAMP ELSE NULL END)";
-                $stmt = $db->prepare($query);
-                $stmt->execute([
-                    $assignment_id, $document_id, $selected_sentences, $writing_style, $edited_summary,
-                    $step1_completed, $step2_completed, $step3_completed,
-                    $step1_completed, $step2_completed, $step3_completed
-                ]);
+                $stmt->execute([$assignment_id, $document_id]);
+                $existing = $stmt->fetch();
+                
+                if ($existing) {
+                    // Update
+                    $query = "UPDATE labeling_results SET 
+                              selected_sentences = ?, writing_style = ?, edited_summary = ?,
+                              step1_completed = ?, step2_completed = ?, step3_completed = ?,
+                              auto_saved_at = CURRENT_TIMESTAMP,
+                              completed_at = CASE WHEN ? = 1 AND ? = 1 AND ? = 1 THEN CURRENT_TIMESTAMP ELSE completed_at END
+                              WHERE assignment_id = ? AND document_id = ?";
+                    $stmt = $db->prepare($query);
+                    $stmt->execute([
+                        $selected_sentences, $writing_style, $edited_summary,
+                        $step1_completed, $step2_completed, $step3_completed,
+                        $step1_completed, $step2_completed, $step3_completed,
+                        $assignment_id, $document_id
+                    ]);
+                } else {
+                    // Insert
+                    $query = "INSERT INTO labeling_results 
+                              (assignment_id, document_id, selected_sentences, writing_style, edited_summary,
+                               step1_completed, step2_completed, step3_completed, auto_saved_at,
+                               completed_at)
+                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 
+                                      CASE WHEN ? = 1 AND ? = 1 AND ? = 1 THEN CURRENT_TIMESTAMP ELSE NULL END)";
+                    $stmt = $db->prepare($query);
+                    $stmt->execute([
+                        $assignment_id, $document_id, $selected_sentences, $writing_style, $edited_summary,
+                        $step1_completed, $step2_completed, $step3_completed,
+                        $step1_completed, $step2_completed, $step3_completed
+                    ]);
+                }
+            } catch (Exception $e) {
+                // If table doesn't exist, create it and try again
+                if (strpos($e->getMessage(), "doesn't exist") !== false) {
+                    $create_table = "CREATE TABLE IF NOT EXISTS labeling_results (
+                        id int(11) NOT NULL AUTO_INCREMENT,
+                        assignment_id int(11) NOT NULL,
+                        document_id int(11) NOT NULL,
+                        selected_sentences longtext,
+                        writing_style varchar(50) DEFAULT NULL,
+                        edited_summary longtext,
+                        step1_completed tinyint(1) DEFAULT 0,
+                        step2_completed tinyint(1) DEFAULT 0,
+                        step3_completed tinyint(1) DEFAULT 0,
+                        auto_saved_at timestamp NULL DEFAULT NULL,
+                        completed_at timestamp NULL DEFAULT NULL,
+                        created_at timestamp DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (id),
+                        UNIQUE KEY unique_assignment_document (assignment_id, document_id)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+                    $db->exec($create_table);
+                    
+                    // Try insert again
+                    $query = "INSERT INTO labeling_results 
+                              (assignment_id, document_id, selected_sentences, writing_style, edited_summary,
+                               step1_completed, step2_completed, step3_completed, auto_saved_at,
+                               completed_at)
+                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 
+                                      CASE WHEN ? = 1 AND ? = 1 AND ? = 1 THEN CURRENT_TIMESTAMP ELSE NULL END)";
+                    $stmt = $db->prepare($query);
+                    $stmt->execute([
+                        $assignment_id, $document_id, $selected_sentences, $writing_style, $edited_summary,
+                        $step1_completed, $step2_completed, $step3_completed,
+                        $step1_completed, $step2_completed, $step3_completed
+                    ]);
+                } else {
+                    throw $e;
+                }
             }
             
-            // Update assignment status
+            // Update assignment status if all steps completed
             if ($step1_completed && $step2_completed && $step3_completed) {
-                $query = "UPDATE assignments SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE id = ?";
+                $query = "UPDATE assignments SET status = 'completed' WHERE id = ?";
                 $stmt = $db->prepare($query);
                 $stmt->execute([$assignment_id]);
             } else {
-                $query = "UPDATE assignments SET status = 'in_progress', updated_at = CURRENT_TIMESTAMP WHERE id = ?";
+                $query = "UPDATE assignments SET status = 'in_progress' WHERE id = ?";
                 $stmt = $db->prepare($query);
                 $stmt->execute([$assignment_id]);
             }
@@ -302,7 +318,6 @@ if (isset($_GET['saved'])) {
             border-radius: 15px;
             box-shadow: 0 5px 15px rgba(0,0,0,0.1);
             overflow: hidden;
-            margin-bottom: 20px;
         }
         .step-header {
             background: linear-gradient(135deg, #007bff 0%, #6610f2 100%);
@@ -337,7 +352,6 @@ if (isset($_GET['saved'])) {
             padding: 15px 20px;
             cursor: pointer;
             transition: all 0.3s ease;
-            display: inline-block;
         }
         .document-tab.active {
             background: #007bff;
@@ -375,7 +389,7 @@ if (isset($_GET['saved'])) {
             text-align: center;
             cursor: pointer;
             transition: all 0.3s ease;
-            margin: 10px 0;
+            margin: 10px;
         }
         .writing-style-option:hover {
             border-color: #007bff;
@@ -396,12 +410,6 @@ if (isset($_GET['saved'])) {
             border-radius: 20px;
             display: none;
             z-index: 1100;
-        }
-        .step-section {
-            display: none;
-        }
-        .step-section.active {
-            display: block;
         }
     </style>
 </head>
@@ -457,7 +465,7 @@ if (isset($_GET['saved'])) {
                     <a href="my_tasks.php" class="btn btn-outline-primary">← Quay lại danh sách công việc</a>
                 </div>
             </div>
-        <?php elseif ($assignment && !empty($documents)): ?>
+        <?php elseif ($assignment): ?>
             
             <div class="d-flex justify-content-between align-items-center mb-4">
                 <div>
@@ -491,7 +499,7 @@ if (isset($_GET['saved'])) {
 
             <!-- Document Tabs (for multi-document) -->
             <?php if (count($documents) > 1): ?>
-                <div class="d-flex mb-3 flex-wrap">
+                <div class="d-flex mb-3">
                     <?php foreach ($documents as $index => $doc): ?>
                         <div class="document-tab <?php echo $index == 0 ? 'active' : ''; ?>" 
                              onclick="switchDocument(<?php echo $index; ?>)" 
@@ -517,13 +525,13 @@ if (isset($_GET['saved'])) {
                             $step2 = $result['step2_completed'] ?? false;
                             $step3 = $result['step3_completed'] ?? false;
                             ?>
-                            <div class="progress-step <?php echo $step1 ? 'completed' : 'active'; ?>" id="progress-step-1-<?php echo $doc_index; ?>">1</div>
-                            <div class="progress-step <?php echo $step2 ? 'completed' : ($step1 ? 'active' : ''); ?>" id="progress-step-2-<?php echo $doc_index; ?>">2</div>
-                            <div class="progress-step <?php echo $step3 ? 'completed' : ($step2 ? 'active' : ''); ?>" id="progress-step-3-<?php echo $doc_index; ?>">3</div>
+                            <div class="progress-step <?php echo $step1 ? 'completed' : 'active'; ?>">1</div>
+                            <div class="progress-step <?php echo $step2 ? 'completed' : ($step1 ? 'active' : ''); ?>">2</div>
+                            <div class="progress-step <?php echo $step3 ? 'completed' : ($step2 ? 'active' : ''); ?>">3</div>
                         </div>
 
                         <!-- Step 1: Select Important Sentences -->
-                        <div class="step-section <?php echo !$step1 || (!$step2 && !$step3) ? 'active' : ''; ?>" id="step1-<?php echo $doc_index; ?>">
+                        <div class="step-section" id="step1-<?php echo $doc_index; ?>">
                             <div class="step-header">
                                 <h4><i class="fas fa-mouse-pointer me-2"></i>Bước 1: Chọn câu quan trọng</h4>
                                 <p class="mb-0">Click vào các câu quan trọng trong văn bản</p>
@@ -570,7 +578,7 @@ if (isset($_GET['saved'])) {
                         </div>
 
                         <!-- Step 2: Choose Writing Style -->
-                        <div class="step-section <?php echo $step1 && !$step2 ? 'active' : ''; ?>" id="step2-<?php echo $doc_index; ?>">
+                        <div class="step-section d-none" id="step2-<?php echo $doc_index; ?>">
                             <div class="step-header">
                                 <h4><i class="fas fa-palette me-2"></i>Bước 2: Chọn phong cách văn bản</h4>
                                 <p class="mb-0">Chọn phong cách phù hợp cho bản tóm tắt</p>
@@ -618,7 +626,7 @@ if (isset($_GET['saved'])) {
                         </div>
 
                         <!-- Step 3: Edit Summary -->
-                        <div class="step-section <?php echo $step2 ? 'active' : ''; ?>" id="step3-<?php echo $doc_index; ?>">
+                        <div class="step-section d-none" id="step3-<?php echo $doc_index; ?>">
                             <div class="step-header">
                                 <h4><i class="fas fa-edit me-2"></i>Bước 3: Chỉnh sửa bản tóm tắt</h4>
                                 <p class="mb-0">Chỉnh sửa bản tóm tắt AI dựa trên các câu đã chọn</p>
@@ -628,7 +636,7 @@ if (isset($_GET['saved'])) {
                                     <div class="col-md-6">
                                         <h6>Bản tóm tắt AI gốc:</h6>
                                         <div class="border rounded p-3 bg-light" style="max-height: 300px; overflow-y: auto;">
-                                            <?php echo nl2br(htmlspecialchars($document['ai_summary'] ?? 'Không có tóm tắt AI')); ?>
+                                            <?php echo htmlspecialchars($document['ai_summary'] ?? 'Không có tóm tắt AI'); ?>
                                         </div>
                                     </div>
                                     <div class="col-md-6">
@@ -654,429 +662,228 @@ if (isset($_GET['saved'])) {
                     </div>
                 </div>
             <?php endforeach; ?>
-        <?php elseif ($assignment && empty($documents)): ?>
-            <div class="alert alert-warning">
-                <i class="fas fa-exclamation-triangle me-2"></i>
-                Assignment được tìm thấy nhưng không có tài liệu liên quan. Vui lòng liên hệ admin.
-            </div>
+
         <?php endif; ?>
     </div>
 
     <!-- Hidden forms for saving -->
-    <?php if (!empty($documents)): ?>
-        <?php foreach ($documents as $doc_index => $document): ?>
-            <form id="save-form-<?php echo $doc_index; ?>" method="POST" style="display: none;">
-                <input type="hidden" name="action" value="save_labeling">
-                <input type="hidden" name="document_id" value="<?php echo $document['id']; ?>">
-                <input type="hidden" name="selected_sentences" id="form-selected-sentences-<?php echo $doc_index; ?>">
-                <input type="hidden" name="writing_style" id="form-writing-style-<?php echo $doc_index; ?>">
-                <input type="hidden" name="edited_summary" id="form-edited-summary-<?php echo $doc_index; ?>">
-                <input type="hidden" name="step1_completed" id="form-step1-<?php echo $doc_index; ?>">
-                <input type="hidden" name="step2_completed" id="form-step2-<?php echo $doc_index; ?>">
-                <input type="hidden" name="step3_completed" id="form-step3-<?php echo $doc_index; ?>">
-            </form>
-        <?php endforeach; ?>
-    <?php endif; ?>
+    <?php foreach ($documents as $doc_index => $document): ?>
+        <form id="save-form-<?php echo $doc_index; ?>" method="POST" style="display: none;">
+            <input type="hidden" name="action" value="save_labeling">
+            <input type="hidden" name="document_id" value="<?php echo $document['id']; ?>">
+            <input type="hidden" name="selected_sentences" id="form-selected-sentences-<?php echo $doc_index; ?>">
+            <input type="hidden" name="writing_style" id="form-writing-style-<?php echo $doc_index; ?>">
+            <input type="hidden" name="edited_summary" id="form-edited-summary-<?php echo $doc_index; ?>">
+            <input type="hidden" name="step1_completed" id="form-step1-<?php echo $doc_index; ?>">
+            <input type="hidden" name="step2_completed" id="form-step2-<?php echo $doc_index; ?>">
+            <input type="hidden" name="step3_completed" id="form-step3-<?php echo $doc_index; ?>">
+        </form>
+    <?php endforeach; ?>
 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
     <script>
-        // Global variables
-        window.currentDocument = 0;
-        window.selectedSentences = {};
-        window.writingStyles = {};
-        window.completedSteps = {};
-
-        // Debug function
-        function debugLog(message, data) {
-            console.log('[DEBUG]', message, data);
-        }
+        let currentDocument = 0;
+        let selectedSentences = {};
+        let writingStyles = {};
+        let completedSteps = {};
 
         // Initialize data from PHP
-        <?php if (!empty($documents)): ?>
+        <?php foreach ($documents as $doc_index => $document): ?>
+            selectedSentences[<?php echo $doc_index; ?>] = <?php 
+                $result = $results_map[$document['id']] ?? null;
+                echo $result['selected_sentences'] ?? '[]'; 
+            ?>;
+            writingStyles[<?php echo $doc_index; ?>] = '<?php echo $result['writing_style'] ?? ''; ?>';
+            completedSteps[<?php echo $doc_index; ?>] = {
+                step1: <?php echo $result['step1_completed'] ? 'true' : 'false'; ?>,
+                step2: <?php echo $result['step2_completed'] ? 'true' : 'false'; ?>,
+                step3: <?php echo $result['step3_completed'] ? 'true' : 'false'; ?>
+            };
+        <?php endforeach; ?>
+
+        // Initialize interface
+        document.addEventListener('DOMContentLoaded', function() {
             <?php foreach ($documents as $doc_index => $document): ?>
-                try {
-                    window.selectedSentences[<?php echo $doc_index; ?>] = <?php 
-                        $result = $results_map[$document['id']] ?? null;
-                        echo $result['selected_sentences'] ?? '[]'; 
-                    ?>;
-                    window.writingStyles[<?php echo $doc_index; ?>] = '<?php echo $result['writing_style'] ?? ''; ?>';
-                    window.completedSteps[<?php echo $doc_index; ?>] = {
-                        step1: <?php echo $result['step1_completed'] ? 'true' : 'false'; ?>,
-                        step2: <?php echo $result['step2_completed'] ? 'true' : 'false'; ?>,
-                        step3: <?php echo $result['step3_completed'] ? 'true' : 'false'; ?>
-                    };
-                } catch(e) {
-                    console.error('Error initializing doc <?php echo $doc_index; ?>:', e);
+                loadSavedData(<?php echo $doc_index; ?>);
+            <?php endforeach; ?>
+            
+            // Show appropriate step
+            <?php foreach ($documents as $doc_index => $document): ?>
+                if (completedSteps[<?php echo $doc_index; ?>].step3) {
+                    showStep(3, <?php echo $doc_index; ?>);
+                } else if (completedSteps[<?php echo $doc_index; ?>].step2) {
+                    showStep(3, <?php echo $doc_index; ?>);
+                } else if (completedSteps[<?php echo $doc_index; ?>].step1) {
+                    showStep(2, <?php echo $doc_index; ?>);
+                } else {
+                    showStep(1, <?php echo $doc_index; ?>);
                 }
             <?php endforeach; ?>
-        <?php endif; ?>
-
-        debugLog('Initialized data:', {
-            selectedSentences: window.selectedSentences,
-            writingStyles: window.writingStyles,
-            completedSteps: window.completedSteps
         });
 
-        // Initialize when page loads
-        document.addEventListener('DOMContentLoaded', function() {
-            debugLog('DOM loaded, starting initialization...');
+        function switchDocument(docIndex) {
+            // Hide all documents
+            document.querySelectorAll('.document-container').forEach(el => el.classList.add('d-none'));
+            document.querySelectorAll('.document-tab').forEach(el => el.classList.remove('active'));
             
-            <?php if (!empty($documents)): ?>
-                <?php foreach ($documents as $doc_index => $document): ?>
-                    try {
-                        loadSavedData(<?php echo $doc_index; ?>);
-                        updateProgressIndicator(<?php echo $doc_index; ?>);
-                    } catch(e) {
-                        console.error('Error loading doc <?php echo $doc_index; ?>:', e);
-                    }
-                <?php endforeach; ?>
-            <?php endif; ?>
+            // Show selected document
+            document.getElementById('document-' + docIndex).classList.remove('d-none');
+            document.getElementById('tab-' + docIndex).classList.add('active');
             
-            debugLog('Initialization complete');
-        });
+            currentDocument = docIndex;
+        }
 
-        // Toggle sentence selection
         function toggleSentence(element) {
-            try {
-                const docIndex = parseInt(element.dataset.doc);
-                const sentenceIndex = parseInt(element.dataset.sentence);
-                
-                debugLog('Toggle sentence clicked', { docIndex, sentenceIndex });
-                
-                if (!window.selectedSentences[docIndex]) {
-                    window.selectedSentences[docIndex] = [];
-                }
-                
-                if (element.classList.contains('selected')) {
-                    element.classList.remove('selected');
-                    window.selectedSentences[docIndex] = window.selectedSentences[docIndex].filter(i => i !== sentenceIndex);
-                    debugLog('Deselected sentence', sentenceIndex);
-                } else {
-                    element.classList.add('selected');
-                    window.selectedSentences[docIndex].push(sentenceIndex);
-                    debugLog('Selected sentence', sentenceIndex);
-                }
-                
-                updateSelectedDisplay(docIndex);
-                autoSave(docIndex);
-            } catch(e) {
-                console.error('Error in toggleSentence:', e);
+            const docIndex = parseInt(element.dataset.doc);
+            const sentenceIndex = parseInt(element.dataset.sentence);
+            
+            if (!selectedSentences[docIndex]) {
+                selectedSentences[docIndex] = [];
+            }
+            
+            if (element.classList.contains('selected')) {
+                element.classList.remove('selected');
+                selectedSentences[docIndex] = selectedSentences[docIndex].filter(i => i !== sentenceIndex);
+            } else {
+                element.classList.add('selected');
+                selectedSentences[docIndex].push(sentenceIndex);
+            }
+            
+            updateSelectedDisplay(docIndex);
+            autoSave(docIndex);
+        }
+
+        function updateSelectedDisplay(docIndex) {
+            const container = document.getElementById('selected-sentences-' + docIndex);
+            const sentences = document.querySelectorAll(`#sentences-${docIndex} .sentence`);
+            
+            if (selectedSentences[docIndex] && selectedSentences[docIndex].length > 0) {
+                let html = '';
+                selectedSentences[docIndex].forEach(index => {
+                    if (sentences[index]) {
+                        html += '<div class="mb-2 p-2 bg-light rounded">' + sentences[index].textContent + '</div>';
+                    }
+                });
+                container.innerHTML = html;
+            } else {
+                container.innerHTML = '<div class="text-muted">Chưa có câu nào được chọn</div>';
             }
         }
 
-        // Update selected sentences display
-        function updateSelectedDisplay(docIndex) {
-            try {
-                const container = document.getElementById('selected-sentences-' + docIndex);
-                const sentences = document.querySelectorAll(`#sentences-${docIndex} .sentence`);
-                
-                if (!container) {
-                    console.error('Container not found for doc', docIndex);
+        function clearSelections(docIndex) {
+            selectedSentences[docIndex] = [];
+            document.querySelectorAll(`#sentences-${docIndex} .sentence`).forEach(el => {
+                el.classList.remove('selected');
+            });
+            updateSelectedDisplay(docIndex);
+            autoSave(docIndex);
+        }
+
+        function selectStyle(style, docIndex) {
+            writingStyles[docIndex] = style;
+            
+            // Update UI
+            document.querySelectorAll(`#step2-${docIndex} .writing-style-option`).forEach(el => {
+                el.classList.remove('selected');
+            });
+            document.querySelector(`#step2-${docIndex} .writing-style-option[data-style="${style}"]`).classList.add('selected');
+            
+            // Enable next button
+            document.getElementById('step2-complete-' + docIndex).disabled = false;
+            
+            autoSave(docIndex);
+        }
+
+        function showStep(step, docIndex) {
+            // Hide all steps
+            for (let i = 1; i <= 3; i++) {
+                document.getElementById(`step${i}-${docIndex}`).classList.add('d-none');
+            }
+            
+            // Show selected step
+            document.getElementById(`step${step}-${docIndex}`).classList.remove('d-none');
+        }
+
+        function completeStep(step, docIndex) {
+            if (step === 1) {
+                if (!selectedSentences[docIndex] || selectedSentences[docIndex].length === 0) {
+                    alert('Vui lòng chọn ít nhất một câu quan trọng!');
                     return;
                 }
-                
-                if (window.selectedSentences[docIndex] && window.selectedSentences[docIndex].length > 0) {
-                    let html = '';
-                    window.selectedSentences[docIndex].forEach(index => {
-                        if (sentences[index]) {
-                            html += '<div class="mb-2 p-2 bg-light rounded">' + sentences[index].textContent + '</div>';
-                        }
-                    });
-                    container.innerHTML = html;
-                } else {
-                    container.innerHTML = '<div class="text-muted">Chưa có câu nào được chọn</div>';
+                completedSteps[docIndex].step1 = true;
+                showStep(2, docIndex);
+            } else if (step === 2) {
+                if (!writingStyles[docIndex]) {
+                    alert('Vui lòng chọn phong cách văn bản!');
+                    return;
                 }
-            } catch(e) {
-                console.error('Error in updateSelectedDisplay:', e);
+                completedSteps[docIndex].step2 = true;
+                showStep(3, docIndex);
+            } else if (step === 3) {
+                const summary = document.getElementById('edited-summary-' + docIndex).value.trim();
+                if (!summary) {
+                    alert('Vui lòng nhập bản tóm tắt!');
+                    return;
+                }
+                completedSteps[docIndex].step3 = true;
+                saveDocument(docIndex);
             }
+            
+            autoSave(docIndex);
         }
 
-        // Clear all selections
-        function clearSelections(docIndex) {
-            try {
-                debugLog('Clearing selections for doc', docIndex);
-                window.selectedSentences[docIndex] = [];
-                document.querySelectorAll(`#sentences-${docIndex} .sentence`).forEach(el => {
-                    el.classList.remove('selected');
+        function autoSave(docIndex) {
+            // Update form data
+            updateFormData(docIndex);
+            
+            // Show auto-save indicator
+            const indicator = document.getElementById('autoSaveIndicator');
+            indicator.style.display = 'block';
+            setTimeout(() => {
+                indicator.style.display = 'none';
+            }, 2000);
+        }
+
+        function updateFormData(docIndex) {
+            document.getElementById('form-selected-sentences-' + docIndex).value = JSON.stringify(selectedSentences[docIndex] || []);
+            document.getElementById('form-writing-style-' + docIndex).value = writingStyles[docIndex] || '';
+            document.getElementById('form-edited-summary-' + docIndex).value = document.getElementById('edited-summary-' + docIndex).value;
+            document.getElementById('form-step1-' + docIndex).value = completedSteps[docIndex].step1 ? '1' : '';
+            document.getElementById('form-step2-' + docIndex).value = completedSteps[docIndex].step2 ? '1' : '';
+            document.getElementById('form-step3-' + docIndex).value = completedSteps[docIndex].step3 ? '1' : '';
+        }
+
+        function saveDocument(docIndex) {
+            updateFormData(docIndex);
+            document.getElementById('save-form-' + docIndex).submit();
+        }
+
+        function saveAll() {
+            updateFormData(currentDocument);
+            document.getElementById('save-form-' + currentDocument).submit();
+        }
+
+        function loadSavedData(docIndex) {
+            // Load selected sentences
+            if (selectedSentences[docIndex] && selectedSentences[docIndex].length > 0) {
+                const sentences = document.querySelectorAll(`#sentences-${docIndex} .sentence`);
+                selectedSentences[docIndex].forEach(index => {
+                    if (sentences[index]) {
+                        sentences[index].classList.add('selected');
+                    }
                 });
                 updateSelectedDisplay(docIndex);
-                autoSave(docIndex);
-            } catch(e) {
-                console.error('Error in clearSelections:', e);
             }
-        }
-
-        // Select writing style
-        function selectStyle(style, docIndex) {
-            try {
-                debugLog('Selecting style:', style, 'for doc:', docIndex);
-                window.writingStyles[docIndex] = style;
-                
-                // Update UI
-                document.querySelectorAll(`#step2-${docIndex} .writing-style-option`).forEach(el => {
-                    el.classList.remove('selected');
-                });
-                const selectedOption = document.querySelector(`#step2-${docIndex} .writing-style-option[data-style="${style}"]`);
-                if (selectedOption) {
-                    selectedOption.classList.add('selected');
+            
+            // Load writing style
+            if (writingStyles[docIndex]) {
+                const styleElement = document.querySelector(`#step2-${docIndex} .writing-style-option[data-style="${writingStyles[docIndex]}"]`);
+                if (styleElement) {
+                    styleElement.classList.add('selected');
+                    document.getElementById('step2-complete-' + docIndex).disabled = false;
                 }
-                
-                // Enable next button
-                const completeBtn = document.getElementById('step2-complete-' + docIndex);
-                if (completeBtn) {
-                    completeBtn.disabled = false;
-                }
-                
-                autoSave(docIndex);
-            } catch(e) {
-                console.error('Error in selectStyle:', e);
             }
-        }
-
-        // Show specific step
-        function showStep(step, docIndex) {
-            try {
-                debugLog('Showing step:', step, 'for doc:', docIndex);
-                
-                // Hide all steps for this document
-                for (let i = 1; i <= 3; i++) {
-                    const stepEl = document.getElementById(`step${i}-${docIndex}`);
-                    if (stepEl) {
-                        stepEl.classList.remove('active');
-                        stepEl.style.display = 'none';
-                    }
-                }
-                
-                // Show selected step
-                const targetStep = document.getElementById(`step${step}-${docIndex}`);
-                if (targetStep) {
-                    targetStep.classList.add('active');
-                    targetStep.style.display = 'block';
-                    debugLog('Step shown successfully:', step);
-                } else {
-                    console.error('Target step not found:', `step${step}-${docIndex}`);
-                }
-                
-                updateProgressIndicator(docIndex);
-            } catch(e) {
-                console.error('Error in showStep:', e);
-            }
-        }
-
-        // Complete a step
-        function completeStep(step, docIndex) {
-            try {
-                debugLog('Completing step:', step, 'for doc:', docIndex);
-                
-                if (step === 1) {
-                    if (!window.selectedSentences[docIndex] || window.selectedSentences[docIndex].length === 0) {
-                        alert('Vui lòng chọn ít nhất một câu quan trọng!');
-                        return;
-                    }
-                    window.completedSteps[docIndex].step1 = true;
-                    showStep(2, docIndex);
-                    debugLog('Step 1 completed, moving to step 2');
-                } else if (step === 2) {
-                    if (!window.writingStyles[docIndex]) {
-                        alert('Vui lòng chọn phong cách văn bản!');
-                        return;
-                    }
-                    window.completedSteps[docIndex].step2 = true;
-                    showStep(3, docIndex);
-                    debugLog('Step 2 completed, moving to step 3');
-                } else if (step === 3) {
-                    const summaryEl = document.getElementById('edited-summary-' + docIndex);
-                    const summary = summaryEl ? summaryEl.value.trim() : '';
-                    if (!summary) {
-                        alert('Vui lòng nhập bản tóm tắt!');
-                        return;
-                    }
-                    window.completedSteps[docIndex].step3 = true;
-                    saveDocument(docIndex);
-                    debugLog('Step 3 completed, saving document');
-                    return; // Don't call updateProgressIndicator here as we're redirecting
-                }
-                
-                updateProgressIndicator(docIndex);
-                autoSave(docIndex);
-            } catch(e) {
-                console.error('Error in completeStep:', e);
-            }
-        }
-
-        // Update progress indicator
-        function updateProgressIndicator(docIndex) {
-            try {
-                const steps = window.completedSteps[docIndex] || {};
-                
-                for (let i = 1; i <= 3; i++) {
-                    const progressEl = document.getElementById(`progress-step-${i}-${docIndex}`);
-                    if (progressEl) {
-                        progressEl.classList.remove('completed', 'active');
-                        
-                        if (steps[`step${i}`]) {
-                            progressEl.classList.add('completed');
-                        } else {
-                            // Check if this should be the active step
-                            if (i === 1 && !steps.step1) {
-                                progressEl.classList.add('active');
-                            } else if (i === 2 && steps.step1 && !steps.step2) {
-                                progressEl.classList.add('active');
-                            } else if (i === 3 && steps.step2 && !steps.step3) {
-                                progressEl.classList.add('active');
-                            }
-                        }
-                    }
-                }
-            } catch(e) {
-                console.error('Error in updateProgressIndicator:', e);
-            }
-        }
-
-        // Auto save function
-        function autoSave(docIndex) {
-            try {
-                updateFormData(docIndex);
-                
-                const indicator = document.getElementById('autoSaveIndicator');
-                if (indicator) {
-                    indicator.style.display = 'block';
-                    setTimeout(() => {
-                        indicator.style.display = 'none';
-                    }, 2000);
-                }
-            } catch(e) {
-                console.error('Error in autoSave:', e);
-            }
-        }
-
-        // Update form data
-        function updateFormData(docIndex) {
-            try {
-                const forms = document.getElementById('form-selected-sentences-' + docIndex);
-                const formStyle = document.getElementById('form-writing-style-' + docIndex);
-                const formSummary = document.getElementById('form-edited-summary-' + docIndex);
-                const formStep1 = document.getElementById('form-step1-' + docIndex);
-                const formStep2 = document.getElementById('form-step2-' + docIndex);
-                const formStep3 = document.getElementById('form-step3-' + docIndex);
-                const summaryEl = document.getElementById('edited-summary-' + docIndex);
-                
-                if (forms) forms.value = JSON.stringify(window.selectedSentences[docIndex] || []);
-                if (formStyle) formStyle.value = window.writingStyles[docIndex] || '';
-                if (formSummary && summaryEl) formSummary.value = summaryEl.value;
-                if (formStep1) formStep1.value = window.completedSteps[docIndex].step1 ? '1' : '';
-                if (formStep2) formStep2.value = window.completedSteps[docIndex].step2 ? '1' : '';
-                if (formStep3) formStep3.value = window.completedSteps[docIndex].step3 ? '1' : '';
-            } catch(e) {
-                console.error('Error in updateFormData:', e);
-            }
-        }
-
-        // Save document
-        function saveDocument(docIndex) {
-            try {
-                updateFormData(docIndex);
-                const form = document.getElementById('save-form-' + docIndex);
-                if (form) {
-                    debugLog('Submitting form for doc:', docIndex);
-                    form.submit();
-                } else {
-                    console.error('Form not found for doc:', docIndex);
-                }
-            } catch(e) {
-                console.error('Error in saveDocument:', e);
-            }
-        }
-
-        // Save all
-        function saveAll() {
-            try {
-                updateFormData(window.currentDocument);
-                const form = document.getElementById('save-form-' + window.currentDocument);
-                if (form) {
-                    form.submit();
-                }
-            } catch(e) {
-                console.error('Error in saveAll:', e);
-            }
-        }
-
-        // Switch document
-        function switchDocument(docIndex) {
-            try {
-                debugLog('Switching to document:', docIndex);
-                
-                document.querySelectorAll('.document-container').forEach(el => el.classList.add('d-none'));
-                document.querySelectorAll('.document-tab').forEach(el => el.classList.remove('active'));
-                
-                const docContainer = document.getElementById('document-' + docIndex);
-                const tabContainer = document.getElementById('tab-' + docIndex);
-                
-                if (docContainer && tabContainer) {
-                    docContainer.classList.remove('d-none');
-                    tabContainer.classList.add('active');
-                    window.currentDocument = docIndex;
-                }
-            } catch(e) {
-                console.error('Error in switchDocument:', e);
-            }
-        }
-
-        // Load saved data
-        function loadSavedData(docIndex) {
-            try {
-                debugLog('Loading saved data for doc:', docIndex);
-                
-                // Load selected sentences
-                if (window.selectedSentences[docIndex] && window.selectedSentences[docIndex].length > 0) {
-                    const sentences = document.querySelectorAll(`#sentences-${docIndex} .sentence`);
-                    window.selectedSentences[docIndex].forEach(index => {
-                        if (sentences[index]) {
-                            sentences[index].classList.add('selected');
-                        }
-                    });
-                    updateSelectedDisplay(docIndex);
-                }
-                
-                // Load writing style
-                if (window.writingStyles[docIndex]) {
-                    const styleElement = document.querySelector(`#step2-${docIndex} .writing-style-option[data-style="${window.writingStyles[docIndex]}"]`);
-                    if (styleElement) {
-                        styleElement.classList.add('selected');
-                        const completeBtn = document.getElementById('step2-complete-' + docIndex);
-                        if (completeBtn) {
-                            completeBtn.disabled = false;
-                        }
-                    }
-                }
-
-                // Show appropriate step based on completion status
-                const steps = window.completedSteps[docIndex];
-                if (steps.step3) {
-                    showStep(3, docIndex);
-                } else if (steps.step2) {
-                    showStep(3, docIndex);
-                } else if (steps.step1) {
-                    showStep(2, docIndex);
-                } else {
-                    showStep(1, docIndex);
-                }
-            } catch(e) {
-                console.error('Error in loadSavedData:', e);
-            }
-        }
-
-        // Test function to verify JavaScript is working
-        function testFunction() {
-            alert('JavaScript is working!');
-            console.log('Test function called successfully');
         }
     </script>
-    
-    <!-- Add test button for debugging -->
-    <div style="position: fixed; bottom: 20px; right: 20px; z-index: 9999;">
-        <button onclick="testFunction()" class="btn btn-sm btn-warning">Test JS</button>
-        <button onclick="debugLog('Current state:', {currentDoc: window.currentDocument, steps: window.completedSteps})" class="btn btn-sm btn-info">Debug</button>
-    </div>
 </body>
 </html>
